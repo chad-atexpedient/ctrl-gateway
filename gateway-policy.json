@@ -1,0 +1,185 @@
+{
+  "_doc": "Glint-V2 routing policy. First-match-wins for overrides. Hot-reload via POST /reload. See README for context.",
+
+  "_doc_overrides": "Each override is a condition -> action. First match wins. Conditions evaluated top-to-bottom. Specific conditions above catch-alls. override_only tiers are only reachable via these (never via cost arithmetic).",
+  "overrides": [
+    {
+      "name": "vision_routing",
+      "_doc": "Image in message -> vision tier. Always wins.",
+      "condition": "has_image == true",
+      "action": "route_to_tier",
+      "tier": "tier2",
+      "via_endpoint_kind": "vision_endpoints",
+      "source_tag": "vision"
+    },
+    {
+      "name": "owui_background_task",
+      "_doc": "OWUI meta-tasks ('### Task:', 'generate title', 'suggest follow-up'). These trip false code/math flags on the router; route to tier0.",
+      "condition": "matches_regex('owui_task_regex')",
+      "action": "route_to_tier",
+      "tier": "tier0",
+      "source_tag": "bg_task"
+    },
+    {
+      "name": "medical_keyword",
+      "_doc": "Medical/health keywords (drug names, clinical terms, patient language). Routes to medical tier regardless of cost.",
+      "condition": "matches_regex('medical_keyword_regex')",
+      "action": "route_to_tier",
+      "tier": "tier_medical",
+      "source_tag": "medical_kw"
+    },
+    {
+      "name": "freshness_simple",
+      "_doc": "Freshness signals (today/current/latest/news) + low complexity -> tier0 (fast + small model can answer weather/breaking-news).",
+      "condition": "matches_regex('freshness_regex') AND router_complexity <= 3",
+      "action": "route_to_tier",
+      "tier": "tier0",
+      "source_tag": "freshness"
+    },
+    {
+      "name": "structural_prototype_hard_coding",
+      "_doc": "Structural prototypes (system_design, complex_debugging) -> tier4 (Laguna). Prototypes are STRUCTURAL ONLY (kind: structural).",
+      "condition": "prototype_match(kind='structural', name='hard_programming', threshold=0.85) OR prototype_match(kind='structural', name='system_design', threshold=0.85)",
+      "action": "route_to_tier",
+      "tier": "tier4",
+      "source_tag": "prototype_structural"
+    },
+    {
+      "name": "very_high_complexity_with_code",
+      "_doc": "cx>=4 + code/math -> tier4 (hard coding/math).",
+      "condition": "router_complexity >= 4 AND (router_flag_code OR router_flag_math)",
+      "action": "route_to_tier",
+      "tier": "tier4",
+      "source_tag": "glint_override"
+    },
+    {
+      "name": "high_complexity_with_code",
+      "_doc": "cx>=3 + code/math -> tier2 (Qwen3.5-4B).",
+      "condition": "router_complexity >= 3 AND (router_flag_code OR router_flag_math)",
+      "action": "route_to_tier",
+      "tier": "tier2",
+      "source_tag": "glint_override"
+    },
+    {
+      "name": "high_complexity_with_reasoning",
+      "_doc": "cx>=3 + reasoning -> tier3 (Qwen3.5-9B).",
+      "condition": "router_complexity >= 3 AND router_flag_reasoning",
+      "action": "route_to_tier",
+      "tier": "tier3",
+      "source_tag": "glint_override"
+    },
+    {
+      "name": "low_complexity_default",
+      "_doc": "Catch-all: cx<=2 + no flags -> tier0.",
+      "condition": "router_complexity <= 2 AND NOT router_flag_code AND NOT router_flag_math AND NOT router_flag_reasoning",
+      "action": "route_to_tier",
+      "tier": "tier0",
+      "source_tag": "glint_override"
+    }
+  ],
+
+  "_doc_regexes": "All regexes are case-insensitive (?i implied). Update carefully; these run on every request.",
+  "freshness_regex": "\\b(today|tonight|current|currently|latest|now|right now|this week|this morning|this evening|breaking|live|just happened|recent|recently)\\b",
+  "medical_keyword_regex": "\\b(metformin|lisinopril|atorvastatin|levothyroxine|amlodipine|metoprolol|albuterol|omeprazole|losartan|gabapentin|hydrochlorothiazide|sertraline|simvastatin|ibuprofen|acetaminophen|amoxicillin|insulin|aspirin|warfarin|prednisone|tramadol|azithromycin|amitriptyline|naproxen|hydrocodone|ciprofloxacin|fluoxetine|propranolol|diazepam|doxycycline|clonazepam|prescribed|prescription|dosage|mg/kg|side effects?|contraindications?|symptoms?|diagnosis|prognosis|treatment|therapy|clinical|patient|my doctor|my physician|my nurse|i've been diagnosed|i was prescribed|side effect|adverse reaction|drug interaction|pharmacy|pharmacist|rx\\b|medication|medicine|pill|tablet|capsule|injection|vaccine|vaccination|immunization|disease|disorder|syndrome|chronic|acute|benign|malignant|tumor|cancer|diabetes|hypertension|depression|anxiety|bipolar|adhd|allergy|asthma|arthritis|cardiac|stroke|seizure|migraine|psychiatric|psychiatric|antibiotic|antiviral|antifungal|antidepressant|antihistamine)\\b",
+  "owui_task_regex": "(?i)\\b### Task:\\b|\\b(generate a concise title|generate 1-3 broad tags|suggest 3-5 follow-up|respond with inline citations|summarize the following into)\\b",
+
+  "_doc_prototype_thresholds": "Per-prototype similarity threshold for matching. Higher = stricter. Keep thresholds high to avoid Glint's Roman-Empire-medical false-positive lesson.",
+  "prototype_thresholds": {
+    "system_design": 0.85,
+    "hard_programming": 0.85,
+    "complex_debugging": 0.85,
+    "codebase_search": 0.80,
+    "planning": 0.75,
+    "code_review": 0.80
+  },
+
+  "_doc_calibration": "Temperature scaling applied to router softmax. Higher temperature = softer probabilities (more escalation). Lower = sharper.",
+  "calibration": {
+    "temperature": 1.0,
+    "_doc_temperature": "Default 1.0. Increase (e.g., 1.3) if too many escalations; decrease (e.g., 0.7) if too few."
+  },
+
+  "_doc_ladder": "When chosen tier is unavailable (breaker open, error, context overflow), how to walk.",
+  "ladder": {
+    "context_overflow_strategy": "walk_up",
+    "_doc_walk_up": "If prompt exceeds tier max_context, try tier with larger context (tier2 -> tier3 -> tier4 -> tier3_external).",
+    "context_reserve_pct": 25,
+    "_doc_reserve": "Reserve this % of max_context as KV buffer.",
+    "error_strategy": "fallback_then_retry",
+    "_doc_fallback": "On endpoint error, retry once on configured fallback endpoint; on second failure, return 503.",
+    "breaker_strategy": "skip_tier",
+    "_doc_skip": "If any endpoint in the tier is in breaker OPEN state, skip the whole tier (move to next tier in ladder)."
+  },
+
+  "_doc_efficiency": "Tie-break when costs are within margin. prefer_healthier: skip endpoints in OPEN state. prefer_lower_load: prefer endpoints with fewer inflight requests.",
+  "efficiency_tiebreak": {
+    "prefer_healthier": true,
+    "prefer_lower_load": true,
+    "load_window_seconds": 30
+  },
+
+  "_doc_logging": "What to log per request.",
+  "logging": {
+    "log_all_decisions": true,
+    "log_query_preview_chars": 200,
+    "log_full_prompt": false,
+    "log_response_preview_chars": 100,
+    "_doc_log_full_prompt": "Full prompt logging is a privacy risk; disabled by default. Enable for debugging only."
+  },
+
+  "_doc_memory": "Three-tier memory + Observational Memory (Mastra pattern). All threads/users accumulate history; OM compresses when tokens cross thresholds.",
+  "memory": {
+    "last_messages": 20,
+    "working_memory_enabled": true,
+    "working_memory_scope": "resource",
+    "semantic_recall_top_k": 0,
+    "_doc_sem_recall": "Set to 3+ to enable L3 semantic recall. Off by default — costs an embedding per stored message. Enable when 'search past conversations' is a real user job.",
+
+    "message_tokens": 12000,
+    "_doc_message_tokens": "Threshold of unobserved-message tokens in a thread that triggers the Observer. Lower = more frequent compression, fresher observations.",
+
+    "observation_tokens": 20000,
+    "_doc_observation_tokens": "Threshold of observation tokens that triggers the Reflector. Lower = more frequent condensation.",
+
+    "compaction_token_threshold_pct": 75,
+    "_doc_compaction_pct": "When memory context exceeds this % of tier's max_context, the gateway redirects to a higher tier with larger context window.",
+
+    "observer_tier": "tier0",
+    "observer_endpoint": null,
+    "observer_model": null,
+    "observer_max_tokens": 800,
+
+    "reflector_tier": "tier0",
+    "reflector_endpoint": null,
+    "reflector_model": null,
+    "reflector_max_tokens": 600,
+
+    "_doc_observer_tier": "Small fast model for compression work. Per Mastra: 'Observer model is a cost lever, not a quality one'. Tier0 is the default."
+  },
+
+  "_doc_events": "Event emitter config (OWUI thinking indicator pattern). UI platforms subscribe via SSE at /events.",
+  "events": {
+    "emit_status": true,
+    "emit_decisions": true,
+    "emit_compaction_redirects": true,
+    "ring_buffer_size": 1000
+  },
+
+  "_doc_swarm": "Swarm/synthesis mode: decompose complex requests into parallel subtasks across tiers, then synthesize. Off by default. mode: off | auto | always. auto triggers when cost-first picks a trigger_tier AND complexity >= min_complexity AND a swarm-eligible flag is set. Swarm only runs if its expected cost is below max_swarm_cost_usd.",
+  "swarm": {
+    "mode": "off",
+    "trigger_tiers": ["tier4"],
+    "min_complexity": 4,
+    "chunk_max_chars": 2000,
+    "tier_pyramid": ["tier0", "tier2", "tier3"],
+    "synthesis_tier": "tier3",
+    "max_swarm_cost_usd": null
+  },
+
+  "_doc_translation": "Translation-intent handling. mode: off | detect_only | rewrite | dedicated_endpoint. detect_only tags the decision without changing routing. rewrite injects a translator system prompt."
+  ,
+  "translation": {
+    "mode": "off",
+    "dedicated_tier": null
+  }
+}

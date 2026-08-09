@@ -1,0 +1,64 @@
+# Glint-V2 multi-instance mode
+#
+# In single mode (default), the gateway uses SQLite. Set:
+#   gateway-config.json -> mode: "multi"
+#   gateway-config.json -> db_url: "postgresql+psycopg://glint:glint@postgres:5432/glint"
+# to enable multi-instance horizontal scaling.
+#
+# Run multiple gateway instances behind a load balancer:
+#   docker compose up --scale gateway=3
+
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: glint
+      POSTGRES_USER: glint
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - glint-pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U glint"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  gateway:
+    build: .
+    command: python -m gateway.app --host 0.0.0.0 --port 8076
+    environment:
+      TEACHER_API_KEY: ${TEACHER_API_KEY:-}
+      TEACHER_BASE_URL: ${TEACHER_BASE_URL:-}
+      GLINT_DB_URL: ${GLINT_DB_URL:?set GLINT_DB_URL}
+      GLINT_MODE: multi
+      GLINT_AUTH_ENABLED: "true"
+      GLINT_ADMIN_API_KEY: ${GLINT_ADMIN_API_KEY:?set GLINT_ADMIN_API_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./router_model/data:/app/router_model/data
+      - ./router_model/checkpoints:/app/router_model/checkpoints
+    expose:
+      - "8076"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8076/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  lb:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - gateway
+
+volumes:
+  glint-pgdata:

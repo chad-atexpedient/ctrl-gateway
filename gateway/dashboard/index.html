@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Glint-V2 Gateway</title>
+<style>
+:root{--bg:#080b10;--panel:#0f141c;--card:#141a24;--border:#1c2430;--text:#c5d0de;--dim:#5a6678;--bright:#e8f0fc;--accent:#00d4aa;--accent2:#0ea5e9;--warn:#ff9f43;--err:#ff5252;--t0:#4fc3f7;--t1:#66bb6a;--t2:#ab47bc;--t3:#ff9f43;--t4:#ff5252;--tm:#ec407a}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:'SF Mono',Monaco,'Cascadia Code',Menlo,monospace;font-size:13px;line-height:1.6}
+h1,h2,h3{font-weight:600;color:var(--bright)}h2{font-size:18px;margin-bottom:12px}h3{font-size:14px;margin-bottom:8px}
+a{color:var(--accent2);text-decoration:none}
+section{padding:24px;max-width:1200px;margin:0 auto}
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:16px}
+.card .title{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;padding:8px;color:var(--dim);font-size:10px;text-transform:uppercase;border-bottom:1px solid var(--border);letter-spacing:.5px}
+td{padding:7px 8px;border-bottom:1px solid var(--border)}tr:last-child td{border:none}
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600}
+.b0{background:rgba(79,195,247,.12);color:var(--t0)}.b1{background:rgba(102,187,106,.12);color:var(--t1)}.b2{background:rgba(171,71,188,.12);color:var(--t2)}.b3{background:rgba(255,159,67,.12);color:var(--t3)}.b4{background:rgba(255,82,82,.12);color:var(--t4)}.bm{background:rgba(236,64,122,.12);color:var(--tm)}
+.bar{height:22px;border-radius:4px;overflow:hidden;display:flex}.bar .seg{display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;transition:width .8s;overflow:hidden;white-space:nowrap}
+.health-up{background:var(--accent)}.health-open{background:var(--err);animation:pulse 1s infinite}.health-half{background:var(--warn)}@keyframes pulse{0%,100%{opacity:.5}50%{opacity:1}}
+.spend-bar{height:14px;border-radius:3px;background:var(--border);overflow:hidden;margin-top:4px}.spend-fill{height:100%;background:var(--accent);transition:width .5s}.spend-fill.warn{background:var(--warn)}.spend-fill.err{background:var(--err)}
+input,select,textarea{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-family:inherit;font-size:13px;width:100%}
+input:focus,select:focus{border-color:var(--accent);outline:none}
+label{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:4px}
+.btn{display:inline-block;padding:8px 16px;border-radius:6px;border:1px solid var(--border);background:var(--card);color:var(--text);cursor:pointer;font-family:inherit;font-size:12px;font-weight:600;transition:all .2s}
+.btn:hover{border-color:var(--accent);color:var(--accent)}
+.btn.primary{background:var(--accent);color:#000;border-color:var(--accent)}
+.btn.primary:hover{opacity:.85;color:#000}
+.btn.danger{border-color:var(--err);color:var(--err)}.btn.danger:hover{background:var(--err);color:#000}
+.btn.sm{padding:4px 10px;font-size:11px}
+.form-row{margin-bottom:12px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.7);display:none;z-index:100;align-items:center;justify-content:center}
+.modal-bg.show{display:flex}.modal{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:24px;max-width:500px;width:90%;max-height:80vh;overflow-y:auto}
+.trace{max-height:400px;overflow-y:auto}.trace-row{display:grid;grid-template-columns:60px 90px 1fr 60px;gap:8px;padding:5px 0;border-bottom:1px solid var(--border);font-size:11px;align-items:center}
+.tag{display:inline-block;padding:1px 7px;border-radius:3px;font-size:9px;margin:2px;background:var(--border);color:var(--dim)}
+.gpunode{display:flex;align-items:center;gap:8px}.gpunode .chip{width:8px;height:8px;border-radius:50%}
+/* Tabs */
+nav{background:var(--panel);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:10}
+nav .inner{max-width:1200px;margin:0 auto;display:flex;align-items:center;padding:0 24px;gap:4px;overflow-x:auto}
+nav .brand{font-size:18px;font-weight:700;color:var(--bright);padding:12px 16px 12px 0;white-space:nowrap}
+nav .brand span{color:var(--accent)}
+nav .tab{padding:12px 16px;cursor:pointer;font-size:12px;font-weight:600;color:var(--dim);border-bottom:2px solid transparent;transition:all .2s;white-space:nowrap}
+nav .tab:hover{color:var(--text)}nav .tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+nav .right{margin-left:auto;display:flex;align-items:center;gap:8px;padding:8px 0}
+.tab-content{display:none}.tab-content.active{display:block}
+.hero-mini{text-align:center;padding:30px 24px 10px}.hero-mini h1{font-size:28px}.hero-mini h1 span{color:var(--accent)}
+.hero-mini .nums{display:flex;justify-content:center;gap:30px;margin-top:16px;flex-wrap:wrap}
+.hero-mini .num{text-align:center}.hero-mini .num .v{font-size:24px;font-weight:700;color:var(--accent)}.hero-mini .num .l{font-size:10px;color:var(--dim);text-transform:uppercase}
+.discovered{display:grid;grid-template-columns:1fr;gap:8px}
+.disc-card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:12px;display:flex;align-items:center;justify-content:between;gap:12px}
+.disc-card .info{flex:1}.disc-card .info b{color:var(--bright)}.disc-card .info .models{font-size:10px;color:var(--dim);margin-top:2px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:12px}.kv .k{color:var(--dim)}
+.toast{position:fixed;bottom:20px;right:20px;padding:12px 20px;border-radius:8px;font-size:12px;font-weight:600;z-index:200;opacity:0;transition:opacity .3s}
+.toast.show{opacity:1}.toast.ok{background:var(--accent);color:#000}.toast.err{background:var(--err);color:#000}
+.copy-field{display:flex;gap:8px;align-items:center}.copy-field input{flex:1}
+.tier-card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:12px}
+.tier-card h3{display:flex;align-items:center;gap:8px}
+.tier-endpoints{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="inner">
+    <div class="brand">Glint<span>-V2</span></div>
+    <div class="tab active" data-tab="live" onclick="showTab('live')">Live</div>
+    <div class="tab" data-tab="providers" onclick="showTab('providers')">Providers</div>
+    <div class="tab" data-tab="keys" onclick="showTab('keys')">Keys</div>
+    <div class="tab" data-tab="routing" onclick="showTab('routing')">Routing</div>
+    <div class="tab" data-tab="flywheel" onclick="showTab('flywheel')">Flywheel</div>
+    <div class="right">
+      <span id="key-status" style="font-size:11px;opacity:.6"></span>
+      <button class="btn sm" onclick="promptForKey()">Set Key</button>
+      <button class="btn sm" onclick="clearKey()">Clear</button>
+    </div>
+  </div>
+</nav>
+
+<!-- ===== LIVE TAB ===== -->
+<div class="tab-content active" id="tab-live">
+  <div class="hero-mini">
+    <h1>Glint<span>-V2</span> Gateway</h1>
+    <div class="nums" id="hero-nums">
+      <div class="num"><div class="v" id="num-decisions">—</div><div class="l">Decisions</div></div>
+      <div class="num"><div class="v" id="num-accuracy">—</div><div class="l">Accuracy</div></div>
+      <div class="num"><div class="v" id="num-models">—</div><div class="l">Endpoints</div></div>
+      <div class="num"><div class="v" id="num-reviewer">—</div><div class="l">Reviewer</div></div>
+      <div class="num"><div class="v" id="num-spend">—</div><div class="l">Spend</div></div>
+    </div>
+  </div>
+  <section>
+    <div class="card"><div class="title">Endpoints (live health probes)</div>
+      <table><thead><tr><th>Endpoint</th><th>Kind</th><th>Health</th><th>Inflight</th><th>Max</th><th>Load</th></tr></thead>
+      <tbody id="endpoints-table"></tbody></table>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+      <div class="card"><div class="title">Tier Distribution (24h)</div><div id="tier-table"></div></div>
+      <div class="card"><div class="title">Cost Breakdown (24h)</div><div id="cost-table"></div></div>
+    </div>
+    <div class="card"><div class="title">Recent Routing Decisions</div>
+      <div class="trace" id="trace-container"></div></div>
+    <div class="card"><div class="title">Live Event Stream <button class="btn sm" onclick="toggleEvents()">Pause/Resume</button></div>
+      <div id="events-container" style="max-height:300px;overflow-y:auto;font-size:11px"></div></div>
+  </section>
+</div>
+
+<!-- ===== PROVIDERS TAB ===== -->
+<div class="tab-content" id="tab-providers">
+  <section>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h2>Providers</h2>
+      <div style="display:flex;gap:8px">
+        <button class="btn" onclick="probeLocal()">Probe Local</button>
+        <button class="btn primary" onclick="openAddProvider()">+ Add Provider</button>
+      </div>
+    </div>
+    <div id="probe-results" style="margin-bottom:16px"></div>
+    <div class="card">
+      <table><thead><tr><th>Name</th><th>Kind</th><th>Base URL</th><th>Model</th><th>Actions</th></tr></thead>
+      <tbody id="providers-table"></tbody></table>
+    </div>
+  </section>
+</div>
+
+<!-- ===== KEYS TAB ===== -->
+<div class="tab-content" id="tab-keys">
+  <section>
+    <h2>API Keys</h2>
+    <div class="card">
+      <h3>Generate New Key</h3>
+      <div class="form-grid">
+        <div class="form-row"><label>Tenant ID</label><input id="key-tenant" placeholder="alice" value="default"></div>
+        <div class="form-row"><label>Scope</label><select id="key-scope"><option value='["user"]'>user</option><option value='["admin","user"]'>admin + user</option></select></div>
+      </div>
+      <button class="btn primary" onclick="generateKey()">Generate Key</button>
+      <div id="new-key-display" style="margin-top:12px;display:none">
+        <label>Copy this key now — it won't be shown again:</label>
+        <div class="copy-field"><input id="new-key-value" readonly><button class="btn sm" onclick="copyToClipboard('new-key-value')">Copy</button></div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Active Keys</h3>
+      <table><thead><tr><th>Key (masked)</th><th>Tenant</th><th>Scope</th><th>Action</th></tr></thead>
+      <tbody id="keys-table"></tbody></table>
+    </div>
+  </section>
+</div>
+
+<!-- ===== ROUTING TAB ===== -->
+<div class="tab-content" id="tab-routing">
+  <section>
+    <h2>Routing Tiers</h2>
+    <p style="color:var(--dim);margin-bottom:16px">Each tier maps to provider endpoints. The cost-first policy picks the cheapest tier with sufficient capability.</p>
+    <div id="tiers-container"></div>
+  </section>
+</div>
+
+<!-- ===== FLYWHEEL TAB ===== -->
+<div class="tab-content" id="tab-flywheel">
+  <section>
+    <h2>Data Flywheel</h2>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:16px;margin-bottom:16px">
+      <div class="card"><div class="title">Curated Samples</div><div style="font-size:28px;font-weight:700;color:var(--accent)" id="fw-curated">—</div></div>
+      <div class="card"><div class="title">Review Queue</div><div style="font-size:28px;font-weight:700;color:var(--accent2)" id="fw-pending">—</div><div style="font-size:11px;color:var(--dim)" id="fw-review-detail"></div></div>
+      <div class="card"><div class="title">Model Versions</div><div style="font-size:28px;font-weight:700;color:var(--t2)" id="fw-versions">—</div></div>
+      <div class="card"><div class="title">Router Status</div><div id="fw-router-status" style="font-size:14px;padding-top:4px">—</div></div>
+    </div>
+    <div class="card">
+      <h3>Vertical Knowledge Graph</h3>
+      <p style="color:var(--dim);font-size:11px;margin-bottom:12px">Node size = curated samples. Color = accuracy (green > 90%, yellow > 70%, red below). Edges = confusion pairs from latest eval.</p>
+      <svg id="flywheel-graph" width="100%" height="400" style="background:var(--panel);border-radius:8px;border:1px solid var(--border)"></svg>
+      <div id="fw-node-detail" style="margin-top:12px;font-size:12px;color:var(--dim)">Click a node for details.</div>
+    </div>
+    <div class="card">
+      <h3>Training Controls</h3>
+      <p style="color:var(--dim);font-size:12px;margin-bottom:12px">Manually trigger a router retraining run. Uses curated samples + base data. Eval gate must pass before promotion. Snapshots are taken automatically for revert.</p>
+      <button class="btn primary" onclick="triggerRetrain(false)">Retrain Now</button>
+      <button class="btn" onclick="triggerRetrain(true)">Allow Embedding Fine-tune</button>
+      <span id="fw-training-status" style="margin-left:12px;font-size:12px"></span>
+    </div>
+    <div class="card">
+      <h3>Checkpoint History</h3>
+      <table><thead><tr><th>Version</th><th>Status</th><th>Base Acc</th><th>Live Acc</th><th>Created</th><th>Action</th></tr></thead>
+      <tbody id="fw-checkpoints"></tbody></table>
+    </div>
+    <div class="card">
+      <h3>Per-Vertical Accuracy</h3>
+      <div id="fw-vertical-accuracy"></div>
+    </div>
+  </section>
+</div>
+
+<!-- ===== MODALS ===== -->
+<div class="modal-bg" id="modal-provider">
+  <div class="modal">
+    <h3 id="modal-provider-title">Add Provider</h3>
+    <div class="form-row"><label>Provider Preset (optional)</label>
+      <select id="preset-select" onchange="applyPreset()"><option value="">— Custom —</option></select>
+    </div>
+    <div class="form-grid">
+      <div class="form-row"><label>Name</label><input id="ep-name" placeholder="my-provider"></div>
+      <div class="form-row"><label>Kind</label><select id="ep-kind"><option>openai</option><option>anthropic</option><option>gemini</option><option>ollama</option><option>llamacpp</option></select></div>
+    </div>
+    <div class="form-row"><label>Base URL</label><input id="ep-url" placeholder="https://api.openai.com/v1"></div>
+    <div class="form-grid">
+      <div class="form-row"><label>Model Alias</label><input id="ep-model" placeholder="gpt-4o"></div>
+      <div class="form-row"><label>API Key Env Var</label><input id="ep-keyenv" placeholder="OPENAI_API_KEY"></div>
+    </div>
+    <div class="form-grid">
+      <div class="form-row"><label>Concurrency</label><input id="ep-conc" type="number" value="4"></div>
+      <div class="form-row"><label>Max Context</label><input id="ep-ctx" type="number" value="32768"></div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:16px">
+      <button class="btn" onclick="testFromModal()">Test Connection</button>
+      <button class="btn primary" onclick="saveProvider()">Save Provider</button>
+      <button class="btn" onclick="closeModal('modal-provider')">Cancel</button>
+    </div>
+    <div id="test-result" style="margin-top:12px"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const REFRESH_MS = 5000;
+let eventSource = null;
+let eventsPaused = false;
+let _presets = {};
+let _editingProvider = null;
+const TIER_COLORS = {tier0:'#4fc3f7',tier1:'#66bb6a',tier2:'#ab47bc',tier3:'#ff9f43',tier4:'#ff5252',tier_medical:'#ec407a'};
+const TIER_BADGES = {tier0:'b0',tier1:'b1',tier2:'b2',tier3:'b3',tier4:'b4',tier_medical:'bm'};
+
+// ---- Helpers ----
+function esc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function safeArg(value) { return encodeURIComponent(value).replace(/'/g, '%27'); }
+async function fetchJSON(path, opts={}) {
+  try {
+    const headers = opts.headers || {};
+    const token = sessionStorage.getItem('glint_api_key');
+    if (token) headers['Authorization'] = 'Bearer ' + token;
+    if (opts.body) headers['Content-Type'] = 'application/json';
+    const r = await fetch(path, {...opts, headers});
+    if (!r.ok) return null;
+    return await r.json();
+  } catch(e) { return null; }
+}
+async function api(path, method='POST', body=null) {
+  const headers = {};
+  const token = sessionStorage.getItem('glint_api_key');
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+  if (body) headers['Content-Type'] = 'application/json';
+  const r = await fetch(path, {method, headers, body: body?JSON.stringify(body):undefined});
+  return {status: r.status, data: r.ok ? await r.json() : await r.text()};
+}
+function toast(msg, ok=true) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.className = 'toast show ' + (ok?'ok':'err');
+  setTimeout(() => t.className = 'toast', 3000);
+}
+function copyToClipboard(id) {
+  const el = document.getElementById(id); el.select(); document.execCommand('copy'); toast('Copied!');
+}
+function promptForKey() {
+  const token = prompt('Enter Glint admin API key:'); if (token) { sessionStorage.setItem('glint_api_key', token); updateKeyStatus(); refreshAll(); connectEvents(); }
+}
+function clearKey() { sessionStorage.removeItem('glint_api_key'); updateKeyStatus(); refreshAll(); connectEvents(); }
+function updateKeyStatus() {
+  const el = document.getElementById('key-status');
+  if (el) el.textContent = sessionStorage.getItem('glint_api_key') ? 'key set' : '';
+}
+function showTab(name) {
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('tab-'+name).classList.add('active');
+  document.querySelector(`.tab[data-tab="${name}"]`).classList.add('active');
+  if (name === 'providers') loadProviders();
+  if (name === 'keys') loadKeys();
+  if (name === 'routing') loadTiers();
+  if (name === 'flywheel') loadFlywheel();
+}
+
+// ---- LIVE TAB ----
+async function refreshLive() {
+  const [stats, trace, cost, reviewStats, config] = await Promise.all([
+    fetchJSON('/stats'), fetchJSON('/trace?limit=10'), fetchJSON('/cost?since_hours=24'),
+    fetchJSON('/review-stats'), fetchJSON('/config'),
+  ]);
+  if (stats) renderEndpoints(stats);
+  if (trace) renderTrace(trace.decisions||[]);
+  if (cost) renderCost(cost);
+  if (reviewStats && config) renderHero(trace, reviewStats, config, stats);
+}
+function renderHero(trace, review, config, stats) {
+  document.getElementById('num-decisions').textContent = (trace?.decisions?.length||0);
+  document.getElementById('num-models').textContent = stats?.endpoints ? Object.keys(stats.endpoints).length : '—';
+  document.getElementById('num-reviewer').textContent = config?.config?.reviewer?.model || '—';
+  const spend = review?.est_total_cost_usd || 0;
+  document.getElementById('num-spend').textContent = '$' + spend.toFixed(3);
+}
+function renderEndpoints(stats) {
+  const tbody = document.getElementById('endpoints-table'); tbody.innerHTML = '';
+  for (const [name, e] of Object.entries(stats.endpoints||{})) {
+    const h = e.health;
+    const hc = h===true?'health-up':h==='OPEN'||h===false?'health-open':h==='HALF_OPEN'?'health-half':'health-up';
+    const load = e.max_concurrency>0?Math.min(100,e.inflight/e.max_concurrency*100):0;
+    tbody.innerHTML += `<tr><td><b>${esc(name)}</b></td><td>${esc(e.kind)}</td><td><span class="gpunode"><span class="chip ${hc}"></span>${esc(h===true?'OK':h||'—')}</span></td><td>${esc(e.inflight)}</td><td>${esc(e.max_concurrency)}</td><td><div class="spend-bar"><div class="spend-fill ${load>80?'err':load>50?'warn':''}" style="width:${load}%"></div></div></td></tr>`;
+  }
+}
+function renderTrace(decisions) {
+  const c = document.getElementById('trace-container'); c.innerHTML = '';
+  decisions.slice(0,20).forEach(d => {
+    const tb = TIER_BADGES[d.tier]||'b2';
+    c.innerHTML += `<div class="trace-row"><span class="badge ${tb}">${esc(d.tier)}</span><span style="font-size:10px;color:var(--dim)">${esc(d.vertical||'?')}</span><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(d.query_preview||'')}</span><span style="text-align:right;color:var(--dim)">${d.ms_total?Math.round(d.ms_total)+'ms':''}</span></div>`;
+  });
+}
+function renderCost(cost) {
+  const el = document.getElementById('cost-table');
+  if (!cost?.by_tier) { el.innerHTML = '<span style="color:var(--dim)">No data</span>'; return; }
+  let html = '<table><thead><tr><th>Tier</th><th>Requests</th><th>Cost</th></tr></thead><tbody>';
+  for (const [t, s] of Object.entries(cost.by_tier)) {
+    html += `<tr><td><span class="badge ${TIER_BADGES[t]||'b2'}">${esc(t)}</span></td><td>${esc(s.count)}</td><td>$${(s.total_cost||0).toFixed(4)}</td></tr>`;
+  }
+  html += '</tbody></table>'; el.innerHTML = html;
+}
+function toggleEvents() { eventsPaused = !eventsPaused; }
+async function connectEvents() {
+  if (eventSource) eventSource.abort();
+  const controller = new AbortController(); eventSource = controller;
+  const headers = {};
+  const token = sessionStorage.getItem('glint_api_key');
+  if (token) headers.Authorization = 'Bearer ' + token;
+  try {
+    const response = await fetch('/events', {headers, signal:controller.signal});
+    if (!response.ok || !response.body) return;
+    const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
+    while (true) {
+      const {value, done} = await reader.read(); if (done) break;
+      buffer += decoder.decode(value, {stream:true}).replace(/\r\n/g, '\n');
+      let boundary;
+      while ((boundary = buffer.indexOf('\n\n')) >= 0) {
+        const frame = buffer.slice(0, boundary); buffer = buffer.slice(boundary + 2);
+        const data = frame.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trim()).join('\n');
+        if (!data || eventsPaused) continue;
+        try { renderEvent(JSON.parse(data)); } catch(err) {}
+      }
+    }
+  } catch(err) {
+    if (!controller.signal.aborted) setTimeout(connectEvents, 2000);
+  }
+}
+function renderEvent(ev) {
+  const c = document.getElementById('events-container');
+  const line = document.createElement('div');
+  line.style.cssText = 'padding:3px 0;border-bottom:1px solid var(--border)';
+  line.style.color = ev.severity==='error'?'var(--err)':ev.severity==='warn'?'var(--warn)':'var(--dim)';
+  const detail = ev.data?.description || JSON.stringify(ev.data||{}).slice(0,100);
+  line.textContent = `[${ev.source}] ${ev.type}: ${detail}`;
+  c.prepend(line); while (c.children.length > 50) c.removeChild(c.lastChild);
+}
+function refreshAll() { updateKeyStatus(); refreshLive(); }
+
+// ---- PROVIDERS TAB ----
+async function loadPresets() {
+  const data = await fetchJSON('/admin/provider-presets');
+  if (!data?.presets) return;
+  _presets = data.presets;
+  const sel = document.getElementById('preset-select');
+  sel.innerHTML = '<option value="">— Custom —</option>';
+  for (const [key, p] of Object.entries(_presets)) {
+    sel.innerHTML += `<option value="${esc(key)}">${esc(p.display)} (${esc(p.region)})</option>`;
+  }
+}
+function applyPreset() {
+  const key = document.getElementById('preset-select').value;
+  if (!key || !_presets[key]) return;
+  const p = _presets[key];
+  document.getElementById('ep-kind').value = p.kind;
+  document.getElementById('ep-url').value = p.base_url;
+  document.getElementById('ep-model').value = p.default_models?.[0] || '';
+  document.getElementById('ep-keyenv').value = p.api_key_env || '';
+  document.getElementById('ep-ctx').value = p.max_context || 32768;
+  if (!document.getElementById('ep-name').value)
+    document.getElementById('ep-name').value = key.replace(/[^a-z0-9_]/gi,'_');
+}
+function openAddProvider(editing=null) {
+  _editingProvider = editing;
+  document.getElementById('modal-provider-title').textContent = editing ? 'Edit Provider' : 'Add Provider';
+  document.getElementById('ep-name').value = editing?.name || '';
+  document.getElementById('ep-kind').value = editing?.kind || 'openai';
+  document.getElementById('ep-url').value = editing?.base_url || '';
+  document.getElementById('ep-model').value = editing?.model_alias || '';
+  document.getElementById('ep-keyenv').value = editing?.api_key_env || '';
+  document.getElementById('ep-conc').value = editing?.concurrency || 4;
+  document.getElementById('ep-ctx').value = editing?.max_context || 32768;
+  document.getElementById('preset-select').value = '';
+  document.getElementById('test-result').innerHTML = '';
+  document.getElementById('modal-provider').classList.add('show');
+}
+function closeModal(id) { document.getElementById(id).classList.remove('show'); }
+async function probeLocal() {
+  toast('Scanning localhost...');
+  const data = await fetchJSON('/admin/probe-local');
+  const el = document.getElementById('probe-results');
+  if (!data?.discovered?.length) { el.innerHTML = '<div class="card" style="color:var(--dim)">No local LLM servers found. Make sure Ollama, LM Studio, vLLM, or llama.cpp is running.</div>'; return; }
+  let html = '<div class="card"><div class="title">Discovered Local Services</div><div class="discovered">';
+  data.discovered.forEach(d => {
+    const encoded = safeArg(JSON.stringify({url:d.base_url,kind:d.kind,model:d.models?.[0]||''}));
+    html += `<div class="disc-card"><div class="info"><b>${esc(d.service)}</b> · ${esc(d.base_url)} · kind=${esc(d.kind)}<div class="models">Models: ${esc(d.models?.join(', ')||'unknown')}</div></div><button class="btn primary sm" onclick="quickAddLocalEncoded('${encoded}')">Add</button></div>`;
+  });
+  html += '</div></div>';
+  el.innerHTML = html;
+}
+async function quickAddLocal(url, kind, model) {
+  const name = 'local_' + url.split('//')[1].split(':')[1];
+  const {status, data} = await api('/admin/endpoints', 'POST', {name, kind, base_url:url, model_alias:model||'default', concurrency:4, max_context:32768});
+  if (status===201) { toast('Added: '+name); loadProviders(); } else { toast('Failed: '+data, false); }
+}
+function quickAddLocalEncoded(encoded) { const d=JSON.parse(decodeURIComponent(encoded)); return quickAddLocal(d.url,d.kind,d.model); }
+async function loadProviders() {
+  if (!Object.keys(_presets).length) await loadPresets();
+  const config = await fetchJSON('/config');
+  const tbody = document.getElementById('providers-table'); tbody.innerHTML = '';
+  if (!config?.config?.endpoints) return;
+  config.config.endpoints.forEach(ep => {
+    const encoded = safeArg(JSON.stringify(ep));
+    tbody.innerHTML += `<tr><td><b>${esc(ep.name)}</b></td><td><span class="badge b2">${esc(ep.kind)}</span></td><td style="font-size:11px;color:var(--dim)">${esc(ep.base_url)}</td><td>${esc(ep.model_alias||'—')}</td><td><button class="btn sm" onclick="openEncodedProvider('${encoded}')">Edit</button> <button class="btn sm danger" onclick="deleteProvider('${esc(ep.name)}')">Delete</button></td></tr>`;
+  });
+}
+function openEncodedProvider(encoded) { openAddProvider(JSON.parse(decodeURIComponent(encoded))); }
+async function deleteProvider(name) {
+  if (!confirm('Delete provider "'+name+'"?')) return;
+  const {status} = await api('/admin/endpoints/'+name, 'DELETE');
+  if (status===200) { toast('Deleted: '+name); loadProviders(); } else { toast('Failed', false); }
+}
+async function saveProvider() {
+  const body = {
+    name: document.getElementById('ep-name').value,
+    kind: document.getElementById('ep-kind').value,
+    base_url: document.getElementById('ep-url').value,
+    model_alias: document.getElementById('ep-model').value,
+    api_key_env: document.getElementById('ep-keyenv').value || undefined,
+    concurrency: parseInt(document.getElementById('ep-conc').value)||4,
+    max_context: parseInt(document.getElementById('ep-ctx').value)||32768,
+  };
+  if (!body.name || !body.base_url) { toast('Name and URL required', false); return; }
+  const method = _editingProvider ? 'PUT' : 'POST';
+  const path = _editingProvider ? '/admin/endpoints/'+_editingProvider.name : '/admin/endpoints';
+  const {status, data} = await api(path, method, body);
+  if (status===200||status===201) { toast(_editingProvider?'Updated':'Added: '+body.name); closeModal('modal-provider'); loadProviders(); }
+  else { toast('Error: '+data, false); }
+}
+async function testFromModal() {
+  const el = document.getElementById('test-result');
+  el.innerHTML = '<span style="color:var(--dim)">Testing...</span>';
+  const body = {
+    base_url: document.getElementById('ep-url').value,
+    kind: document.getElementById('ep-kind').value,
+    model_alias: document.getElementById('ep-model').value,
+    api_key_env: document.getElementById('ep-keyenv').value || undefined,
+  };
+  const {status, data} = await api('/admin/test-endpoint', 'POST', body);
+  if (status===200) { el.style.color='var(--accent)'; el.textContent=`OK (${data.latency_ms}ms): "${data.response_preview||''}"`; }
+  else { el.style.color='var(--err)'; el.textContent=`Failed: ${typeof data==='string'?data:data?.error||'unknown'}`; }
+}
+
+// ---- KEYS TAB ----
+async function generateKey() {
+  const tenant = document.getElementById('key-tenant').value || 'anonymous';
+  const scope = JSON.parse(document.getElementById('key-scope').value);
+  const {status, data} = await api('/admin/keys', 'POST', {tenant_id:tenant, scope});
+  if (status===201) {
+    document.getElementById('new-key-display').style.display = 'block';
+    document.getElementById('new-key-value').value = data.key;
+    toast('Key generated!'); loadKeys();
+  } else { toast('Failed: '+data, false); }
+}
+async function loadKeys() {
+  const data = await fetchJSON('/admin/keys');
+  const tbody = document.getElementById('keys-table'); tbody.innerHTML = '';
+  if (!data?.keys) return;
+  data.keys.forEach(k => {
+    tbody.innerHTML += `<tr><td style="font-family:monospace">${esc(k.key_masked)}</td><td>${esc(k.tenant_id)}</td><td>${esc(k.scope?.join(', '))}</td><td><button class="btn sm danger" onclick="revokeKey('${esc(k.key_masked.split('...')[0])}')">Revoke</button></td></tr>`;
+  });
+}
+async function revokeKey(prefix) {
+  if (!confirm('Revoke this key?')) return;
+  const {status} = await api('/admin/keys/'+prefix, 'DELETE');
+  if (status===200) { toast('Revoked'); loadKeys(); } else { toast('Failed', false); }
+}
+
+// ---- ROUTING TAB ----
+async function loadTiers() {
+  const config = await fetchJSON('/config');
+  const el = document.getElementById('tiers-container');
+  if (!config?.config?.tiers) return;
+  el.innerHTML = '';
+  config.config.tiers.forEach(t => {
+    const eps = (t.endpoints||[]).map(e => `<span class="tag">${esc(e)}</span>`).join('');
+    const overrideOnly = t.override_only ? '<span class="badge bm" style="margin-left:8px">override-only</span>' : '';
+    el.innerHTML += `<div class="tier-card"><h3><span class="badge ${TIER_BADGES[t.name]||'b2'}">${esc(t.name)}</span>${overrideOnly}</h3><div style="font-size:11px;color:var(--dim)">max_context: ${(t.max_context||32768).toLocaleString()}</div><div class="tier-endpoints">${eps||'<span style="color:var(--dim)">no endpoints assigned</span>'}</div></div>`;
+  });
+}
+
+// ---- FLYWHEEL TAB ----
+async function loadFlywheel() {
+  const [review, registry, accuracy, graph, training] = await Promise.all([
+    fetchJSON('/review-stats'), fetchJSON('/registry'), fetchJSON('/accuracy?since_hours=168'),
+    fetchJSON('/admin/flywheel-graph'), fetchJSON('/admin/training-status'),
+  ]);
+  if (review) {
+    document.getElementById('fw-pending').textContent = review.pending||0;
+    document.getElementById('fw-review-detail').textContent = `${review.done||0} done · ${review.failed||0} failed`;
+  }
+  if (graph) {
+    document.getElementById('fw-curated').textContent = graph.total_curated||0;
+  }
+  if (training) {
+    const el = document.getElementById('fw-router-status');
+    const ts = document.getElementById('fw-training-status');
+    if (training.training_in_progress) { el.innerHTML = '<span style="color:var(--warn)">Training...</span>'; ts.textContent = '⏳ training in progress'; }
+    else if (training.is_stub) { el.innerHTML = '<span style="color:var(--dim)">Stub model</span>'; ts.textContent=''; }
+    else { el.innerHTML = '<span style="color:var(--accent)">'+esc(training.router_version||'active')+'</span>'; ts.textContent=''; }
+    if (training.drift_alarm) el.innerHTML += '<br><span style="color:var(--err);font-size:11px">⚠ drift alarm active</span>';
+  }
+  if (registry) {
+    document.getElementById('fw-versions').textContent = registry.checkpoints?.length||0;
+    const activeVer = registry.active_version;
+    const tb = document.getElementById('fw-checkpoints'); tb.innerHTML = '';
+    (registry.checkpoints||[]).forEach(c => {
+      const isActive = c.id === activeVer;
+      const status = c.rolled_back_at ? '<span style="color:var(--err)">rolled back</span>' : isActive ? '<span style="color:var(--accent)">★ active</span>' : c.promoted ? '<span style="color:var(--t2)">promoted</span>' : 'pending';
+      const canRevert = c.promoted && !isActive && !c.rolled_back_at;
+      const revertBtn = canRevert ? `<button class="btn sm" onclick="revertTo(decodeURIComponent('${safeArg(c.id)}'))">Revert</button>` : '';
+      tb.innerHTML += `<tr><td style="font-family:monospace;font-size:11px">${esc(c.id?.slice(0,20))}</td><td>${status}</td><td>${c.eval_base_accuracy?(c.eval_base_accuracy*100).toFixed(1)+'%':'—'}</td><td>${c.eval_live_accuracy?(c.eval_live_accuracy*100).toFixed(1)+'%':'—'}</td><td style="font-size:10px;color:var(--dim)">${c.created_at?new Date(c.created_at).toLocaleDateString():'—'}</td><td>${revertBtn}</td></tr>`;
+    });
+  }
+  if (graph?.nodes) renderFlywheelGraph(graph);
+  if (accuracy?.per_vertical) {
+    const el = document.getElementById('fw-vertical-accuracy');
+    let html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px">';
+    for (const [v, s] of Object.entries(accuracy.per_vertical)) {
+      const acc = s.accuracy!=null?(s.accuracy*100).toFixed(0)+'%':'—';
+      const color = s.accuracy==null?'var(--dim)':s.accuracy>0.9?'var(--accent)':s.accuracy>0.7?'var(--warn)':'var(--err)';
+      html += `<div style="background:var(--card);border:1px solid var(--border);border-radius:6px;padding:8px"><div style="font-size:11px;color:var(--dim)">${esc(v)}</div><div style="font-size:18px;font-weight:700;color:${color}">${acc}</div><div style="font-size:10px;color:var(--dim)">${s.correct}/${s.correct+s.wrong}</div></div>`;
+    }
+    html += '</div>'; el.innerHTML = html;
+  }
+}
+function renderFlywheelGraph(graph) {
+  const svg = document.getElementById('flywheel-graph');
+  const w = svg.clientWidth||800, h = 400, cx = w/2, cy = h/2;
+  const nodes = graph.nodes||[]; const edges = graph.edges||[];
+  if (!nodes.length) { svg.innerHTML = '<text x="'+cx+'" y="'+cy+'" text-anchor="middle" fill="#5a6678">No data yet — the flywheel needs reviewed samples.</text>'; return; }
+  const maxCurated = Math.max(...nodes.map(n=>n.curated), 1);
+  const radius = Math.min(cx, cy) - 60;
+  // Position nodes in a circle
+  nodes.forEach((n, i) => {
+    const angle = (i / nodes.length) * Math.PI * 2 - Math.PI/2;
+    n.x = cx + Math.cos(angle) * radius;
+    n.y = cy + Math.sin(angle) * radius;
+  });
+  const nodeMap = {}; nodes.forEach(n => nodeMap[n.id] = n);
+  let html = '';
+  // Edges (confusion)
+  edges.forEach(e => {
+    const s = nodeMap[e.source], t = nodeMap[e.target];
+    if (!s || !t) return;
+    const opacity = Math.min(0.6, e.count/10);
+    const mx = (s.x+t.x)/2, my = (s.y+t.y)/2 - 20;
+    html += `<path d="M${s.x},${s.y} Q${mx},${my} ${t.x},${t.y}" stroke="var(--err)" stroke-width="${Math.min(3,e.count/3)}" fill="none" opacity="${opacity}"/>`;
+  });
+  // Nodes
+  nodes.forEach(n => {
+    const r = 8 + Math.sqrt(n.curated/maxCurated)*22;
+    const color = n.accuracy==null?'#5a6678':n.accuracy>0.9?'#00d4aa':n.accuracy>0.7?'#ff9f43':'#ff5252';
+    const label = n.label||n.id;
+    html += `<circle cx="${n.x}" cy="${n.y}" r="${r}" fill="${color}" fill-opacity="0.15" stroke="${color}" stroke-width="2" style="cursor:pointer" onclick="showNodeDetail(decodeURIComponent('${safeArg(n.id)}'),${n.curated},${n.accuracy||'null'},${n.correct||0},${n.wrong||0})"/>`;
+    html += `<text x="${n.x}" y="${n.y+r+12}" text-anchor="middle" fill="#c5d0de" font-size="9" style="pointer-events:none">${esc(label.length>14?label.slice(0,12)+'..':label)}</text>`;
+  });
+  svg.innerHTML = html;
+}
+function showNodeDetail(id, curated, accuracy, correct, wrong) {
+  const el = document.getElementById('fw-node-detail');
+  const accStr = accuracy!=null?(accuracy*100).toFixed(1)+'%':'no data';
+  el.innerHTML = `<b style="color:var(--bright)">${esc(id)}</b> — ${curated} curated samples, accuracy: ${accStr} (${correct} correct / ${wrong} wrong)`;
+}
+async function revertTo(version) {
+  if (!confirm('Revert router to version '+version.slice(0,20)+'...?')) return;
+  toast('Reverting...');
+  const {status, data} = await api('/admin/revert/'+version, 'POST');
+  if (status===200) { toast('Reverted to '+version.slice(0,12)); loadFlywheel(); }
+  else { toast('Revert failed: '+data, false); }
+}
+async function triggerRetrain(allowEmbedding) {
+  if (!confirm(allowEmbedding?'Trigger retrain with embedding fine-tune? (stub — will run heads-only)':'Trigger retrain now?')) return;
+  toast('Retrain triggered...');
+  const path = '/retrain' + (allowEmbedding?'?allow_embedding_finetune=true':'');
+  const {status} = await api(path, 'POST');
+  if (status===200) { toast('Retrain started'); setTimeout(loadFlywheel, 2000); }
+  else toast('Failed', false);
+}
+
+// ---- INIT ----
+refreshAll();
+connectEvents();
+setInterval(refreshLive, REFRESH_MS);
+loadPresets();
+</script>
+</body>
+</html>

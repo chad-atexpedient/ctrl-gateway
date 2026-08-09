@@ -1,0 +1,252 @@
+{
+  "_doc": "Provider presets for Glint-V2 guided setup. Each preset defines how to connect to a provider. Most providers are OpenAI-compatible (kind=openai) and only need base_url + api_key. Anthropic and Google have native adapters. The dashboard's Setup wizard reads these presets so users can add a provider with one click + an API key.",
+  "version": 1,
+  "presets": {
+    "openai": {
+      "display": "OpenAI",
+      "kind": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "region": "us",
+      "default_models": ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "o3-mini"],
+      "default_pricing": {"in_per_1k_tokens": 0.0025, "out_per_1k_tokens": 0.01},
+      "max_context": 128000,
+      "docs": "https://platform.openai.com/docs/api-reference"
+    },
+    "anthropic": {
+      "display": "Anthropic (Claude)",
+      "kind": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "region": "us",
+      "default_models": ["claude-sonnet-4-20250514", "claude-3-5-haiku-20241022", "claude-3-5-sonnet-20241022"],
+      "default_pricing": {"in_per_1k_tokens": 0.003, "out_per_1k_tokens": 0.015},
+      "max_context": 200000,
+      "docs": "https://docs.anthropic.com/en/api/messages"
+    },
+    "google": {
+      "display": "Google Gemini",
+      "kind": "gemini",
+      "base_url": "https://generativelanguage.googleapis.com",
+      "api_key_env": "GOOGLE_API_KEY",
+      "region": "us",
+      "default_models": ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-pro", "gemini-1.5-flash"],
+      "default_pricing": {"in_per_1k_tokens": 0.001, "out_per_1k_tokens": 0.004},
+      "max_context": 1000000,
+      "docs": "https://ai.google.dev/gemini-api/docs"
+    },
+    "groq": {
+      "display": "Groq (ultra-fast)",
+      "kind": "openai",
+      "base_url": "https://api.groq.com/openai/v1",
+      "api_key_env": "GROQ_API_KEY",
+      "region": "us",
+      "default_models": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "deepseek-r1-distill-llama-70b"],
+      "default_pricing": {"in_per_1k_tokens": 0.0006, "out_per_1k_tokens": 0.0008},
+      "max_context": 128000,
+      "docs": "https://console.groq.com/docs"
+    },
+    "together": {
+      "display": "Together AI",
+      "kind": "openai",
+      "base_url": "https://api.together.xyz/v1",
+      "api_key_env": "TOGETHER_API_KEY",
+      "region": "us",
+      "default_models": ["meta-llama/Llama-3.3-70B-Instruct-Turbo", "Qwen/Qwen2.5-72B-Instruct-Turbo"],
+      "default_pricing": {"in_per_1k_tokens": 0.0008, "out_per_1k_tokens": 0.0023},
+      "max_context": 128000,
+      "docs": "https://docs.together.ai"
+    },
+    "fireworks": {
+      "display": "Fireworks AI",
+      "kind": "openai",
+      "base_url": "https://api.fireworks.ai/inference/v1",
+      "api_key_env": "FIREWORKS_API_KEY",
+      "region": "us",
+      "default_models": ["accounts/fireworks/models/llama-v3p3-70b-instruct", "accounts/fireworks/models/qwen2p5-72b-instruct"],
+      "default_pricing": {"in_per_1k_tokens": 0.0009, "out_per_1k_tokens": 0.0026},
+      "max_context": 128000,
+      "docs": "https://docs.fireworks.ai"
+    },
+    "mistral": {
+      "display": "Mistral AI",
+      "kind": "openai",
+      "base_url": "https://api.mistral.ai/v1",
+      "api_key_env": "MISTRAL_API_KEY",
+      "region": "us",
+      "default_models": ["mistral-large-latest", "mistral-small-latest", "codestral-latest"],
+      "default_pricing": {"in_per_1k_tokens": 0.002, "out_per_1k_tokens": 0.006},
+      "max_context": 128000,
+      "docs": "https://docs.mistral.ai"
+    },
+    "xai": {
+      "display": "xAI (Grok)",
+      "kind": "openai",
+      "base_url": "https://api.x.ai/v1",
+      "api_key_env": "XAI_API_KEY",
+      "region": "us",
+      "default_models": ["grok-3", "grok-3-mini", "grok-2-vision"],
+      "default_pricing": {"in_per_1k_tokens": 0.005, "out_per_1k_tokens": 0.015},
+      "max_context": 131072,
+      "docs": "https://docs.x.ai"
+    },
+    "perplexity": {
+      "display": "Perplexity",
+      "kind": "openai",
+      "base_url": "https://api.perplexity.ai",
+      "api_key_env": "PERPLEXITY_API_KEY",
+      "region": "us",
+      "default_models": ["sonar-pro", "sonar", "sonar-reasoning"],
+      "default_pricing": {"in_per_1k_tokens": 0.001, "out_per_1k_tokens": 0.001},
+      "max_context": 127072,
+      "docs": "https://docs.perplexity.ai"
+    },
+    "openrouter": {
+      "display": "OpenRouter (aggregator)",
+      "kind": "openai",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "region": "us",
+      "default_models": ["openai/gpt-4o", "anthropic/claude-3.5-sonnet", "google/gemini-2.0-flash-exp:free", "deepseek/deepseek-r1"],
+      "default_pricing": {"in_per_1k_tokens": 0.003, "out_per_1k_tokens": 0.01},
+      "max_context": 128000,
+      "docs": "https://openrouter.ai/docs"
+    },
+    "cohere": {
+      "display": "Cohere",
+      "kind": "openai",
+      "base_url": "https://api.cohere.ai/v1",
+      "api_key_env": "COHERE_API_KEY",
+      "region": "us",
+      "default_models": ["command-r-plus", "command-r", "command-r7b"],
+      "default_pricing": {"in_per_1k_tokens": 0.0025, "out_per_1k_tokens": 0.01},
+      "max_context": 128000,
+      "docs": "https://docs.cohere.com"
+    },
+    "deepseek": {
+      "display": "DeepSeek",
+      "kind": "openai",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "region": "cn",
+      "default_models": ["deepseek-chat", "deepseek-reasoner", "deepseek-r1"],
+      "default_pricing": {"in_per_1k_tokens": 0.0003, "out_per_1k_tokens": 0.0011},
+      "max_context": 64000,
+      "docs": "https://api-docs.deepseek.com"
+    },
+    "moonshot": {
+      "display": "Moonshot AI (Kimi)",
+      "kind": "openai",
+      "base_url": "https://api.moonshot.cn/v1",
+      "api_key_env": "MOONSHOT_API_KEY",
+      "region": "cn",
+      "default_models": ["moonshot-v1-auto", "moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
+      "default_pricing": {"in_per_1k_tokens": 0.0017, "out_per_1k_tokens": 0.0017},
+      "max_context": 128000,
+      "docs": "https://platform.moonshot.cn/docs"
+    },
+    "zhipu": {
+      "display": "Zhipu AI (ChatGLM)",
+      "kind": "openai",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "api_key_env": "ZHIPU_API_KEY",
+      "region": "cn",
+      "default_models": ["glm-4-plus", "glm-4-flash", "glm-4-air", "glm-4v-plus"],
+      "default_pricing": {"in_per_1k_tokens": 0.0007, "out_per_1k_tokens": 0.0007},
+      "max_context": 128000,
+      "docs": "https://open.bigmodel.cn/dev/api"
+    },
+    "minimax": {
+      "display": "MiniMax",
+      "kind": "openai",
+      "base_url": "https://api.minimax.chat/v1",
+      "api_key_env": "MINIMAX_API_KEY",
+      "region": "cn",
+      "default_models": ["abab6.5s-chat", "abab6.5-chat"],
+      "default_pricing": {"in_per_1k_tokens": 0.0005, "out_per_1k_tokens": 0.0005},
+      "max_context": 245760,
+      "docs": "https://platform.minimaxi.com/document"
+    },
+    "doubao": {
+      "display": "ByteDance Doubao",
+      "kind": "openai",
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+      "api_key_env": "DOUBAO_API_KEY",
+      "region": "cn",
+      "default_models": ["doubao-pro-32k", "doubao-pro-128k", "doubao-lite-32k"],
+      "default_pricing": {"in_per_1k_tokens": 0.0001, "out_per_1k_tokens": 0.0002},
+      "max_context": 128000,
+      "docs": "https://www.volcengine.com/docs/82379"
+    },
+    "stepfun": {
+      "display": "StepFun",
+      "kind": "openai",
+      "base_url": "https://api.stepfun.com/v1",
+      "api_key_env": "STEPFUN_API_KEY",
+      "region": "cn",
+      "default_models": ["step-1-8k", "step-1-32k", "step-1-128k", "step-1v-8k"],
+      "default_pricing": {"in_per_1k_tokens": 0.0003, "out_per_1k_tokens": 0.001},
+      "max_context": 128000,
+      "docs": "https://platform.stepfun.com"
+    },
+    "xiaomi": {
+      "display": "Xiaomi Token Plan",
+      "kind": "openai",
+      "base_url": "https://token-plan-sgp.xiaomimimo.com/v1",
+      "api_key_env": "XIAOMI_API_KEY",
+      "region": "cn",
+      "default_models": ["mimo-large", "mimo-mini"],
+      "default_pricing": {"in_per_1k_tokens": 0.0002, "out_per_1k_tokens": 0.0006},
+      "max_context": 64000,
+      "docs": "https://xiaomimimo.com"
+    },
+    "ollama": {
+      "display": "Ollama (local)",
+      "kind": "ollama",
+      "base_url": "http://localhost:11434",
+      "api_key_env": null,
+      "region": "local",
+      "default_models": [],
+      "default_pricing": {"in_per_1k_tokens": 0.0, "out_per_1k_tokens": 0.0},
+      "max_context": 32768,
+      "docs": "https://ollama.com",
+      "discoverable": true
+    },
+    "lmstudio": {
+      "display": "LM Studio (local)",
+      "kind": "openai",
+      "base_url": "http://localhost:1234/v1",
+      "api_key_env": null,
+      "region": "local",
+      "default_models": [],
+      "default_pricing": {"in_per_1k_tokens": 0.0, "out_per_1k_tokens": 0.0},
+      "max_context": 32768,
+      "docs": "https://lmstudio.ai",
+      "discoverable": true
+    },
+    "vllm": {
+      "display": "vLLM (local)",
+      "kind": "openai",
+      "base_url": "http://localhost:8000/v1",
+      "api_key_env": null,
+      "region": "local",
+      "default_models": [],
+      "default_pricing": {"in_per_1k_tokens": 0.0, "out_per_1k_tokens": 0.0},
+      "max_context": 32768,
+      "docs": "https://docs.vllm.ai",
+      "discoverable": true
+    },
+    "llamacpp": {
+      "display": "llama.cpp server (local)",
+      "kind": "llamacpp",
+      "base_url": "http://localhost:8070",
+      "api_key_env": null,
+      "region": "local",
+      "default_models": [],
+      "default_pricing": {"in_per_1k_tokens": 0.0, "out_per_1k_tokens": 0.0},
+      "max_context": 32768,
+      "docs": "https://github.com/ggerganov/llama.cpp/tree/master/tools/server",
+      "discoverable": true
+    }
+  }
+}

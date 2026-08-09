@@ -1,0 +1,733 @@
+# Glint-V2 vertical taxonomy
+# Each vertical has:
+#   name: unique id
+#   display: human-readable
+#   description: short description used by router head and synthetic-data prompt
+#   keywords: alias keywords (helps with synthetic data generation + OOD detection)
+#   min_capability: 0-1, minimum capability score a tier must have for this vertical to qualify as "sufficient"
+#   preferred_tiers: hint tiers (informational; cost-first still picks)
+#   kind: "topic" (most verticals) | "structural" (allowed for prototypes — system_design etc.)
+#   examples: 2-3 example queries used for synthetic data seed + adversarial pairs
+
+verticals:
+
+  - name: chat
+    display: Casual Chat
+    description: General conversational chat, greetings, small talk
+    keywords: [hi, hello, hey, how are you, what's up, good morning]
+    min_capability: 0.3
+    preferred_tiers: [tier0]
+    kind: topic
+    examples:
+      - "Hi how are you"
+      - "Hello there"
+      - "What's up?"
+
+  - name: trivia
+    display: Trivia / Fact Recall
+    description: Simple factual Q&A, capitals, dates, definitions
+    keywords: [what is, who is, when was, where is, capital of, definition]
+    min_capability: 0.5
+    preferred_tiers: [tier0, tier2]
+    kind: topic
+    examples:
+      - "What is the capital of France?"
+      - "Who wrote Hamlet?"
+      - "What year did WWII end?"
+
+  - name: freshness
+    display: Freshness / Current Events
+    description: Time-sensitive queries about current events, weather, news
+    keywords: [today, current, latest, news, weather, breaking, this week]
+    min_capability: 0.4
+    preferred_tiers: [tier0]
+    kind: topic
+    examples:
+      - "What is the weather in Paris?"
+      - "Latest news about AI"
+      - "What happened today in tech?"
+
+  - name: formatting
+    display: Formatting / Structure
+    description: Reformating content (markdown, tables, lists, JSON structuring)
+    keywords: [format, reformat, structure, markdown, table, json, csv]
+    min_capability: 0.5
+    preferred_tiers: [tier0, tier2]
+    kind: topic
+    examples:
+      - "Format this as a markdown table"
+      - "Convert to JSON"
+
+  - name: summarization_simple
+    display: Simple Summarization
+    description: Summarize short documents (< 2K tokens) without analysis
+    keywords: [summarize, tldr, brief, short version, key points]
+    min_capability: 0.5
+    preferred_tiers: [tier0, tier2]
+    kind: topic
+    examples:
+      - "Summarize this article"
+      - "TLDR this email"
+
+  - name: summarization
+    display: Complex Summarization
+    description: Summarize long documents with analysis and key takeaways
+    keywords: [comprehensive summary, executive summary, synthesize, key takeaways]
+    min_capability: 0.7
+    preferred_tiers: [tier2, tier3]
+    kind: topic
+    examples:
+      - "Summarize this 50-page report into key themes"
+      - "Synthesize these meeting notes"
+
+  - name: translation_simple
+    display: Simple Translation
+    description: Translate short text between languages
+    keywords: [translate, translation, in spanish, in french, to english]
+    min_capability: 0.5
+    preferred_tiers: [tier0, tier1]
+    kind: topic
+    examples:
+      - "Translate 'hello world' to Spanish"
+      - "What is 'good morning' in Japanese?"
+
+  - name: translation
+    display: Complex Translation
+    description: Translate technical, literary, or nuanced content preserving tone
+    keywords: [professional translation, literary translation, technical translation]
+    min_capability: 0.7
+    preferred_tiers: [tier1, tier2]
+    kind: topic
+    examples:
+      - "Translate this technical paper abstract preserving terminology"
+      - "Translate this poem preserving meter and rhyme"
+
+  - name: programming
+    display: Programming (general)
+    description: General programming questions, syntax, snippets, simple algorithms
+    keywords: [python, javascript, java, c++, rust, go, ruby, php, code, function, syntax]
+    min_capability: 0.6
+    preferred_tiers: [tier2, tier4]
+    kind: topic
+    examples:
+      - "Write a Python function to reverse a string"
+      - "How do I sort a list in JavaScript?"
+
+  - name: hard_programming
+    display: Hard Programming
+    description: Complex algorithms, competitive programming, low-level optimization
+    keywords: [algorithm, complexity, optimization, o(n), dynamic programming, dp, graph]
+    min_capability: 0.85
+    preferred_tiers: [tier4]
+    kind: topic
+    examples:
+      - "Solve this LeetCode hard problem"
+      - "Implement a red-black tree with O(log n) insert"
+
+  - name: web_dev
+    display: Web Development
+    description: HTML/CSS/JS, frameworks (React, Vue, Svelte), backend (Node, Django, Rails)
+    keywords: [html, css, react, vue, svelte, node, django, rails, nextjs, typescript]
+    min_capability: 0.6
+    preferred_tiers: [tier2, tier4]
+    kind: topic
+    examples:
+      - "How do I use React hooks?"
+      - "Build a REST API in Django"
+
+  - name: databases
+    display: Databases
+    description: SQL, NoSQL, schema design, query optimization, migrations
+    keywords: [sql, postgres, mysql, sqlite, mongodb, redis, query, schema, migration]
+    min_capability: 0.6
+    preferred_tiers: [tier2, tier4]
+    kind: topic
+    examples:
+      - "Optimize this slow query"
+      - "Design a schema for multi-tenant SaaS"
+
+  - name: devops_sysadmin
+    display: DevOps / Sysadmin
+    description: CI/CD, Docker, Kubernetes, Linux, networking, deployment
+    keywords: [docker, kubernetes, k8s, ci/cd, github actions, linux, ssh, nginx, deploy]
+    min_capability: 0.6
+    preferred_tiers: [tier2, tier4]
+    kind: topic
+    examples:
+      - "Set up GitHub Actions for a Python project"
+      - "Debug a failing Kubernetes pod"
+
+  - name: security
+    display: Security / Cybersecurity
+    description: AppSec, pentesting, cryptography, threat modeling, secure coding
+    keywords: [security, vulnerability, cve, xss, sql injection, encryption, hash, csrf]
+    min_capability: 0.7
+    preferred_tiers: [tier2, tier4]
+    kind: topic
+    examples:
+      - "How does XSS work?"
+      - "Audit this authentication flow for vulnerabilities"
+
+  - name: data_science_ml
+    display: Data Science / ML
+    description: Statistics, ML model training, data analysis, visualization
+    keywords: [pandas, numpy, scikit-learn, pytorch, tensorflow, regression, classification]
+    min_capability: 0.6
+    preferred_tiers: [tier2, tier4]
+    kind: topic
+    examples:
+      - "Train a classifier on this dataset"
+      - "Explain gradient boosting"
+
+  - name: math
+    display: Math (general)
+    description: "General math: arithmetic, algebra, basic calculus"
+    keywords: [math, equation, solve, calculate, formula, derivative, integral]
+    min_capability: 0.5
+    preferred_tiers: [tier0, tier2]
+    kind: topic
+    examples:
+      - "What is 2+2?"
+      - "Solve x^2 = 9"
+      - "Calculate the area of a circle with radius 5"
+
+  - name: complex_math
+    display: Complex Math
+    description: "Advanced math: topology, abstract algebra, number theory, advanced calculus"
+    keywords: [topology, manifold, group theory, ring theory, category theory, proof]
+    min_capability: 0.85
+    preferred_tiers: [tier3, tier4]
+    kind: topic
+    examples:
+      - "Prove the fundamental theorem of algebra"
+      - "Explain the proof of Fermat's Last Theorem"
+
+  - name: science
+    display: Science (general)
+    description: "General science: physics, chemistry, biology at undergraduate level"
+    keywords: [physics, chemistry, biology, force, energy, atom, molecule, cell]
+    min_capability: 0.6
+    preferred_tiers: [tier2]
+    kind: topic
+    examples:
+      - "Explain photosynthesis"
+      - "What is the ideal gas law?"
+
+  - name: scientific_reasoning
+    display: Scientific Reasoning
+    description: Research-level reasoning, hypothesis formation, experimental design
+    keywords: [hypothesis, experiment, methodology, peer review, replication]
+    min_capability: 0.8
+    preferred_tiers: [tier3]
+    kind: topic
+    examples:
+      - "Design an experiment to test X"
+      - "Critique this research methodology"
+
+  - name: engineering
+    display: Engineering (general)
+    description: Mechanical, electrical, civil engineering at practitioner level
+    keywords: [mechanical, electrical, civil, circuit, beam, stress, load, voltage]
+    min_capability: 0.6
+    preferred_tiers: [tier2]
+    kind: topic
+    examples:
+      - "Calculate the stress on this beam"
+      - "Design a voltage divider"
+
+  - name: reasoning_puzzle
+    display: Reasoning / Puzzles
+    description: Logical reasoning puzzles, riddles, multi-step deduction
+    keywords: [puzzle, riddle, logic, deduce, what comes next, brain teaser]
+    min_capability: 0.6
+    preferred_tiers: [tier2, tier3]
+    kind: topic
+    examples:
+      - "Solve this logic puzzle"
+      - "What comes next in the sequence?"
+
+  - name: creative_writing
+    display: Creative Writing
+    description: Stories, poems, scripts, song lyrics, fiction
+    keywords: [story, poem, haiku, fiction, novel, character, dialogue, plot]
+    min_capability: 0.6
+    preferred_tiers: [tier1]
+    kind: topic
+    examples:
+      - "Write a haiku about rain"
+      - "Write a short story about a robot"
+
+  - name: professional_writing
+    display: Professional Writing
+    description: Emails, reports, business proposals, marketing copy
+    keywords: [email, report, proposal, cover letter, marketing copy, blog post]
+    min_capability: 0.6
+    preferred_tiers: [tier1]
+    kind: topic
+    examples:
+      - "Write a follow-up email after a meeting"
+      - "Draft a project proposal"
+
+  - name: editing_grammar
+    display: Editing / Grammar
+    description: Proofreading, grammar correction, style improvement
+    keywords: [proofread, grammar, spell check, edit, improve, style]
+    min_capability: 0.6
+    preferred_tiers: [tier1]
+    kind: topic
+    examples:
+      - "Proofread this essay"
+      - "Improve the grammar of this paragraph"
+
+  - name: factual_qa
+    display: Factual Q&A
+    description: Encyclopedic knowledge, history, geography, definitions
+    keywords: [explain, describe, what is, history of, geography]
+    min_capability: 0.6
+    preferred_tiers: [tier2]
+    kind: topic
+    examples:
+      - "Tell me a fun fact about the Roman Empire"
+      - "Explain the history of the Silk Road"
+
+  - name: knowledge_general
+    display: General Knowledge
+    description: Broad general-knowledge questions requiring reasoning across domains
+    keywords: [general knowledge, trivia, explain, overview]
+    min_capability: 0.6
+    preferred_tiers: [tier2]
+    kind: topic
+    examples:
+      - "Explain the relationship between quantum mechanics and general relativity"
+
+  - name: education
+    display: Education / Tutoring
+    description: Teaching concepts, explaining topics at student level
+    keywords: [teach me, explain like, tutorial, learn, student, lesson]
+    min_capability: 0.6
+    preferred_tiers: [tier2]
+    kind: topic
+    examples:
+      - "Explain recursion like I'm 12"
+      - "Teach me about machine learning"
+
+  - name: business
+    display: Business / Strategy
+    description: Strategy, operations, management, entrepreneurship
+    keywords: [business, strategy, operations, management, startup, mba]
+    min_capability: 0.6
+    preferred_tiers: [tier2]
+    kind: topic
+    examples:
+      - "How do I scale a SaaS startup?"
+      - "Explain Porter's Five Forces"
+
+  - name: finance
+    display: Finance (general)
+    description: Personal finance, budgeting, investing basics, accounting
+    keywords: [finance, budget, invest, savings, accounting, tax]
+    min_capability: 0.6
+    preferred_tiers: [tier2]
+    kind: topic
+    examples:
+      - "Explain compound interest"
+      - "How do I budget monthly?"
+
+  - name: options_trading
+    display: Options / Derivatives Trading
+    description: Options strategies, Greeks, hedging, advanced trading
+    keywords: [options, call, put, strike, greeks, delta, gamma, theta, vega, hedging]
+    min_capability: 0.75
+    preferred_tiers: [tier3]
+    kind: topic
+    examples:
+      - "Explain call vs put options"
+      - "Walk me through a delta-neutral hedge"
+
+  - name: legal
+    display: Legal (general)
+    description: General legal information (NOT legal advice)
+    keywords: [legal, law, contract, clause, terms, liability, jurisdiction]
+    min_capability: 0.6
+    preferred_tiers: [tier2]
+    kind: topic
+    examples:
+      - "Explain what an NDA does"
+      - "What is force majeure?"
+
+  - name: legal_reasoning
+    display: Legal Reasoning
+    description: Case analysis, statutory interpretation, argument construction
+    keywords: [case law, precedent, statute, brief, motion, jurisdiction]
+    min_capability: 0.8
+    preferred_tiers: [tier3]
+    kind: topic
+    examples:
+      - "Analyze this contract for risks"
+      - "Argue both sides of a constitutional question"
+
+  - name: legal_doc
+    display: Legal Document Drafting
+    description: Drafting contracts, briefs, motions, legal letters
+    keywords: [draft a contract, draft a brief, legal document, motion to]
+    min_capability: 0.8
+    preferred_tiers: [tier3, tier4]
+    kind: topic
+    examples:
+      - "Draft a non-compete clause"
+      - "Draft a motion to dismiss"
+
+  - name: health
+    display: Health (general)
+    description: General wellness, fitness, nutrition, lifestyle health
+    keywords: [health, fitness, nutrition, exercise, diet, wellness, sleep]
+    min_capability: 0.6
+    preferred_tiers: [tier_medical]
+    kind: topic
+    examples:
+      - "What are good exercises for lower back pain?"
+      - "How much protein do I need daily?"
+
+  - name: pharma
+    display: Pharmaceuticals
+    description: Drug information, interactions, dosing, mechanisms
+    keywords: [drug, medication, prescription, dose, mechanism, interaction, side effect]
+    min_capability: 0.9
+    preferred_tiers: [tier_medical]
+    kind: topic
+    examples:
+      - "What are contraindications for metformin?"
+      - "Explain the mechanism of SSRIs"
+
+  - name: clinical
+    display: Clinical Medicine
+    description: Clinical decision support, differential diagnosis, treatment planning
+    keywords: [differential, diagnosis, clinical, treatment plan, patient presentation]
+    min_capability: 0.9
+    preferred_tiers: [tier_medical]
+    kind: topic
+    examples:
+      - "Differential diagnosis for chest pain"
+      - "Workup for suspected PE"
+
+  - name: mental_health
+    display: Mental Health
+    description: Psychology, therapy approaches, mental health information
+    keywords: [anxiety, depression, therapy, cbt, dbt, ptsd, mental health]
+    min_capability: 0.85
+    preferred_tiers: [tier_medical]
+    kind: topic
+    examples:
+      - "Explain cognitive behavioral therapy"
+      - "Symptoms of generalized anxiety disorder"
+
+  - name: wellness
+    display: Wellness / Lifestyle Medicine
+    description: Sleep, stress management, holistic wellness, preventive health
+    keywords: [wellness, mindfulness, meditation, sleep hygiene, stress]
+    min_capability: 0.7
+    preferred_tiers: [tier_medical]
+    kind: topic
+    examples:
+      - "Tips for better sleep"
+      - "How does mindfulness reduce stress?"
+
+  - name: dental
+    display: Dental Health
+    description: Oral health, dental procedures, hygiene
+    keywords: [dental, teeth, gum, cavity, root canal, braces, oral health]
+    min_capability: 0.8
+    preferred_tiers: [tier_medical]
+    kind: topic
+    examples:
+      - "How do I prevent cavities?"
+      - "Explain root canal procedure"
+
+  - name: veterinary
+    display: Veterinary
+    description: Pet health, animal care, veterinary questions
+    keywords: [dog, cat, pet, vet, veterinary, animal health]
+    min_capability: 0.75
+    preferred_tiers: [tier_medical]
+    kind: topic
+    examples:
+      - "Why is my dog limping?"
+      - "Vaccination schedule for kittens"
+
+  - name: travel
+    display: Travel
+    description: Trip planning, destinations, logistics, itineraries
+    keywords: [travel, trip, vacation, itinerary, destination, flight, hotel]
+    min_capability: 0.5
+    preferred_tiers: [tier2]
+    kind: topic
+    examples:
+      - "Plan a 5-day trip to Japan"
+      - "Best time to visit Bali?"
+
+  - name: food
+    display: Food / Cooking
+    description: Recipes, cooking techniques, ingredients, restaurants
+    keywords: [recipe, cook, ingredient, cuisine, restaurant, baking]
+    min_capability: 0.5
+    preferred_tiers: [tier1, tier2]
+    kind: topic
+    examples:
+      - "Recipe for chocolate chip cookies"
+      - "How do I make sourdough?"
+
+  - name: entertainment
+    display: Entertainment (movies/TV/music)
+    description: Recommendations, reviews, trivia about films/TV/music
+    keywords: [movie, film, tv show, music, album, song, recommendation]
+    min_capability: 0.4
+    preferred_tiers: [tier0, tier2]
+    kind: topic
+    examples:
+      - "Best sci-fi movies of 2024"
+      - "Recommend albums similar to Radiohead"
+
+  - name: gaming
+    display: Gaming
+    description: Video games, board games, mechanics, walkthroughs
+    keywords: [game, gaming, walkthrough, boss, strategy guide, steam, playstation, xbox]
+    min_capability: 0.5
+    preferred_tiers: [tier2]
+    kind: topic
+    examples:
+      - "Best build for Elden Ring samurai"
+      - "Tips for Hollow Knight"
+
+  - name: sports
+    display: Sports
+    description: Sport rules, scores, players, history, strategy
+    keywords: [football, basketball, soccer, baseball, tennis, nba, nfl, fifa, score]
+    min_capability: 0.4
+    preferred_tiers: [tier0, tier2]
+    kind: topic
+    examples:
+      - "Who won the 2024 NBA Finals?"
+      - "Explain the offside rule"
+
+  - name: lifestyle
+    display: Lifestyle / Personal
+    description: Personal advice, relationships, life decisions
+    keywords: [relationship, advice, lifestyle, personal, life, dating]
+    min_capability: 0.5
+    preferred_tiers: [tier2]
+    kind: topic
+    examples:
+      - "How do I deal with a difficult coworker?"
+      - "Tips for better work-life balance"
+
+  - name: e_commerce
+    display: E-Commerce / Retail
+    description: Online store operations, product descriptions, marketing, logistics
+    keywords: [shopify, woocommerce, product description, ecommerce, retail, sku]
+    min_capability: 0.5
+    preferred_tiers: [tier2]
+    kind: topic
+    examples:
+      - "Write a product description for a wireless headphone"
+      - "Optimize my Shopify checkout"
+
+  - name: real_estate
+    display: Real Estate
+    description: Property buying/selling, mortgages, real estate analysis
+    keywords: [real estate, mortgage, property, realtor, closing, escrow, listing]
+    min_capability: 0.6
+    preferred_tiers: [tier2]
+    kind: topic
+    examples:
+      - "How does a mortgage work?"
+      - "Calculate monthly payment on a $400K loan"
+
+  - name: hr
+    display: HR / Recruiting
+    description: Hiring, interviews, performance reviews, HR policies
+    keywords: [hiring, interview, recruiter, performance review, hr policy, onboarding]
+    min_capability: 0.6
+    preferred_tiers: [tier2]
+    kind: topic
+    examples:
+      - "Interview questions for a senior engineer"
+      - "Write a performance review template"
+
+  - name: marketing
+    display: Marketing / Advertising
+    description: Marketing strategy, ad copy, SEO, social media
+    keywords: [marketing, ad copy, seo, social media, campaign, brand]
+    min_capability: 0.6
+    preferred_tiers: [tier2]
+    kind: topic
+    examples:
+      - "Write ad copy for a fitness app"
+      - "SEO strategy for a B2B SaaS"
+
+  - name: logistics
+    display: Logistics / Supply Chain
+    description: Shipping, inventory, supply chain, warehouse operations
+    keywords: [logistics, shipping, supply chain, inventory, warehouse, freight]
+    min_capability: 0.6
+    preferred_tiers: [tier2]
+    kind: topic
+    examples:
+      - "Optimize warehouse picking routes"
+      - "Explain just-in-time inventory"
+
+  - name: energy
+    display: Energy / Utilities
+    description: Energy sector, renewables, oil & gas, utilities
+    keywords: [energy, renewable, solar, wind, oil, gas, utility, grid]
+    min_capability: 0.6
+    preferred_tiers: [tier2]
+    kind: topic
+    examples:
+      - "How do solar panels work?"
+      - "Explain the electric grid"
+
+  - name: aerospace
+    display: Aerospace / Aviation
+    description: Aviation, space, satellites, aerospace engineering
+    keywords: [aviation, space, satellite, rocket, astronaut, aircraft, faa]
+    min_capability: 0.6
+    preferred_tiers: [tier2]
+    kind: topic
+    examples:
+      - "How does a rocket land itself?"
+      - "Explain orbital mechanics"
+
+  - name: insurance
+    display: Insurance
+    description: Insurance products, claims, underwriting, actuarial
+    keywords: [insurance, claim, premium, deductible, policy, underwriting]
+    min_capability: 0.6
+    preferred_tiers: [tier2]
+    kind: topic
+    examples:
+      - "How does term life insurance work?"
+      - "Explain umbrella insurance"
+
+  - name: education_platforms
+    display: Education Platforms
+    description: EdTech, online courses, learning platforms, LMS
+    keywords: [lms, courseware, edtech, online course, mooc, curriculum]
+    min_capability: 0.6
+    preferred_tiers: [tier2]
+    kind: topic
+    examples:
+      - "Design a curriculum for Python beginners"
+      - "Best practices for online assessments"
+
+  - name: long_form_analysis
+    display: Long-Form Analysis
+    description: Analyzing long documents, papers, reports (>10K tokens)
+    keywords: [analyze this paper, review this report, long document, in-depth]
+    min_capability: 0.8
+    preferred_tiers: [tier3]
+    kind: topic
+    examples:
+      - "Analyze this 100-page research paper"
+      - "Review this annual report"
+
+  - name: research_synthesis
+    display: Research Synthesis
+    description: Synthesizing multiple sources, literature reviews, meta-analysis
+    keywords: [synthesize, literature review, meta-analysis, across sources]
+    min_capability: 0.8
+    preferred_tiers: [tier3]
+    kind: topic
+    examples:
+      - "Synthesize findings from these 10 papers on X"
+      - "Write a literature review on CRISPR"
+
+  - name: architecture
+    display: Software Architecture
+    description: High-level software/system architecture decisions
+    keywords: [architecture, microservices, monolith, event-driven, cqrs, hexagonal]
+    min_capability: 0.8
+    preferred_tiers: [tier4]
+    kind: topic
+    examples:
+      - "Should I use microservices for a 5-person team?"
+      - "Compare event-driven vs request-response architectures"
+
+  - name: system_design
+    display: System Design
+    description: System design interview prep and real-world system design
+    keywords: [design a system, design twitter, scale, load balancer, sharding, cap theorem]
+    min_capability: 0.85
+    preferred_tiers: [tier4]
+    kind: structural
+    examples:
+      - "Design a URL shortener like bit.ly"
+      - "How would you design Twitter's timeline?"
+
+  - name: complex_debugging
+    display: Complex Debugging
+    description: Hard debugging, race conditions, distributed systems issues
+    keywords: [debug, race condition, deadlock, memory leak, heisenbug, distributed system]
+    min_capability: 0.85
+    preferred_tiers: [tier4]
+    kind: structural
+    examples:
+      - "Debug a distributed system deadlock"
+      - "Find the race condition in this code"
+
+  - name: codebase_analysis
+    display: Codebase Analysis
+    description: Understanding a whole codebase, finding patterns, refactoring suggestions
+    keywords: [codebase, repo, refactor, code smell, dependency graph, architecture]
+    min_capability: 0.85
+    preferred_tiers: [tier4]
+    kind: structural
+    examples:
+      - "Analyze this 500K LOC codebase"
+      - "Suggest refactoring for this repo"
+
+  - name: codebase_search
+    display: Codebase Search
+    description: Finding code in a codebase, semantic search across files
+    keywords: [find in codebase, where is, search code, locate function]
+    min_capability: 0.8
+    preferred_tiers: [tier4]
+    kind: structural
+    examples:
+      - "Find where authentication is handled"
+      - "Locate all uses of this API"
+
+  - name: code_review
+    display: Code Review
+    description: Reviewing PRs, suggesting improvements, catching bugs
+    keywords: [review this pr, code review, suggest improvements, nit]
+    min_capability: 0.7
+    preferred_tiers: [tier2, tier4]
+    kind: structural
+    examples:
+      - "Review this PR for issues"
+      - "Suggest improvements to this code"
+
+  - name: planning
+    display: Planning / Strategy
+    description: Multi-step planning, roadmaps, project breakdowns
+    keywords: [plan, roadmap, breakdown, steps to, strategy for]
+    min_capability: 0.7
+    preferred_tiers: [tier3, tier4]
+    kind: structural
+    examples:
+      - "Plan a 6-month product roadmap"
+      - "Break down this project into tasks"
+
+  - name: other
+    display: Other / Unclassified
+    description: Catch-all for queries that don't fit any vertical
+    keywords: []
+    min_capability: 0.3
+    preferred_tiers: [tier0, tier2]
+    kind: topic
+    examples:
+      - "[miscellaneous query]"
+
+# Total: 57 verticals
+# Structural verticals (allowed in prototypes.json): system_design, complex_debugging, codebase_analysis, codebase_search, code_review, planning
+# Topic verticals: all others (router handles via embedding + classifier, never prototypes)

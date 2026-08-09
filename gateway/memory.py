@@ -1,0 +1,1475 @@
+"""Glint-V2 data layer.
+
+SQLAlchemy core (schema-only; no ORM) — same schema works for SQLite (single
+mode) and Postgres (multi mode). Driver is selected from db_url.
+
+Tables:
+  routing_log    — every routing decision (immutable append-only)
+  feedback       — human feedback (correct/wrong) for routing decisions
+  sessions       — working memory: previous tier per session
+  model_versions — registry of router checkpoint versions
+  checkpoints    — registry: per-version eval scores + rollback pointers
+  flagged_inputs — suspicious / injection-flagged prompts
+  users          — tenant config + current spend
+  usage_counters — token counts per user per period (for budget enforcement)
+  breakers       — per-endpoint circuit breaker state
+  review_queue   — async reviewer queue (Postgres LISTEN/NOTIFY in multi mode)
+  review_results — reviewer outputs (per-field labels)
+  curated_samples — high-agreement samples for training (versioned)
+  live_eval_set  — periodically sampled live-traffic eval
+"""
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import json
+import logging
+import threading
+from datetime import UTC, datetime
+from typing import Any
+
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    create_engine,
+    delete,
+    func,
+    insert,
+    select,
+    text,
+    update,
+)
+from sqlalchemy.engine import Engine
+
+log = logging.getLogger("glint.memory")
+
+metadata = MetaData()
+
+routing_log = Table(
+    "routing_log",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("ts", DateTime, default=lambda: datetime.now(UTC), index=True),
+    Column("tenant_id", String(64), index=True),
+    Column("session_id", String(64), index=True),
+    Column("model_version", String(64), index=True),
+    Column("policy_version", Integer),
+    Column("query_hash", String(64), index=True),
+    Column("query_preview", Text),
+    Column("vertical", String(64), index=True),
+    Column("vertical_top2_prob", Float),
+    Column("complexity", Integer),
+    Column("flags_code", Boolean),
+    Column("flags_math", Boolean),
+    Column("flags_reasoning", Boolean),
+    Column("flags_long_output", Boolean),
+    Column("tier", String(32), index=True),
+    Column("endpoint", String(64)),
+    Column("source", String(32), index=True),
+    Column("ms_classify", Float),
+    Column("ms_total", Float),
+    Column("est_cost_usd", Float),
+    Column("actual_cost_usd", Float),
+    Column("escalated", Boolean, default=False),
+    Column("fallback_used", Boolean, default=False),
+    Column("error", Text),
+    Column("truncated", Boolean, default=False),
+    Column("has_image", Boolean, default=False),
+    Column("has_injection_signal", Boolean, default=False),
+    Column("response_ok", Boolean),
+    Column("review_status", String(16), default="pending"),
+    Column("extra", Text),
+)
+
+feedback = Table(
+    "feedback",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("ts", DateTime, default=lambda: datetime.now(UTC)),
+    Column("decision_id", Integer, ForeignKey("routing_log.id"), index=True),
+    Column("correct", Boolean),
+    Column("suggested_tier", String(32)),
+    Column("comment", Text),
+    Column("source", String(16), default="human"),
+)
+
+sessions = Table(
+    "sessions",
+    metadata,
+    Column("session_id", String(64), primary_key=True),
+    Column("tenant_id", String(64), index=True),
+    Column("last_tier", String(32)),
+    Column("last_vertical", String(64)),
+    Column("last_endpoint", String(64)),
+    Column("last_response_ok", Boolean),
+    Column("last_response_ms", Float),
+    Column("last_used_at", DateTime, default=lambda: datetime.now(UTC)),
+    Column("request_count", Integer, default=0),
+)
+
+model_versions = Table(
+    "model_versions",
+    metadata,
+    Column("id", String(64), primary_key=True),
+    Column("parent_id", String(64)),
+    Column("created_at", DateTime, default=lambda: datetime.now(UTC)),
+    Column("embedding_model", String(128)),
+    Column("heads_hash", String(64)),
+    Column("active", Boolean, default=False),
+    Column("created_by", String(32), default="trainer"),
+)
+
+checkpoints = Table(
+    "checkpoints",
+    metadata,
+    Column("id", String(64), primary_key=True),
+    Column("model_version_id", String(64), ForeignKey("model_versions.id")),
+    Column("eval_base_accuracy", Float),
+    Column("eval_live_accuracy", Float),
+    Column("per_vertical_accuracy", Text),
+    Column("confusion_top20", Text),
+    Column("policy_replay_drift_pct", Float),
+    Column("promoted", Boolean, default=False),
+    Column("rolled_back_at", DateTime),
+    Column("rolled_back_reason", Text),
+    Column("created_at", DateTime, default=lambda: datetime.now(UTC)),
+)
+
+flagged_inputs = Table(
+    "flagged_inputs",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("ts", DateTime, default=lambda: datetime.now(UTC)),
+    Column("tenant_id", String(64), index=True),
+    Column("decision_id", Integer),
+    Column("reason", String(32), index=True),
+    Column("matched_regex", String(256)),
+    Column("query_preview", Text),
+    Column("action_taken", String(32)),
+)
+
+users = Table(
+    "users",
+    metadata,
+    Column("tenant_id", String(64), primary_key=True),
+    Column("tier_access", Text),
+    Column("budget_usd_per_day", Float, default=1.0),
+    Column("rps_limit", Integer, default=100),
+    Column("concurrent_limit", Integer, default=20),
+    Column("tokens_per_min", Integer, default=200000),
+    Column("created_at", DateTime, default=lambda: datetime.now(UTC)),
+)
+
+usage_counters = Table(
+    "usage_counters",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("tenant_id", String(64), index=True),
+    Column("ts", DateTime, default=lambda: datetime.now(UTC), index=True),
+    Column("period_hour", String(13), index=True),
+    Column("period_day", String(10), index=True),
+    Column("period_month", String(7), index=True),
+    Column("tokens_in", Integer, default=0),
+    Column("tokens_out", Integer, default=0),
+    Column("cost_usd", Float, default=0.0),
+    Column("request_count", Integer, default=0),
+)
+
+breakers = Table(
+    "breakers",
+    metadata,
+    Column("endpoint_name", String(64), primary_key=True),
+    Column("state", String(16), default="CLOSED"),
+    Column("consecutive_failures", Integer, default=0),
+    Column("opened_at", DateTime),
+    Column("last_failure_at", DateTime),
+    Column("last_success_at", DateTime),
+    Column("half_open_probes_remaining", Integer, default=0),
+)
+
+review_queue = Table(
+    "review_queue",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("ts_queued", DateTime, default=lambda: datetime.now(UTC), index=True),
+    Column("decision_id", Integer, ForeignKey("routing_log.id"), index=True),
+    Column("tenant_id", String(64), index=True),
+    Column("priority", Integer, default=0),
+    Column("status", String(16), default="pending", index=True),
+    Column("attempts", Integer, default=0),
+    Column("started_at", DateTime),
+    Column("last_error", Text),
+    Column("cost_usd_estimate", Float, default=0.0),
+    Column("prompt_text", Text),
+)
+
+review_results = Table(
+    "review_results",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("decision_id", Integer, ForeignKey("routing_log.id"), index=True, unique=True),
+    Column("reviewer_model", String(128)),
+    Column("reviewer_endpoint", String(256)),
+    Column("reviewed_at", DateTime, default=lambda: datetime.now(UTC)),
+    Column("vertical_label", String(64)),
+    Column("complexity_label", Integer),
+    Column("flag_code_label", Boolean),
+    Column("flag_math_label", Boolean),
+    Column("flag_reasoning_label", Boolean),
+    Column("flag_long_output_label", Boolean),
+    Column("truncated", Boolean),
+    Column("agreement_vertical", Boolean),
+    Column("agreement_complexity", Boolean),
+    Column("agreement_code", Boolean),
+    Column("agreement_math", Boolean),
+    Column("agreement_reasoning", Boolean),
+    Column("agreement_long_output", Boolean),
+    Column("all_fields_agree", Boolean, index=True),
+    Column("router_confidence_at_decision", Float),
+    Column("trust_score", Float, default=1.0),
+    Column("curated", Boolean, default=False),
+    Column("curated_at", DateTime),
+    Column("curated_run_id", String(64), index=True),
+    Column("meta_reviewed", Boolean, default=False),
+    Column("meta_review_agreement", Float),
+    Column("raw_response", Text),
+    Column("prompt_text", Text),
+    Column("cost_usd", Float),
+)
+
+curated_samples = Table(
+    "curated_samples",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("decision_id", Integer, ForeignKey("routing_log.id"), index=True),
+    Column("review_result_id", Integer, ForeignKey("review_results.id"), index=True),
+    Column("curated_run_id", String(64), index=True),
+    Column("query_hash", String(64), index=True),
+    Column("text", Text),
+    Column("vertical", String(64), index=True),
+    Column("complexity", Integer),
+    Column("flag_code", Boolean),
+    Column("flag_math", Boolean),
+    Column("flag_reasoning", Boolean),
+    Column("flag_long_output", Boolean),
+    Column("model_version", String(64)),
+    Column("reviewer_model", String(128)),
+    Column("trust_score", Float),
+    Column("source", String(16), default="synthetic"),
+    Column("created_at", DateTime, default=lambda: datetime.now(UTC)),
+)
+
+live_eval_set = Table(
+    "live_eval_set",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("decision_id", Integer, ForeignKey("routing_log.id"), index=True, unique=True),
+    Column("query_hash", String(64), index=True),
+    Column("text", Text),
+    Column("ground_truth_vertical", String(64)),
+    Column("ground_truth_complexity", Integer),
+    Column("ground_truth_flags", Text),
+    Column("label_source", String(32)),
+    Column("created_at", DateTime, default=lambda: datetime.now(UTC)),
+)
+
+trainer_state = Table(
+    "trainer_state",
+    metadata,
+    Column("key", String(64), primary_key=True),
+    Column("value", Text),
+)
+
+
+# ----- Engine + connection management -----
+
+
+_engine: Engine | None = None
+_lock = threading.Lock()
+
+
+def init_engine(db_url: str) -> Engine:
+    """Create engine and create all tables. Idempotent."""
+    global _engine
+    with _lock:
+        if _engine is not None:
+            return _engine
+        connect_args = {}
+        if db_url.startswith("sqlite"):
+            connect_args["check_same_thread"] = False
+        _engine = create_engine(db_url, future=True, connect_args=connect_args)
+        if db_url.startswith("sqlite"):
+            from sqlalchemy import event
+
+            @event.listens_for(_engine, "connect")
+            def _sqlite_pragmas(dbapi_connection, _connection_record):
+                cursor = dbapi_connection.cursor()
+                cursor.execute("PRAGMA foreign_keys=ON")
+                cursor.execute("PRAGMA busy_timeout=5000")
+                cursor.close()
+        metadata.create_all(_engine)
+        _migrate(_engine)
+        return _engine
+
+
+def _migrate(engine: Engine):
+    """Lightweight column migrations for pre-existing databases.
+
+    create_all() does not alter existing tables, so columns added after the
+    first deploy need an explicit ALTER TABLE. Safe to run on every boot.
+    """
+    try:
+        with engine.connect() as conn:
+            existing = _column_names(conn, "routing_log")
+            if "vertical_top2_prob" not in existing:
+                conn.execute(text("ALTER TABLE routing_log ADD COLUMN vertical_top2_prob FLOAT"))
+                conn.commit()
+            review_columns = _column_names(conn, "review_queue")
+            if review_columns and "prompt_text" not in review_columns:
+                conn.execute(text("ALTER TABLE review_queue ADD COLUMN prompt_text TEXT"))
+                conn.commit()
+            if review_columns and "started_at" not in review_columns:
+                conn.execute(text("ALTER TABLE review_queue ADD COLUMN started_at DATETIME"))
+                conn.commit()
+            result_columns = _column_names(conn, "review_results")
+            if result_columns and "prompt_text" not in result_columns:
+                conn.execute(text("ALTER TABLE review_results ADD COLUMN prompt_text TEXT"))
+                conn.commit()
+    except Exception as e:
+        log.warning("schema migration skipped: %s", e)
+
+
+def _column_names(conn, table_name: str) -> set:
+    import sqlalchemy
+    insp = sqlalchemy.inspect(conn)
+    try:
+        return {c["name"] for c in insp.get_columns(table_name)}
+    except Exception:
+        return set()
+
+
+def engine() -> Engine:
+    if _engine is None:
+        raise RuntimeError("engine not initialized — call init_engine first")
+    return _engine
+
+
+def close_engine() -> None:
+    global _engine
+    with _lock:
+        if _engine is not None:
+            _engine.dispose()
+            _engine = None
+
+
+@contextlib.contextmanager
+def begin():
+    """Transactional context. Commits on success, rolls back on exception."""
+    with engine().begin() as conn:
+        yield conn
+
+
+# ----- High-level helpers -----
+
+
+def log_decision(
+    *,
+    tenant_id: str,
+    session_id: str,
+    model_version: str,
+    policy_version: int,
+    query_hash: str,
+    query_preview: str,
+    vertical: str,
+    complexity: int,
+    flags: dict,
+    tier: str,
+    endpoint: str,
+    source: str,
+    ms_classify: float,
+    ms_total: float,
+    est_cost_usd: float,
+    escalated: bool,
+    fallback_used: bool,
+    has_image: bool,
+    has_injection_signal: bool,
+    vertical_top2_prob: float | None = None,
+    truncated: bool = False,
+    error: str | None = None,
+    response_ok: bool | None = None,
+    actual_cost_usd: float | None = None,
+    extra: dict | None = None,
+) -> int:
+    """Append a routing decision. Returns decision id."""
+    with begin() as conn:
+        result = conn.execute(
+            insert(routing_log).values(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                model_version=model_version,
+                policy_version=policy_version,
+                query_hash=query_hash,
+                query_preview=query_preview[:1000],
+                vertical=vertical,
+                vertical_top2_prob=vertical_top2_prob,
+                complexity=complexity,
+                flags_code=flags.get("code", False),
+                flags_math=flags.get("math", False),
+                flags_reasoning=flags.get("reasoning", False),
+                flags_long_output=flags.get("long_output", False),
+                tier=tier,
+                endpoint=endpoint,
+                source=source,
+                ms_classify=ms_classify,
+                ms_total=ms_total,
+                est_cost_usd=est_cost_usd,
+                actual_cost_usd=actual_cost_usd,
+                escalated=escalated,
+                fallback_used=fallback_used,
+                has_image=has_image,
+                has_injection_signal=has_injection_signal,
+                truncated=truncated,
+                error=error,
+                response_ok=response_ok,
+                extra=json.dumps(extra) if extra else None,
+                review_status="pending",
+            )
+        )
+        return int(result.inserted_primary_key[0])
+
+
+def record_feedback(
+    decision_id: int, correct: bool, suggested_tier: str | None = None,
+    comment: str | None = None, source: str = "human",
+):
+    with begin() as conn:
+        conn.execute(insert(feedback).values(
+            decision_id=decision_id,
+            correct=correct,
+            suggested_tier=suggested_tier,
+            comment=comment,
+            source=source,
+        ))
+    if not correct:
+        curate_reviewed_correction(decision_id)
+
+
+def _insert_ignore(table: Table, **values):
+    """Make an INSERT idempotent on conflict for SQLite and PostgreSQL."""
+    dialect = engine().dialect.name
+    if dialect == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+        return sqlite_insert(table).values(**values).on_conflict_do_nothing()
+    if dialect == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        return pg_insert(table).values(**values).on_conflict_do_nothing()
+    return insert(table).values(**values)
+
+
+def _session_storage_key(tenant_id: str, session_id: str) -> str:
+    """Namespace externally supplied session IDs without changing the schema."""
+    raw = f"{tenant_id}\0{session_id}".encode("utf-8", errors="ignore")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def get_or_create_session(session_id: str, tenant_id: str) -> dict:
+    """Return session row, creating if missing (race-safe)."""
+    storage_key = _session_storage_key(tenant_id, session_id)
+    with begin() as conn:
+        row = conn.execute(
+            select(sessions)
+            .where(sessions.c.session_id == storage_key)
+            .where(sessions.c.tenant_id == tenant_id)
+        ).first()
+        if row:
+            out = dict(row._mapping)
+            out["session_id"] = session_id
+            return out
+        conn.execute(_insert_ignore(sessions,
+            session_id=storage_key,
+            tenant_id=tenant_id,
+            request_count=0,
+        ))
+        row = conn.execute(
+            select(sessions)
+            .where(sessions.c.session_id == storage_key)
+            .where(sessions.c.tenant_id == tenant_id)
+        ).first()
+        if not row:
+            return {"session_id": session_id, "tenant_id": tenant_id, "request_count": 0}
+        out = dict(row._mapping)
+        out["session_id"] = session_id
+        return out
+
+
+def update_session(
+    session_id: str,
+    tenant_id: str,
+    *,
+    tier: str,
+    vertical: str,
+    endpoint: str,
+    response_ok: bool,
+    response_ms: float,
+):
+    storage_key = _session_storage_key(tenant_id, session_id)
+    with begin() as conn:
+        conn.execute(
+            update(sessions)
+            .where(sessions.c.session_id == storage_key)
+            .where(sessions.c.tenant_id == tenant_id)
+            .values(
+                last_tier=tier,
+                last_vertical=vertical,
+                last_endpoint=endpoint,
+                last_response_ok=response_ok,
+                last_response_ms=response_ms,
+                last_used_at=datetime.now(UTC),
+                request_count=sessions.c.request_count + 1,
+            )
+        )
+
+
+def update_routing_decision(
+    decision_id: int,
+    *,
+    endpoint: str | None = None,
+    tier: str | None = None,
+    fallback_used: bool | None = None,
+):
+    """Patch a logged routing decision (e.g. after a fallback succeeded)."""
+    values: dict[str, Any] = {}
+    if endpoint is not None:
+        values["endpoint"] = endpoint
+    if tier is not None:
+        values["tier"] = tier
+    if fallback_used is not None:
+        values["fallback_used"] = fallback_used
+    if not values:
+        return
+    with begin() as conn:
+        conn.execute(
+            update(routing_log)
+            .where(routing_log.c.id == decision_id)
+            .values(**values)
+        )
+
+
+def get_breaker_state(endpoint_name: str) -> dict:
+    with engine().connect() as conn:
+        row = conn.execute(
+            select(breakers).where(breakers.c.endpoint_name == endpoint_name)
+        ).first()
+        if row:
+            return dict(row._mapping)
+        return {"endpoint_name": endpoint_name, "state": "CLOSED", "consecutive_failures": 0}
+
+
+def set_breaker_state(endpoint_name: str, state: str, **fields):
+    with begin() as conn:
+        existing = conn.execute(
+            select(breakers).where(breakers.c.endpoint_name == endpoint_name)
+        ).first()
+        values = {
+            "endpoint_name": endpoint_name,
+            "state": state,
+            "consecutive_failures": fields.get("consecutive_failures", 0),
+            "opened_at": fields.get("opened_at"),
+            "last_failure_at": fields.get("last_failure_at"),
+            "last_success_at": fields.get("last_success_at"),
+            "half_open_probes_remaining": fields.get("half_open_probes_remaining", 0),
+        }
+        if existing:
+            conn.execute(
+                update(breakers)
+                .where(breakers.c.endpoint_name == endpoint_name)
+                .values(**values)
+            )
+        else:
+            conn.execute(insert(breakers).values(**values))
+
+
+def enqueue_review(
+    decision_id: int,
+    tenant_id: str,
+    priority: int = 0,
+    cost_estimate: float = 0.0,
+    prompt_text: str | None = None,
+):
+    with begin() as conn:
+        conn.execute(insert(review_queue).values(
+            decision_id=decision_id,
+            tenant_id=tenant_id,
+            priority=priority,
+            cost_usd_estimate=cost_estimate,
+            prompt_text=prompt_text,
+        ))
+
+
+def dequeue_review() -> dict | None:
+    """Pop the oldest pending review item. Returns row dict or None."""
+    with begin() as conn:
+        query = (
+            select(review_queue)
+            .where(review_queue.c.status == "pending")
+            .order_by(review_queue.c.priority.desc(), review_queue.c.ts_queued.asc())
+            .limit(1)
+        )
+        if engine().dialect.name == "postgresql":
+            query = query.with_for_update(skip_locked=True)
+        row = conn.execute(query).first()
+        if not row:
+            return None
+        d = dict(row._mapping)
+        conn.execute(
+            update(review_queue)
+            .where(review_queue.c.id == d["id"])
+            .values(
+                status="in_progress",
+                attempts=review_queue.c.attempts + 1,
+                started_at=datetime.now(UTC),
+            )
+        )
+        return d
+
+
+def complete_review(queue_id: int, status: str = "done", error: str | None = None):
+    with begin() as conn:
+        conn.execute(
+            update(review_queue)
+            .where(review_queue.c.id == queue_id)
+            .values(status=status, last_error=error, prompt_text=None, started_at=None)
+        )
+
+
+def requeue_stale_reviews(stale_after_seconds: int = 300) -> int:
+    """Requeue 'in_progress' review items stuck for too long (crash mid-batch).
+
+    Returns the number of items requeued.
+    """
+    from datetime import timedelta
+    cutoff = datetime.now(UTC) - timedelta(seconds=stale_after_seconds)
+    try:
+        with begin() as conn:
+            result = conn.execute(
+                update(review_queue)
+                .where(review_queue.c.status == "in_progress")
+                .where(review_queue.c.started_at < cutoff)
+                .values(status="pending", last_error="requeued_stale", started_at=None)
+            )
+        return result.rowcount or 0
+    except Exception as e:
+        log.warning("requeue_stale_reviews failed: %s", e)
+        return 0
+
+
+def store_review_result(
+    *,
+    decision_id: int,
+    reviewer_model: str,
+    reviewer_endpoint: str,
+    labels: dict,
+    truncated: bool,
+    router_labels: dict,
+    router_confidence: float,
+    cost_usd: float,
+    raw_response: str,
+    prompt_text: str | None = None,
+    min_trust_to_curate: float = 0.3,
+):
+    """Compute per-field agreement + trust + persist.
+
+    labels and router_labels keys: vertical, complexity, code, math, reasoning, long_output
+
+    Auto-curates: when all fields agree AND trust >= min_trust_to_curate, the
+    sample is written to curated_samples in the same transaction (curated_run_id="auto").
+    This is what actually feeds the trainer — without it the data flywheel is dead.
+    Returns the new review_result_id.
+    """
+    fields = ["vertical", "complexity", "code", "math", "reasoning", "long_output"]
+    agreement = {}
+    for f in fields:
+        if f == "vertical":
+            agreement[f"agreement_{f}"] = labels.get(f) == router_labels.get(f)
+        else:
+            r_lab = labels.get(f)
+            if isinstance(r_lab, bool):
+                agreement[f"agreement_{f}"] = bool(labels.get(f)) == bool(router_labels.get(f, False))
+            else:
+                agreement[f"agreement_{f}"] = labels.get(f) == router_labels.get(f)
+    all_agree = all(agreement[f"agreement_{f}"] for f in fields)
+
+    # Trust score: agreement rate × router confidence
+    agree_count = sum(1 for v in agreement.values() if v)
+    trust = (agree_count / len(fields)) * router_confidence
+
+    with begin() as conn:
+        result = conn.execute(insert(review_results).values(
+            decision_id=decision_id,
+            reviewer_model=reviewer_model,
+            reviewer_endpoint=reviewer_endpoint,
+            vertical_label=labels.get("vertical"),
+            complexity_label=labels.get("complexity"),
+            flag_code_label=labels.get("code"),
+            flag_math_label=labels.get("math"),
+            flag_reasoning_label=labels.get("reasoning"),
+            flag_long_output_label=labels.get("long_output"),
+            truncated=truncated,
+            all_fields_agree=all_agree,
+            router_confidence_at_decision=router_confidence,
+            trust_score=trust,
+            raw_response=raw_response[:50000],
+            prompt_text=prompt_text,
+            cost_usd=cost_usd,
+            **agreement,
+        ))
+        review_result_id = int(result.inserted_primary_key[0])
+        conn.execute(
+            update(routing_log)
+            .where(routing_log.c.id == decision_id)
+            .values(review_status="done")
+        )
+
+        human_correction = conn.execute(
+            select(feedback.c.id)
+            .where(feedback.c.decision_id == decision_id)
+            .where(feedback.c.correct.is_(False))
+            .limit(1)
+        ).first() is not None
+        curate_trust = max(trust, 0.8) if human_correction else trust
+        if ((all_agree and trust >= min_trust_to_curate) or human_correction) and not truncated:
+            decision = conn.execute(select(routing_log).where(routing_log.c.id == decision_id)).first()
+            if decision:
+                _insert_curated_review(
+                    conn,
+                    decision=dict(decision._mapping),
+                    review_result_id=review_result_id,
+                    labels=labels,
+                    reviewer_model=reviewer_model,
+                    trust_score=curate_trust,
+                    source="human_reviewed" if human_correction else "flywheel",
+                    sample_text=prompt_text,
+                )
+                log.info("curated decision %d (trust=%.3f) into training pool", decision_id, curate_trust)
+    return review_result_id
+
+
+def _insert_curated_review(
+    conn,
+    *,
+    decision: dict,
+    review_result_id: int,
+    labels: dict,
+    reviewer_model: str,
+    trust_score: float,
+    source: str,
+    sample_text: str | None = None,
+):
+    conn.execute(insert(curated_samples).values(
+        decision_id=decision["id"],
+        review_result_id=review_result_id,
+        curated_run_id="auto",
+        query_hash=decision["query_hash"],
+        text=sample_text or decision["query_preview"],
+        vertical=labels.get("vertical"),
+        complexity=labels.get("complexity"),
+        flag_code=bool(labels.get("code", False)),
+        flag_math=bool(labels.get("math", False)),
+        flag_reasoning=bool(labels.get("reasoning", False)),
+        flag_long_output=bool(labels.get("long_output", False)),
+        model_version=decision["model_version"],
+        reviewer_model=reviewer_model,
+        trust_score=trust_score,
+        source=source,
+    ))
+    conn.execute(
+        update(review_results)
+        .where(review_results.c.id == review_result_id)
+        .values(
+            curated=True,
+            curated_at=datetime.now(UTC),
+            curated_run_id="auto",
+            trust_score=trust_score,
+            prompt_text=None,
+        )
+    )
+
+
+def curate_reviewed_correction(decision_id: int) -> bool:
+    """Curate a reviewer's correction after negative human feedback."""
+    with begin() as conn:
+        rr = conn.execute(
+            select(review_results).where(review_results.c.decision_id == decision_id)
+        ).first()
+        if not rr or rr.curated or rr.truncated:
+            return False
+        decision = conn.execute(select(routing_log).where(routing_log.c.id == decision_id)).first()
+        if not decision:
+            return False
+        labels = {
+            "vertical": rr.vertical_label,
+            "complexity": rr.complexity_label,
+            "code": rr.flag_code_label,
+            "math": rr.flag_math_label,
+            "reasoning": rr.flag_reasoning_label,
+            "long_output": rr.flag_long_output_label,
+        }
+        if not labels["vertical"] or not isinstance(labels["complexity"], int):
+            return False
+        _insert_curated_review(
+            conn,
+            decision=dict(decision._mapping),
+            review_result_id=rr.id,
+            labels=labels,
+            reviewer_model=rr.reviewer_model,
+            trust_score=max(float(rr.trust_score or 0.0), 0.8),
+            source="human_reviewed",
+            sample_text=rr.prompt_text,
+        )
+        return True
+
+
+def curate_sample(review_result_id: int, run_id: str, model_version: str):
+    """Move a high-agreement review result into curated pool."""
+    with begin() as conn:
+        rr = conn.execute(
+            select(review_results).where(review_results.c.id == review_result_id)
+        ).first()
+        if not rr:
+            return
+        rr_d = dict(rr._mapping)
+        if not rr_d["all_fields_agree"]:
+            return
+        decision = conn.execute(
+            select(routing_log).where(routing_log.c.id == rr_d["decision_id"])
+        ).first()
+        if not decision:
+            return
+        d = dict(decision._mapping)
+        conn.execute(insert(curated_samples).values(
+            decision_id=rr_d["decision_id"],
+            review_result_id=review_result_id,
+            curated_run_id=run_id,
+            query_hash=d["query_hash"],
+            text=d["query_preview"],
+            vertical=rr_d["vertical_label"],
+            complexity=rr_d["complexity_label"],
+            flag_code=rr_d["flag_code_label"],
+            flag_math=rr_d["flag_math_label"],
+            flag_reasoning=rr_d["flag_reasoning_label"],
+            flag_long_output=rr_d["flag_long_output_label"],
+            model_version=d["model_version"],
+            reviewer_model=rr_d["reviewer_model"],
+            trust_score=rr_d["trust_score"],
+            source="flywheel",
+        ))
+        conn.execute(
+            update(review_results)
+            .where(review_results.c.id == review_result_id)
+            .values(curated=True, curated_at=datetime.now(UTC), curated_run_id=run_id)
+        )
+
+
+def get_or_create_user(tenant_id: str, defaults: dict, overwrite: bool = False) -> dict:
+    """Return user row, creating if missing.
+
+    overwrite=True applies `defaults` to an existing row (admin edits).
+    overwrite=False (lazy tenant creation) never clobbers existing config.
+    """
+    with begin() as conn:
+        row = conn.execute(
+            select(users).where(users.c.tenant_id == tenant_id)
+        ).first()
+        if row:
+            if overwrite:
+                values = {k: v for k, v in defaults.items() if k != "tenant_id"}
+                if "tier_access" in values and isinstance(values["tier_access"], list):
+                    values["tier_access"] = json.dumps(values["tier_access"])
+                if values:
+                    conn.execute(update(users).where(users.c.tenant_id == tenant_id).values(**values))
+                row = conn.execute(
+                    select(users).where(users.c.tenant_id == tenant_id)
+                ).first()
+            return _user_row_dict(row)
+        values = {"tenant_id": tenant_id, **{k: v for k, v in defaults.items() if k != "tenant_id"}}
+        if "tier_access" in values and isinstance(values["tier_access"], list):
+            values["tier_access"] = json.dumps(values["tier_access"])
+        conn.execute(_insert_ignore(users, **values))
+        row = conn.execute(
+            select(users).where(users.c.tenant_id == tenant_id)
+        ).first()
+        if not row:
+            return {"tenant_id": tenant_id, **defaults}
+        return _user_row_dict(row)
+
+
+def _user_row_dict(row) -> dict:
+    d = dict(row._mapping)
+    for k, v in d.items():
+        if isinstance(v, datetime):
+            d[k] = v.isoformat()
+    if d.get("tier_access"):
+        try:
+            d["tier_access"] = json.loads(d["tier_access"])
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return d
+
+
+def record_usage(tenant_id: str, tokens_in: int, tokens_out: int, cost_usd: float):
+    _insert_usage(tenant_id, tokens_in, tokens_out, cost_usd, request_count=1)
+
+
+def _insert_usage(
+    tenant_id: str,
+    tokens_in: int,
+    tokens_out: int,
+    cost_usd: float,
+    request_count: int,
+    conn=None,
+):
+    now = datetime.now(UTC)
+    values = dict(
+            tenant_id=tenant_id,
+            period_hour=now.strftime("%Y%m%d%H"),
+            period_day=now.strftime("%Y%m%d"),
+            period_month=now.strftime("%Y%m"),
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=cost_usd,
+            request_count=request_count,
+        )
+    if conn is not None:
+        conn.execute(insert(usage_counters).values(**values))
+        return
+    with begin() as own_conn:
+        own_conn.execute(insert(usage_counters).values(**values))
+
+
+def reserve_usage(
+    tenant_id: str,
+    *,
+    budget_limit_usd: float,
+    rps_limit: int,
+    token_limit_per_minute: int,
+    estimated_tokens_in: int,
+    estimated_tokens_out: int,
+    estimated_cost_usd: float,
+) -> tuple[bool, str | None]:
+    """Atomically check quotas and reserve estimated usage for one request."""
+    from datetime import timedelta
+
+    now = datetime.now(UTC)
+    with begin() as conn:
+        user_q = select(users.c.tenant_id).where(users.c.tenant_id == tenant_id)
+        if engine().dialect.name != "sqlite":
+            user_q = user_q.with_for_update()
+        conn.execute(user_q).first()
+
+        if budget_limit_usd > 0:
+            spent = conn.execute(
+                select(func.coalesce(func.sum(usage_counters.c.cost_usd), 0.0))
+                .where(usage_counters.c.tenant_id == tenant_id)
+                .where(usage_counters.c.period_day == now.strftime("%Y%m%d"))
+            ).scalar_one()
+            if float(spent) + estimated_cost_usd > budget_limit_usd:
+                return False, f"daily budget ${budget_limit_usd:.2f} exceeded (spent ${float(spent):.2f})"
+
+        estimated_tokens = max(0, estimated_tokens_in) + max(0, estimated_tokens_out)
+        if rps_limit > 0:
+            request_count = conn.execute(
+                select(func.coalesce(func.sum(usage_counters.c.request_count), 0))
+                .where(usage_counters.c.tenant_id == tenant_id)
+                .where(usage_counters.c.ts >= now - timedelta(seconds=1))
+            ).scalar_one()
+            if int(request_count) >= rps_limit:
+                return False, "requests-per-second limit exceeded"
+        if token_limit_per_minute > 0:
+            token_count = conn.execute(
+                select(func.coalesce(func.sum(usage_counters.c.tokens_in + usage_counters.c.tokens_out), 0))
+                .where(usage_counters.c.tenant_id == tenant_id)
+                .where(usage_counters.c.ts >= now - timedelta(minutes=1))
+            ).scalar_one()
+            if int(token_count) + estimated_tokens > token_limit_per_minute:
+                return False, "tokens-per-minute limit exceeded"
+
+        _insert_usage(
+            tenant_id,
+            max(0, estimated_tokens_in),
+            max(0, estimated_tokens_out),
+            max(0.0, estimated_cost_usd),
+            request_count=1,
+            conn=conn,
+        )
+    return True, None
+
+
+def settle_reserved_usage(
+    tenant_id: str,
+    *,
+    reserved_tokens_in: int,
+    reserved_tokens_out: int,
+    reserved_cost_usd: float,
+    actual_tokens_in: int,
+    actual_tokens_out: int,
+    actual_cost_usd: float,
+    completed: bool,
+):
+    """Settle a reservation; failed requests release all reserved usage."""
+    if completed:
+        token_in_delta = max(0, actual_tokens_in) - max(0, reserved_tokens_in)
+        token_out_delta = max(0, actual_tokens_out) - max(0, reserved_tokens_out)
+        cost_delta = max(0.0, actual_cost_usd) - max(0.0, reserved_cost_usd)
+        request_count = 0
+    else:
+        token_in_delta = -max(0, reserved_tokens_in)
+        token_out_delta = -max(0, reserved_tokens_out)
+        cost_delta = -max(0.0, reserved_cost_usd)
+        request_count = -1
+    _insert_usage(
+        tenant_id,
+        token_in_delta,
+        token_out_delta,
+        cost_delta,
+        request_count=request_count,
+    )
+
+
+def get_today_spend(tenant_id: str) -> float:
+    today = datetime.now(UTC).strftime("%Y%m%d")
+    with engine().connect() as conn:
+        row = conn.execute(
+            select(func.coalesce(func.sum(usage_counters.c.cost_usd), 0.0))
+            .where(usage_counters.c.tenant_id == tenant_id)
+            .where(usage_counters.c.period_day == today)
+        ).first()
+        return float(row[0]) if row else 0.0
+
+
+def get_decisions(
+    limit: int = 100,
+    session_id: str | None = None,
+    vertical: str | None = None,
+    tenant_id: str | None = None,
+    since_hours: float | None = None,
+) -> list[dict]:
+    limit = max(1, min(int(limit), 10000))
+    with engine().connect() as conn:
+        q = select(routing_log).order_by(routing_log.c.id.desc()).limit(limit)
+        if session_id:
+            q = q.where(routing_log.c.session_id == session_id)
+        if vertical:
+            q = q.where(routing_log.c.vertical == vertical)
+        if tenant_id:
+            q = q.where(routing_log.c.tenant_id == tenant_id)
+        if since_hours:
+            from datetime import timedelta
+            cutoff = datetime.now(UTC) - timedelta(hours=since_hours)
+            q = q.where(routing_log.c.ts >= cutoff)
+        rows = conn.execute(q).all()
+        out = []
+        for r in rows:
+            d = dict(r._mapping)
+            for k, v in d.items():
+                if isinstance(v, datetime):
+                    d[k] = v.isoformat()
+            out.append(d)
+        return out
+
+
+def decision_tenant(decision_id: int) -> str | None:
+    with engine().connect() as conn:
+        return conn.execute(
+            select(routing_log.c.tenant_id).where(routing_log.c.id == decision_id)
+        ).scalar_one_or_none()
+
+
+def accuracy_report(since_hours: float | None = None, tenant_id: str | None = None) -> dict:
+    """Compute first-pass accuracy from feedback + fallback detection."""
+    decisions = get_decisions(limit=10000, since_hours=since_hours, tenant_id=tenant_id)
+    fb_by_dec = {}
+    if decisions:
+        decision_ids = [d["id"] for d in decisions]
+        with engine().connect() as conn:
+            fb_rows = conn.execute(
+                select(feedback)
+                .where(feedback.c.decision_id.in_(decision_ids))
+            ).all()
+        fb_by_dec = {f.decision_id: f for f in fb_rows}
+    correct = 0
+    wrong = 0
+    per_vertical: dict[str, dict[str, int]] = {}
+    for d in decisions:
+        v = d["vertical"] or "unknown"
+        per_vertical.setdefault(v, {"correct": 0, "wrong": 0})
+        fb = fb_by_dec.get(d["id"])
+        if fb is None:
+            continue
+        if fb.correct:
+            correct += 1
+            per_vertical[v]["correct"] += 1
+        else:
+            wrong += 1
+            per_vertical[v]["wrong"] += 1
+    total = correct + wrong
+    return {
+        "first_pass_accuracy": correct / total if total else None,
+        "feedback_count": total,
+        "per_vertical": {
+            v: {
+                "correct": s["correct"],
+                "wrong": s["wrong"],
+                "accuracy": s["correct"] / (s["correct"] + s["wrong"]) if (s["correct"] + s["wrong"]) else None,
+            }
+            for v, s in per_vertical.items()
+        },
+    }
+
+
+def record_live_eval(
+    *,
+    decision_id: int,
+    query_hash: str,
+    text: str,
+    ground_truth_vertical: str,
+    ground_truth_complexity: int,
+    ground_truth_flags: dict,
+    label_source: str = "reviewer",
+) -> bool:
+    """Persist a labeled live-traffic sample for the live eval set.
+
+    Idempotent per decision_id. Returns True if inserted (new sample).
+    """
+    try:
+        with begin() as conn:
+            exists = conn.execute(
+                select(live_eval_set).where(live_eval_set.c.decision_id == decision_id)
+            ).first()
+            if exists:
+                return False
+            conn.execute(_insert_ignore(live_eval_set,
+                decision_id=decision_id,
+                query_hash=query_hash,
+                text=text,
+                ground_truth_vertical=ground_truth_vertical,
+                ground_truth_complexity=ground_truth_complexity,
+                ground_truth_flags=json.dumps(ground_truth_flags),
+                label_source=label_source,
+            ))
+            return True
+    except Exception as e:
+        log.warning("record_live_eval failed: %s", e)
+        return False
+
+
+def live_eval_samples(limit: int = 500) -> list[dict]:
+    """Most recent live-eval samples, most recent first."""
+    with engine().connect() as conn:
+        rows = conn.execute(
+            select(live_eval_set).order_by(live_eval_set.c.id.desc()).limit(limit)
+        ).all()
+        out = []
+        for r in rows:
+            d = dict(r._mapping)
+            for k, v in d.items():
+                if isinstance(v, datetime):
+                    d[k] = v.isoformat()
+            if d.get("ground_truth_flags"):
+                try:
+                    d["ground_truth_flags"] = json.loads(d["ground_truth_flags"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            out.append(d)
+        return out
+
+
+def register_model_version(
+    version_id: str, parent_id: str | None, embedding_model: str, heads_hash: str
+) -> None:
+    with begin() as conn:
+        conn.execute(update(model_versions).values(active=False))
+        existing = conn.execute(
+            select(model_versions.c.id).where(model_versions.c.id == version_id)
+        ).first()
+        if existing:
+            values = {"embedding_model": embedding_model, "heads_hash": heads_hash, "active": True}
+            if parent_id is not None:
+                values["parent_id"] = parent_id
+            conn.execute(
+                update(model_versions).where(model_versions.c.id == version_id).values(**values)
+            )
+        else:
+            conn.execute(insert(model_versions).values(
+                id=version_id,
+                parent_id=parent_id,
+                embedding_model=embedding_model,
+                heads_hash=heads_hash,
+                active=True,
+            ))
+
+
+def record_checkpoint(checkpoint_id: str, model_version_id: str) -> None:
+    """Insert a checkpoint row so /registry has history. Idempotent per id."""
+    with begin() as conn:
+        conn.execute(_insert_ignore(checkpoints,
+            id=checkpoint_id,
+            model_version_id=model_version_id,
+            promoted=False,
+        ))
+
+
+def active_model_version() -> str | None:
+    with engine().connect() as conn:
+        row = conn.execute(
+            select(model_versions).where(model_versions.c.active.is_(True)).limit(1)
+        ).first()
+        return row.id if row else None
+
+
+def model_version(version_id: str) -> dict | None:
+    with engine().connect() as conn:
+        row = conn.execute(
+            select(model_versions).where(model_versions.c.id == version_id)
+        ).first()
+    return dict(row._mapping) if row else None
+
+
+def checkpoint_history(limit: int = 20) -> list[dict]:
+    with engine().connect() as conn:
+        rows = conn.execute(
+            select(checkpoints).order_by(checkpoints.c.created_at.desc()).limit(limit)
+        ).all()
+        out = []
+        for row in rows:
+            item = dict(row._mapping)
+            for key, value in item.items():
+                if isinstance(value, datetime):
+                    item[key] = value.isoformat()
+            out.append(item)
+        return out
+
+
+def mark_checkpoint_promoted(checkpoint_id: str, eval_results: dict):
+    with begin() as conn:
+        conn.execute(
+            update(checkpoints)
+            .where(checkpoints.c.id == checkpoint_id)
+            .values(
+                promoted=True,
+                eval_base_accuracy=eval_results.get("base_accuracy"),
+                eval_live_accuracy=eval_results.get("live_accuracy"),
+                per_vertical_accuracy=json.dumps(eval_results.get("per_vertical_accuracy", {})),
+                confusion_top20=json.dumps(eval_results.get("confusion_top20", [])),
+                policy_replay_drift_pct=eval_results.get("policy_drift_pct"),
+            )
+        )
+
+
+def get_trainer_state(key: str, default: str | None = None) -> str | None:
+    with engine().connect() as conn:
+        value = conn.execute(
+            select(trainer_state.c.value).where(trainer_state.c.key == key)
+        ).scalar_one_or_none()
+    return value if value is not None else default
+
+
+def set_trainer_state(key: str, value: str) -> None:
+    with begin() as conn:
+        existing = conn.execute(
+            select(trainer_state.c.key).where(trainer_state.c.key == key)
+        ).first()
+        if existing:
+            conn.execute(update(trainer_state).where(trainer_state.c.key == key).values(value=value))
+        else:
+            conn.execute(insert(trainer_state).values(key=key, value=value))
+
+
+def curated_count_after(sample_id: int) -> tuple[int, int]:
+    """Return (count, maximum id) for curated samples newer than sample_id."""
+    with engine().connect() as conn:
+        row = conn.execute(
+            select(func.count(curated_samples.c.id), func.coalesce(func.max(curated_samples.c.id), sample_id))
+            .where(curated_samples.c.id > sample_id)
+        ).first()
+    return (int(row[0]), int(row[1])) if row else (0, sample_id)
+
+
+def latest_promoted_checkpoint() -> dict | None:
+    with engine().connect() as conn:
+        row = conn.execute(
+            select(checkpoints)
+            .where(checkpoints.c.promoted.is_(True))
+            .where(checkpoints.c.rolled_back_at.is_(None))
+            .order_by(checkpoints.c.created_at.desc())
+            .limit(1)
+        ).first()
+    return dict(row._mapping) if row else None
+
+
+def mark_checkpoint_rolled_back(checkpoint_id: str, reason: str):
+    with begin() as conn:
+        conn.execute(
+            update(checkpoints)
+            .where(checkpoints.c.id == checkpoint_id)
+            .values(rolled_back_at=datetime.now(UTC), rolled_back_reason=reason)
+        )
+
+
+def flag_input(
+    tenant_id: str, decision_id: int | None, reason: str,
+    matched_regex: str, query_preview: str, action_taken: str,
+):
+    with begin() as conn:
+        conn.execute(insert(flagged_inputs).values(
+            tenant_id=tenant_id,
+            decision_id=decision_id,
+            reason=reason,
+            matched_regex=matched_regex,
+            query_preview=query_preview[:1000],
+            action_taken=action_taken,
+        ))
+
+
+def list_flagged(limit: int = 100, reason: str | None = None) -> list[dict]:
+    with engine().connect() as conn:
+        q = select(flagged_inputs).order_by(flagged_inputs.c.id.desc()).limit(limit)
+        if reason:
+            q = q.where(flagged_inputs.c.reason == reason)
+        rows = conn.execute(q).all()
+        out = []
+        for row in rows:
+            item = dict(row._mapping)
+            for key, value in item.items():
+                if isinstance(value, datetime):
+                    item[key] = value.isoformat()
+            out.append(item)
+        return out
+
+
+def review_stats(tenant_id: str | None = None) -> dict:
+    with engine().connect() as conn:
+        tenant_filter = review_queue.c.tenant_id == tenant_id if tenant_id else None
+
+        def count_for(status: str | None = None):
+            q = select(func.count(review_queue.c.id))
+            if status:
+                q = q.where(review_queue.c.status == status)
+            if tenant_filter is not None:
+                q = q.where(tenant_filter)
+            return conn.execute(q).scalar()
+
+        total = count_for()
+        pending = count_for("pending")
+        done = count_for("done")
+        failed = count_for("failed")
+        cost_q = select(func.coalesce(func.sum(review_queue.c.cost_usd_estimate), 0.0))
+        if tenant_filter is not None:
+            cost_q = cost_q.where(tenant_filter)
+        total_cost = conn.execute(cost_q).scalar()
+    return {
+        "total": total,
+        "pending": pending,
+        "done": done,
+        "failed": failed,
+        "est_total_cost_usd": float(total_cost or 0.0),
+    }
+
+
+def cost_breakdown(since_hours: float | None = None, tenant_id: str | None = None) -> dict:
+    decisions = get_decisions(limit=10000, since_hours=since_hours, tenant_id=tenant_id)
+    by_tier: dict[str, dict[str, float | int]] = {}
+    for d in decisions:
+        t = d["tier"]
+        by_tier.setdefault(t, {"count": 0, "total_cost": 0.0})
+        by_tier[t]["count"] += 1
+        by_tier[t]["total_cost"] += d.get("actual_cost_usd") or d.get("est_cost_usd") or 0.0
+    return {
+        "by_tier": by_tier,
+        "total_count": sum(s["count"] for s in by_tier.values()),
+        "total_cost": sum(s["total_cost"] for s in by_tier.values()),
+    }
+
+
+def vertical_distribution(since_hours: float | None = None, tenant_id: str | None = None) -> dict:
+    decisions = get_decisions(limit=10000, since_hours=since_hours, tenant_id=tenant_id)
+    dist: dict[str, int] = {}
+    for d in decisions:
+        v = d["vertical"] or "unknown"
+        dist[v] = dist.get(v, 0) + 1
+    return dist
+
+
+def session_stats(tenant_id: str | None = None) -> dict:
+    from datetime import timedelta
+    cutoff = datetime.now(UTC) - timedelta(hours=1)
+    with engine().connect() as conn:
+        total_q = select(func.count(sessions.c.session_id))
+        active_q = select(func.count(sessions.c.session_id)).where(sessions.c.last_used_at > cutoff)
+        if tenant_id:
+            total_q = total_q.where(sessions.c.tenant_id == tenant_id)
+            active_q = active_q.where(sessions.c.tenant_id == tenant_id)
+        total = conn.execute(total_q).scalar()
+        active = conn.execute(active_q).scalar()
+    return {"total_sessions": total, "active_last_hour": active}
+
+
+def purge_old_traces(days: int) -> int:
+    """Delete routing_log + feedback rows older than `days`. Returns rows purged."""
+    if days <= 0:
+        return 0
+    from datetime import timedelta
+    cutoff = datetime.now(UTC) - timedelta(days=days)
+    try:
+        with engine().connect() as conn:
+            old_ids = conn.execute(
+                select(routing_log.c.id).where(routing_log.c.ts < cutoff)
+            ).all()
+            ids = [r[0] for r in old_ids]
+        if not ids:
+            return 0
+        with begin() as conn:
+            review_ids = [
+                row[0] for row in conn.execute(
+                    select(review_results.c.id).where(review_results.c.decision_id.in_(ids))
+                ).all()
+            ]
+            conn.execute(
+                update(curated_samples)
+                .where(curated_samples.c.decision_id.in_(ids))
+                .values(decision_id=None, review_result_id=None)
+            )
+            conn.execute(delete(live_eval_set).where(live_eval_set.c.decision_id.in_(ids)))
+            conn.execute(delete(review_queue).where(review_queue.c.decision_id.in_(ids)))
+            if review_ids:
+                conn.execute(delete(review_results).where(review_results.c.id.in_(review_ids)))
+            conn.execute(delete(feedback).where(feedback.c.decision_id.in_(ids)))
+            conn.execute(delete(routing_log).where(routing_log.c.id.in_(ids)))
+        return len(ids)
+    except Exception as e:
+        log.warning("purge_old_traces failed: %s", e)
+        return 0
+
+
+def purge_old_flags(days: int) -> int:
+    """Delete flagged_inputs older than `days` (config logging.flagged_retention_days)."""
+    if days <= 0:
+        return 0
+    from datetime import timedelta
+    cutoff = datetime.now(UTC) - timedelta(days=days)
+    try:
+        with begin() as conn:
+            result = conn.execute(
+                delete(flagged_inputs).where(flagged_inputs.c.ts < cutoff)
+            )
+        return result.rowcount or 0
+    except Exception as e:
+        log.warning("purge_old_flags failed: %s", e)
+        return 0

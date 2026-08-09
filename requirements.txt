@@ -1,0 +1,24 @@
+# Gateway runtime
+aiohttp>=3.9
+PyYAML>=6.0
+SQLAlchemy>=2.0
+
+# Optional: Postgres in multi-instance mode
+psycopg[binary]>=3.1
+
+# Router model (training + inference)
+numpy>=1.24
+onnxruntime>=1.17
+transformers>=4.40
+huggingface_hub>=0.20
+
+# Trainer (PyTorch for embed_finetune + advanced heads)
+# torch>=2.1     # uncomment when enabling --allow-embedding-finetune
+
+# Tests
+pytest>=8.0
+pytest-asyncio>=0.23
+
+# Lint / type check (CI)
+ruff>=0.5
+mypy>=1.10

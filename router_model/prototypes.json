@@ -1,0 +1,119 @@
+{
+  "_doc": "Structural prototypes for Glint-V2. STRUCTURAL ONLY — never include topic verticals (medical, health, finance, etc.) as prototypes. The Glint lesson: prototypes encode difficulty profile, not topic, so topic prototypes create false positives. Centroids are filled in by router_model/train.py from training data; this file seeds the schema and initial example names.",
+  "_doc_thresholds": "Per-prototype similarity threshold (in gateway-policy.json: prototype_thresholds). Higher = stricter matching.",
+  "_doc_kind_enforcement": "trainer_worker.py refuses to add a prototype with kind='topic'. Only kind='structural' allowed.",
+
+  "version": 1,
+  "prototypes": [
+    {
+      "name": "system_design",
+      "kind": "structural",
+      "display": "System Design",
+      "description": "High-level system architecture, scaling, distributed systems design",
+      "centroid_seed_text": [
+        "Design a URL shortener that handles 10K requests per second",
+        "How would you design Twitter's timeline at scale",
+        "Design a distributed rate limiter",
+        "Design a chat system like WhatsApp",
+        "Architect a video streaming platform",
+        "Design a real-time notification system",
+        "How would you build a distributed cache"
+      ],
+      "centroid": null,
+      "_doc_centroid": "Computed by router_model/train.py from centroid_seed_text after embedding. 64-d vector. Null until first training run.",
+      "threshold": 0.85,
+      "target_tier": "tier4",
+      "enabled": true
+    },
+    {
+      "name": "hard_programming",
+      "kind": "structural",
+      "display": "Hard Programming",
+      "description": "Complex algorithms, optimization, competitive programming",
+      "centroid_seed_text": [
+        "Implement a red-black tree with O(log n) insert and delete",
+        "Solve the traveling salesman problem using dynamic programming",
+        "Write a lock-free concurrent hash map",
+        "Implement LRU cache with O(1) operations",
+        "Solve this NP-hard graph problem",
+        "Optimize this matrix multiplication to use Strassen's algorithm"
+      ],
+      "centroid": null,
+      "threshold": 0.85,
+      "target_tier": "tier4",
+      "enabled": true
+    },
+    {
+      "name": "complex_debugging",
+      "kind": "structural",
+      "display": "Complex Debugging",
+      "description": "Hard debugging, race conditions, distributed systems issues",
+      "centroid_seed_text": [
+        "Debug a race condition in this concurrent code",
+        "Find the source of an intermittent deadlock in a distributed system",
+        "Diagnose why this microservice has memory leaks",
+        "Trace a request through 12 microservices to find where latency is added",
+        "Debug a heisenbug that only appears in production"
+      ],
+      "centroid": null,
+      "threshold": 0.85,
+      "target_tier": "tier4",
+      "enabled": true
+    },
+    {
+      "name": "codebase_search",
+      "kind": "structural",
+      "display": "Codebase Search",
+      "description": "Semantic search across a codebase",
+      "centroid_seed_text": [
+        "Find all places that handle authentication in this codebase",
+        "Where is the rate limiter implemented",
+        "Locate all callers of this API endpoint",
+        "Find files that import this module",
+        "Show me where errors are logged"
+      ],
+      "centroid": null,
+      "threshold": 0.80,
+      "target_tier": "tier4",
+      "enabled": true
+    },
+    {
+      "name": "code_review",
+      "kind": "structural",
+      "display": "Code Review",
+      "description": "Reviewing PRs and suggesting improvements",
+      "centroid_seed_text": [
+        "Review this PR for security issues",
+        "Suggest improvements to this code",
+        "What's wrong with this implementation",
+        "Critique the design of this module",
+        "Identify code smells in this pull request"
+      ],
+      "centroid": null,
+      "threshold": 0.80,
+      "target_tier": "tier2",
+      "enabled": true
+    },
+    {
+      "name": "planning",
+      "kind": "structural",
+      "display": "Planning / Strategy",
+      "description": "Multi-step planning, roadmaps, project breakdowns",
+      "centroid_seed_text": [
+        "Plan a 6-month product roadmap",
+        "Break this project into phases",
+        "Create a step-by-step migration plan",
+        "Outline a strategy for entering a new market",
+        "Decompose this goal into quarterly objectives"
+      ],
+      "centroid": null,
+      "threshold": 0.75,
+      "target_tier": "tier3",
+      "enabled": true
+    }
+  ],
+
+  "_doc_growth": "Auto-grow via trainer_worker.py. Only structural kind allowed. New prototypes are computed from training samples where vertical in [system_design, hard_programming, complex_debugging, codebase_search, code_review, planning, architecture] AND curated_count > threshold. Centroid = mean(embeddings of curated samples).",
+
+  "_doc_growth_protection": "If a 'medical' or 'finance' or other topic vertical ever tries to register as a prototype, REFUSE with error: 'topic prototypes are forbidden — see Glint Roman Empire lesson in README.'"
+}

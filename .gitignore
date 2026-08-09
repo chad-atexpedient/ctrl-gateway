@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# Data / runtime artifacts
+*.db
+*.db-journal
+router_model/checkpoints/
+router_model/data/
+router_model/data/embedding_cache/
+router_model/registry.json
+router_model/MODEL_CARD.md
+router_model/*_MODEL_CARD.md
+gateway-config.runtime.json
+*.log
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Test / coverage
+.coverage
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
