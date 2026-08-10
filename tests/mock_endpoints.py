@@ -124,6 +124,40 @@ async def chat_completions_openai(request: web.Request):
     return await chat_completions(request)
 
 
+async def chat_completions_ollama(request: web.Request):
+    """Native Ollama /api/chat: JSON response or NDJSON stream (no SSE framing)."""
+    body = await request.json()
+    name = request.app["name"]
+    if name in _fail_endpoints():
+        return web.json_response({"error": "mock_internal"}, status=503)
+
+    if body.get("stream"):
+        resp = web.StreamResponse(
+            status=200,
+            headers={"Content-Type": "application/x-ndjson"},
+        )
+        await resp.prepare(request)
+        await resp.write(json.dumps({
+            "model": "ollama-m", "message": {"role": "assistant", "content": "ollama "},
+            "done": False, "prompt_eval_count": 4, "eval_count": 0,
+        }).encode() + b"\n")
+        await resp.write(json.dumps({
+            "model": "ollama-m", "message": {"role": "assistant", "content": "native"},
+            "done": True, "done_reason": "stop", "prompt_eval_count": 4, "eval_count": 2,
+        }).encode() + b"\n")
+        await resp.write_eof()
+        return resp
+
+    return web.json_response({
+        "model": "ollama-m",
+        "message": {"role": "assistant", "content": f"ollama native from {name}"},
+        "done": True,
+        "done_reason": "stop",
+        "prompt_eval_count": 5,
+        "eval_count": 3,
+    })
+
+
 async def make_app(name: str, latency_ms: int = 1) -> web.Application:
     app = web.Application()
     app["name"] = name
@@ -132,6 +166,7 @@ async def make_app(name: str, latency_ms: int = 1) -> web.Application:
     app.router.add_get("/health", health)
     app.router.add_post("/v1/chat/completions", chat_completions)
     app.router.add_post("/chat/completions", chat_completions_openai)
+    app.router.add_post("/api/chat", chat_completions_ollama)
     return app
 
 

@@ -232,12 +232,26 @@ class _RealModel:
             raise RuntimeError(f"embedding encode failed: {e}") from e
 
     def _run_heads(self, emb: np.ndarray) -> dict[str, np.ndarray]:
-        """Run classifier heads. Returns dict of {head_name: np.ndarray}."""
+        """Run classifier heads. Returns dict of {head_name: np.ndarray}.
+
+        Architecture: shared trunk (Linear 384->hidden, ReLU) -> per-task
+        linear heads. ReLU (not GELU/tanh) is used deliberately so this numpy
+        forward pass is an EXACT match for the PyTorch training graph in
+        router_model/train.py — no activation-approximation drift between
+        train and inference. MUST stay in sync with train.py's model and
+        router_model/eval.py's predict_with_heads (AGENTS.md invariant).
+        """
         out = {}
-        # Vertical softmax: W_v @ emb + b_v
+        # Shared trunk
+        W_t = self.heads_weights["W_trunk1"]
+        b_t = self.heads_weights["b_trunk1"]
+        trunk = emb @ W_t.T + b_t
+        trunk = np.maximum(trunk, 0.0)  # ReLU
+
+        # Vertical softmax: W_v @ trunk + b_v
         W_v = self.heads_weights["W_vertical"]
         b_v = self.heads_weights["b_vertical"]
-        logits_v = emb @ W_v.T + b_v
+        logits_v = trunk @ W_v.T + b_v
         # Apply temperature
         logits_v = logits_v / max(self.calibration_temperature, 1e-6)
         # Stable softmax
@@ -248,7 +262,7 @@ class _RealModel:
         # Complexity ordinal: cumulative sigmoid heads
         W_c = self.heads_weights["W_complexity"]
         b_c = self.heads_weights["b_complexity"]
-        logits_c = emb @ W_c.T + b_c  # shape (5,)
+        logits_c = trunk @ W_c.T + b_c  # shape (5,)
         # Convert to ordinal cumulative: sigmoid of each threshold
         cum = 1.0 / (1.0 + np.exp(-logits_c))
         out["complexity_probs"] = cum
@@ -257,14 +271,14 @@ class _RealModel:
         for fname in ["code", "math", "reasoning", "long_output"]:
             W = self.heads_weights[f"W_{fname}"]
             b = self.heads_weights[f"b_{fname}"]
-            logit = float(emb @ W.T + b)
+            logit = float(trunk @ W.T + b)
             out[f"{fname}_prob"] = 1.0 / (1.0 + math.exp(-logit))
 
         # Projection head (64-d for prototypes)
         W_p = self.heads_weights.get("W_projection")
         b_p = self.heads_weights.get("b_projection")
         if W_p is not None and b_p is not None:
-            proj = emb @ W_p.T + b_p
+            proj = trunk @ W_p.T + b_p
             n = np.linalg.norm(proj)
             out["projection"] = proj / max(n, 1e-9)
         else:
@@ -420,6 +434,7 @@ class Router:
             if metadata_verticals and list(metadata_verticals) != list(vertical_names):
                 raise ValueError("heads taxonomy does not match configured vertical order")
             required_weights = {
+                "W_trunk1", "b_trunk1",
                 "W_vertical", "b_vertical", "W_complexity", "b_complexity",
                 "W_code", "b_code", "W_math", "b_math", "W_reasoning", "b_reasoning",
                 "W_long_output", "b_long_output",
@@ -431,6 +446,20 @@ class Router:
                 raise ValueError("vertical head output size does not match taxonomy")
             if heads_weights["W_complexity"].shape[0] != 5:
                 raise ValueError("complexity head must contain five ordinal thresholds")
+            if heads_weights["W_trunk1"].shape[1] != EMBED_DIM_DEFAULT:
+                raise ValueError(
+                    f"trunk input dim {heads_weights['W_trunk1'].shape[1]} != "
+                    f"embedding dim {EMBED_DIM_DEFAULT}"
+                )
+            hidden_dim = heads_weights["W_trunk1"].shape[0]
+            for head_name in (
+                "W_vertical", "W_complexity", "W_code", "W_math", "W_reasoning", "W_long_output",
+            ):
+                if heads_weights[head_name].shape[1] != hidden_dim:
+                    raise ValueError(
+                        f"{head_name} input dim {heads_weights[head_name].shape[1]} != "
+                        f"trunk hidden dim {hidden_dim}"
+                    )
 
             new_model = _RealModel(
                 embedding_session=embedding_session,
@@ -464,6 +493,20 @@ class Router:
         out = model.predict(text)
         out.ms_classify = (time.time() - t0) * 1000.0
         return out
+
+    def embed(self, text: str) -> np.ndarray | None:
+        """Embed a text with the real model. Returns None while on the stub."""
+        if not text or not text.strip():
+            return None
+        with self._lock:
+            model = self._model
+        if not isinstance(model, _RealModel):
+            return None
+        try:
+            return model._encode(text)
+        except Exception as e:
+            log.warning("embed failed: %s", e)
+            return None
 
     def is_stub(self) -> bool:
         with self._lock:

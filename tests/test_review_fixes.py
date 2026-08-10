@@ -1,4 +1,5 @@
 """Regression tests for code-review fixes (batch 2026-08)."""
+import asyncio
 import json
 import os
 import sys
@@ -521,8 +522,73 @@ class TestSwarm(unittest.TestCase):
         from gateway import swarm
         conf = _conf()
         ctx = type("Ctx", (), {"text": "para one.\n\npara two.\n\npara three."})()
-        subtasks = swarm.decompose(ctx, conf, {"chunk_max_chars": 100, "tier_pyramid": ["tier0", "tier2", "tier3"]})
+        # decompose() is async (llm_plan mode needs to await a planner call);
+        # with llm_plan unset/False and no pool, it resolves straight to the
+        # synchronous chunking path — asyncio.run() is enough here, no need
+        # for an async test case.
+        subtasks = asyncio.run(
+            swarm.decompose(ctx, conf, {"chunk_max_chars": 100, "tier_pyramid": ["tier0", "tier2", "tier3"]})
+        )
         self.assertGreaterEqual(len(subtasks), 1)
+
+    def test_decompose_llm_plan_falls_back_without_pool(self):
+        """llm_plan:true but pool=None must fall back to chunking, not crash."""
+        from gateway import swarm
+        conf = _conf()
+        ctx = type("Ctx", (), {"text": "para one.\n\npara two.\n\npara three."})()
+        subtasks = asyncio.run(
+            swarm.decompose(
+                ctx, conf,
+                {"llm_plan": True, "chunk_max_chars": 100, "tier_pyramid": ["tier0", "tier2", "tier3"]},
+                None,
+            )
+        )
+        self.assertGreaterEqual(len(subtasks), 1)
+
+    def test_topological_layers_no_deps(self):
+        """Subtasks with no depends_on all land in a single layer (matches
+        the old fully-parallel behavior for the default chunking path)."""
+        from gateway.swarm import SubTask, _topological_layers
+        subtasks = [SubTask(id=f"s{i}", prompt="x", target_tier="tier0") for i in range(3)]
+        layers = _topological_layers(subtasks)
+        self.assertEqual(len(layers), 1)
+        self.assertEqual(len(layers[0]), 3)
+
+    def test_topological_layers_respects_dependency(self):
+        from gateway.swarm import SubTask, _topological_layers
+        subtasks = [
+            SubTask(id="a", prompt="x", target_tier="tier0"),
+            SubTask(id="b", prompt="x", target_tier="tier0", depends_on=["a"]),
+        ]
+        layers = _topological_layers(subtasks)
+        self.assertEqual([st.id for st in layers[0]], ["a"])
+        self.assertEqual([st.id for st in layers[1]], ["b"])
+
+    def test_topological_layers_cycle_falls_back_to_single_layer(self):
+        from gateway.swarm import SubTask, _topological_layers
+        subtasks = [
+            SubTask(id="a", prompt="x", target_tier="tier0", depends_on=["b"]),
+            SubTask(id="b", prompt="x", target_tier="tier0", depends_on=["a"]),
+        ]
+        layers = _topological_layers(subtasks)
+        self.assertEqual(len(layers), 1)
+        self.assertEqual(len(layers[0]), 2)
+
+    def test_has_cycle_detects_self_referencing_graph(self):
+        from gateway.swarm import SubTask, _has_cycle
+        subtasks = [
+            SubTask(id="a", prompt="x", target_tier="tier0", depends_on=["b"]),
+            SubTask(id="b", prompt="x", target_tier="tier0", depends_on=["a"]),
+        ]
+        self.assertTrue(_has_cycle(subtasks))
+
+    def test_has_cycle_false_for_dag(self):
+        from gateway.swarm import SubTask, _has_cycle
+        subtasks = [
+            SubTask(id="a", prompt="x", target_tier="tier0"),
+            SubTask(id="b", prompt="x", target_tier="tier0", depends_on=["a"]),
+        ]
+        self.assertFalse(_has_cycle(subtasks))
 
 
 class TestReviewerCaps(unittest.TestCase):

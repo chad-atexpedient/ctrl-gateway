@@ -154,6 +154,78 @@ class TestWorkingMemory(unittest.TestCase):
         alice = om._load_recency("alice", "shared", limit=10)
         self.assertEqual([m["content"] for m in alice], ["alice secret"])
 
+    def test_semantic_recall_uses_stored_vectors(self):
+        import numpy as np
+        from sqlalchemy import insert as sa_insert
+
+        from gateway import memory as storage
+        from gateway import memory_observational as om
+        from gateway import router as router_mod
+
+        mid_tree = om.record_message(
+            resource_id="r9", thread_id="t9", role="user",
+            content="what is a red black tree", embed=False,
+        )
+        mid_greeting = om.record_message(
+            resource_id="r9", thread_id="t9", role="user",
+            content="hello how are you today", embed=False,
+        )
+        with storage.engine().begin() as conn:
+            conn.execute(sa_insert(om.message_embeddings).values(
+                id=f"e{mid_tree}", message_id=mid_tree,
+                vector_blob=json.dumps([1.0] * 8), model="test", dim=8,
+            ))
+            conn.execute(sa_insert(om.message_embeddings).values(
+                id=f"e{mid_greeting}", message_id=mid_greeting,
+                vector_blob=json.dumps([-1.0] * 8), model="test", dim=8,
+            ))
+
+        real_router = type("RealRouter", (), {
+            "is_stub": lambda self: False,
+            "embed": lambda self, text: np.array([1.0] * 8, dtype=np.float32),
+        })()
+        original_router = router_mod.router
+        router_mod.router = lambda: real_router
+        try:
+            results = om._semantic_recall("r9", "trees and algorithms", top_k=1)
+        finally:
+            router_mod.router = original_router
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["content"], "what is a red black tree")
+
+    def test_record_message_stores_embedding_when_requested(self):
+        from sqlalchemy import select
+
+        from gateway import memory as storage
+        from gateway import memory_observational as om
+        from gateway import router as router_mod
+
+        class StubWithEmbed:
+            def is_stub(self):
+                return True
+
+            def embed(self, text):
+                return None
+
+            def model_version(self):
+                return "stub-v0"
+
+        original_router = router_mod.router
+        router_mod.router = lambda: StubWithEmbed()
+        try:
+            message_id = om.record_message(
+                resource_id="r10", thread_id="t10", role="user",
+                content="stub path stores nothing", embed=True,
+            )
+        finally:
+            router_mod.router = original_router
+        with storage.engine().connect() as conn:
+            count = conn.execute(
+                select(om.message_embeddings).where(om.message_embeddings.c.message_id == message_id)
+            ).all()
+        self.assertEqual(len(count), 0)
+
 
 class TestMemoryContext(unittest.TestCase):
     def setUp(self):

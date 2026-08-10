@@ -6,14 +6,20 @@ SQLAlchemy>=2.0
 # Optional: Postgres in multi-instance mode
 psycopg[binary]>=3.1
 
-# Router model (training + inference)
+# Router model — inference (gateway/router.py): numpy + onnxruntime only,
+# no torch. Keeps the live routing hot path CPU-only and torch-free.
 numpy>=1.24
 onnxruntime>=1.17
 transformers>=4.40
 huggingface_hub>=0.20
 
-# Trainer (PyTorch for embed_finetune + advanced heads)
-# torch>=2.1     # uncomment when enabling --allow-embedding-finetune
+# Router model — training only (router_model/train.py heads, plus
+# embed_finetune.py's embedding fine-tune). Not needed to RUN the gateway,
+# only to train/retrain the router. Required now that train.py's heads are a
+# real PyTorch MLP (trunk + task heads) instead of hand-rolled numpy
+# regression — install before running train.py or trainer_worker.py's
+# auto-retrain loop.
+torch>=2.1
 
 # Tests
 pytest>=8.0

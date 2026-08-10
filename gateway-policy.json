@@ -165,7 +165,8 @@
     "ring_buffer_size": 1000
   },
 
-  "_doc_swarm": "Swarm/synthesis mode: decompose complex requests into parallel subtasks across tiers, then synthesize. Off by default. mode: off | auto | always. auto triggers when cost-first picks a trigger_tier AND complexity >= min_complexity AND a swarm-eligible flag is set. Swarm only runs if its expected cost is below max_swarm_cost_usd.",
+  "_doc_swarm": "Swarm/synthesis mode: decompose complex requests into subtasks across tiers/subagents, then synthesize. Off by default. mode: off | auto | always. auto triggers when cost-first picks a trigger_tier AND complexity >= min_complexity AND a swarm-eligible flag is set. Swarm only runs if its expected cost is below max_swarm_cost_usd.",
+  "_doc_swarm_llm_plan": "llm_plan:false (default) = naive paragraph chunking, subtasks are independent. llm_plan:true = planner_tier's model reads the request and returns a dependency-aware subtask plan (min_subtasks..max_subtasks, each with target_tier + optional depends_on); execute_swarm runs it in topological layers. Any planning failure (bad JSON, cycle, unknown tier, out-of-range count) falls back to chunking automatically.",
   "swarm": {
     "mode": "off",
     "trigger_tiers": ["tier4"],
@@ -173,7 +174,11 @@
     "chunk_max_chars": 2000,
     "tier_pyramid": ["tier0", "tier2", "tier3"],
     "synthesis_tier": "tier3",
-    "max_swarm_cost_usd": null
+    "max_swarm_cost_usd": null,
+    "llm_plan": false,
+    "planner_tier": "tier2",
+    "min_subtasks": 2,
+    "max_subtasks": 6
   },
 
   "_doc_translation": "Translation-intent handling. mode: off | detect_only | rewrite | dedicated_endpoint. detect_only tags the decision without changing routing. rewrite injects a translator system prompt."

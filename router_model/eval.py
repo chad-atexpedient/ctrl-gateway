@@ -24,20 +24,30 @@ import numpy as np
 from train import _sigmoid, _softmax, encode_with_embedding
 
 
+def _trunk_forward(embeddings: np.ndarray, weights: dict) -> np.ndarray:
+    """Shared trunk forward pass (Linear -> ReLU). MUST mirror
+    gateway/router.py._RealModel._run_heads and router_model/train.py's
+    PyTorch model exactly — see AGENTS.md invariant on the heads contract."""
+    trunk = embeddings @ weights["W_trunk1"].T + weights["b_trunk1"]
+    return np.maximum(trunk, 0.0)
+
+
 def predict_with_heads(embeddings: np.ndarray, weights: dict, vertical_names: list[str]) -> list[dict]:
     """Run heads on embeddings. Returns list of {vertical, complexity, code, math, reasoning, long_output}."""
-    logits_v = embeddings @ weights["W_vertical"].T + weights["b_vertical"]
+    trunk = _trunk_forward(embeddings, weights)
+
+    logits_v = trunk @ weights["W_vertical"].T + weights["b_vertical"]
     probs_v = _softmax(logits_v)
     vertical_idx = probs_v.argmax(axis=1)
 
-    logits_c = embeddings @ weights["W_complexity"].T + weights["b_complexity"]
+    logits_c = trunk @ weights["W_complexity"].T + weights["b_complexity"]
     probs_c = _sigmoid(logits_c)
     complexity = (probs_c > 0.5).sum(axis=1).clip(min=1, max=5)
 
-    code = _sigmoid(embeddings @ weights["W_code"].T + weights["b_code"]).flatten() > 0.5
-    math = _sigmoid(embeddings @ weights["W_math"].T + weights["b_math"]).flatten() > 0.5
-    reasoning = _sigmoid(embeddings @ weights["W_reasoning"].T + weights["b_reasoning"]).flatten() > 0.5
-    long_output = _sigmoid(embeddings @ weights["W_long_output"].T + weights["b_long_output"]).flatten() > 0.5
+    code = _sigmoid(trunk @ weights["W_code"].T + weights["b_code"]).flatten() > 0.5
+    math = _sigmoid(trunk @ weights["W_math"].T + weights["b_math"]).flatten() > 0.5
+    reasoning = _sigmoid(trunk @ weights["W_reasoning"].T + weights["b_reasoning"]).flatten() > 0.5
+    long_output = _sigmoid(trunk @ weights["W_long_output"].T + weights["b_long_output"]).flatten() > 0.5
 
     return [
         {

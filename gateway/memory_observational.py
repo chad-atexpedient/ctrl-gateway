@@ -320,21 +320,47 @@ def _load_latest_reflection(resource_id: str, thread_id: str) -> str | None:
 
 
 def _semantic_recall(resource_id: str, query_text: str, top_k: int) -> list[dict]:
-    """L3: vector-search over all history for this resource.
+    """L3: vector-search over stored message embeddings for this resource.
 
-    Returns up to top_k messages, with surrounding context if messageRange is set.
-    Falls back to keyword matching if no embeddings configured.
+    Vectors are written by `record_message(embed=True)` when the router has a
+    real (non-stub) embedding model. Falls back to keyword matching when no
+    embeddings are available.
     """
     try:
-        # Try embedding-based recall
+        import numpy as np
+
         from . import router as router_mod
         emb = router_mod.router()
         if emb.is_stub():
             return _keyword_recall_fallback(resource_id, query_text, top_k)
-        # Encode query
-        # ... (real semantic recall would go here)
-        # For now, fall back to keyword
-        return _keyword_recall_fallback(resource_id, query_text, top_k)
+        query_vec = emb.embed(query_text)
+        if query_vec is None:
+            return _keyword_recall_fallback(resource_id, query_text, top_k)
+        with storage.engine().connect() as conn:
+            rows = conn.execute(
+                select(message_history, message_embeddings.c.vector_blob)
+                .join(message_embeddings, message_embeddings.c.message_id == message_history.c.id)
+                .where(message_history.c.resource_id == resource_id)
+                .order_by(message_history.c.id.desc())
+                .limit(500)
+            ).all()
+        query_norm = max(float(np.linalg.norm(query_vec)), 1e-9)
+        scored = []
+        for row in rows:
+            blob = row._mapping["vector_blob"]
+            if not blob:
+                continue
+            try:
+                vector = np.array(json.loads(blob), dtype=np.float32)
+            except (ValueError, TypeError):
+                continue
+            if vector.shape != query_vec.shape:
+                continue
+            similarity = float(np.dot(query_vec, vector) / max(query_norm * float(np.linalg.norm(vector)), 1e-9))
+            message = {k: v for k, v in row._mapping.items() if k != "vector_blob"}
+            scored.append((similarity, message))
+        scored.sort(key=lambda x: -x[0])
+        return [message for _, message in scored[:top_k]]
     except Exception as e:
         log.warning("semantic_recall failed: %s", e)
         return []
@@ -437,8 +463,14 @@ def record_message(
     content: str,
     token_estimate: int | None = None,
     metadata: dict | None = None,
+    embed: bool = False,
 ) -> int:
-    """Persist a message in the memory domain. Returns message id."""
+    """Persist a message in the memory domain. Returns message id.
+
+    When embed=True (router has a real embedding model), the message is also
+    embedded into message_embeddings for L3 semantic recall. The encoding runs
+    in the caller's thread (app.py calls this via asyncio.to_thread).
+    """
     if token_estimate is None:
         token_estimate = len(content) // 4
     try:
@@ -452,7 +484,25 @@ def record_message(
                 metadata_json=json.dumps(metadata) if metadata else None,
             ))
             primary_key = result.inserted_primary_key
-            return int(primary_key[0]) if primary_key else 0
+            message_id = int(primary_key[0]) if primary_key else 0
+        if message_id and embed:
+            try:
+                import numpy as np
+
+                from . import router as router_mod
+                vector = router_mod.router().embed(content)
+                if vector is not None:
+                    with storage.engine().begin() as conn:
+                        conn.execute(insert(message_embeddings).values(
+                            id=f"e{message_id}",
+                            message_id=message_id,
+                            vector_blob=json.dumps(vector.astype(np.float32).tolist()),
+                            model=router_mod.router().model_version(),
+                            dim=int(vector.shape[0]),
+                        ))
+            except Exception as e:
+                log.warning("record_message embedding failed: %s", e)
+        return message_id
     except Exception as e:
         log.warning("record_message failed: %s", e)
         return 0

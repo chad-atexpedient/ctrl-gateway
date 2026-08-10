@@ -9,13 +9,20 @@ Pipeline:
   1. Load curated samples (high agreement, trust_score >= floor)
   2. Mix with base data (30% base + 70% curated by default)
   3. Hash-dedup against frozen eval set
-  4. Train heads (PyTorch, frozen embedding)
-  5. Evaluate on base-eval + live-eval
-  6. If eval gate passes -> atomic hot-swap
-  7. If regression -> auto-rollback
-  8. Update registry, model_card
+  4. (optional) Fine-tune the embedding on vertical disagreements, gated
+     behind manual /retrain --allow-embedding-finetune
+  5. Train heads (PyTorch, frozen or fine-tuned embedding)
+  6. Evaluate on base-eval + live-eval
+  7. If eval gate passes -> atomic hot-swap + persist as boot default
+  8. If regression -> auto-rollback
+  9. Update registry, model_card
 
-Embedding fine-tuning is gated behind manual /retrain --allow-embedding-finetune.
+Embedding fine-tuning (step 4) runs router_model/embed_finetune.py as its own
+subprocess against the vertical-disagreement pool (router vs. reviewer
+mismatches) exported from review_results, producing a fine-tuned ONNX that
+train.py then encodes training data with (--embedding-onnx). Any failure at
+that step falls back to heads-only training on the current frozen embedding
+— never blocks the run.
 """
 from __future__ import annotations
 
@@ -42,9 +49,17 @@ CHECKPOINTS_DIR = Path("./router_model/checkpoints")
 EMBEDDING_DIR = Path("./router_model/data/embedding")
 BASE_DATA_DIR = Path("./router_model/data/base")
 CURATED_DATA_DIR = Path("./router_model/data/curated")
+DISAGREEMENT_DATA_DIR = Path("./router_model/data/disagreement")
 LIVE_EVAL_DIR = Path("./router_model/data/live-eval")
 EVAL_DIR = Path("./router_model/data/eval")
 MODEL_CARD_PATH = Path("./router_model/MODEL_CARD.md")
+
+
+def _run_subprocess(cmd: list[str], timeout: int):
+    """Module-level so it can be shared by every subprocess step (train,
+    eval, embedding fine-tune) via loop.run_in_executor without re-defining
+    a closure each time."""
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
 class TrainerWorker:
@@ -318,13 +333,23 @@ class TrainerWorker:
             loop = asyncio.get_running_loop()
             previous_version: str | None = None
             swapped = False
-
-            def _run_subprocess(cmd: list[str], timeout: int):
-                return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            embedding_onnx_path: str | None = None
 
             try:
                 # 1. Export curated data to file
                 self._export_curated_data(run_id)
+
+                # 1b. Optional embedding fine-tune (manual-gated). Runs BEFORE
+                # heads training so train.py can encode with the fine-tuned
+                # embedding via --embedding-onnx. Any failure here falls back
+                # to heads-only training on the current frozen embedding.
+                if allow_embedding_finetune:
+                    embedding_onnx_path = await self._run_embedding_finetune(run_id)
+                    if not embedding_onnx_path:
+                        log.warning(
+                            "embedding fine-tune produced no artifact this run; "
+                            "continuing heads-only on the current frozen embedding",
+                        )
 
                 # 2. Run training (subprocess to isolate torch state)
                 heads_path = CHECKPOINTS_DIR / f"{new_version}_heads.npz"
@@ -344,11 +369,9 @@ class TrainerWorker:
                     "--version", new_version,
                 ]
                 if allow_embedding_finetune:
-                    log.warning(
-                        "embedding fine-tune requested but NOT implemented "
-                        "(router_model/embed_finetune.py is a stub); running heads-only",
-                    )
                     cmd.append("--allow-embedding-finetune")
+                if embedding_onnx_path:
+                    cmd.extend(["--embedding-onnx", embedding_onnx_path])
                 proc = await loop.run_in_executor(None, _run_subprocess, cmd, 1800)
                 if proc.returncode != 0:
                     log.error("training failed: %s", proc.stderr[-1000:])
@@ -450,18 +473,29 @@ class TrainerWorker:
                     log.info("snapshot created for revert: %s -> %s", new_version, previous_version)
 
                 # 7. Atomic hot-swap
+                # Checksum guard: when this run fine-tuned the embedding, the
+                # ONNX bytes legitimately differ from the static config's
+                # checksum (which was pinned to the previous/stock
+                # embedding) — skip the check since we just produced and are
+                # loading this exact artifact in-process (trusted
+                # provenance). Ordinary heads-only retrains still enforce the
+                # static checksum as before.
                 swap_ok = router_mod.router().try_load_real(
                     onnx_path=str(onnx_path),
                     heads_path=str(heads_path),
                     vertical_names=[v["name"] for v in self.conf.verticals()],
                     calibration_temperature=self.conf.policy.get("calibration", {}).get("temperature", 1.0),
-                    checksum_sha256=self.conf.config.get("embedding", {}).get("checksum_sha256") or None,
+                    checksum_sha256=(
+                        None if embedding_onnx_path
+                        else (self.conf.config.get("embedding", {}).get("checksum_sha256") or None)
+                    ),
                     tokenizer_source=self.conf.config.get("embedding", {}).get("model_id"),
                 )
                 if not swap_ok:
                     log.error("hot-swap failed")
                     return False
                 swapped = True
+                self._persist_as_boot_default(onnx_path, heads_path)
 
                 # 8. Register version + checkpoint (with revert target)
                 memory.register_model_version(
@@ -519,6 +553,120 @@ class TrainerWorker:
                 f.write(json.dumps(d, default=str) + "\n")
         log.info("exported %d curated samples to %s", len(rows), out_path)
 
+    def _export_disagreement_pool(self, run_id: str, limit: int = 20000) -> Path:
+        """Export vertical-label disagreements (router prediction vs.
+        reviewer ground truth) for embed_finetune.py's contrastive triplets.
+
+        Each line: {text, true_vertical, router_vertical}. true_vertical is
+        the reviewer's label (positive-class anchor target); router_vertical
+        is what the router predicted instead (the hard-negative class) —
+        that's exactly the confusable pair the embedding needs to pull apart.
+        """
+        run_dir = DISAGREEMENT_DATA_DIR / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        with memory.engine().connect() as conn:
+            rows = conn.execute(
+                select(
+                    memory.review_results.c.prompt_text,
+                    memory.review_results.c.vertical_label,
+                    memory.routing_log.c.vertical,
+                    memory.routing_log.c.query_preview,
+                )
+                .select_from(memory.review_results)
+                .join(memory.routing_log, memory.routing_log.c.id == memory.review_results.c.decision_id)
+                .where(memory.review_results.c.agreement_vertical.is_(False))
+                .order_by(memory.review_results.c.id.desc())
+                .limit(limit)
+            ).all()
+        out_path = run_dir / "disagreements.jsonl"
+        n = 0
+        with open(out_path, "w", encoding="utf-8") as f:
+            for prompt_text, true_vertical, router_vertical, query_preview in rows:
+                text = prompt_text or query_preview
+                if not text or not true_vertical or not router_vertical:
+                    continue
+                f.write(json.dumps({
+                    "text": text,
+                    "true_vertical": true_vertical,
+                    "router_vertical": router_vertical,
+                }, ensure_ascii=False) + "\n")
+                n += 1
+        log.info("exported %d vertical disagreements to %s", n, out_path)
+        return out_path
+
+    async def _run_embedding_finetune(self, run_id: str) -> str | None:
+        """Run router_model/embed_finetune.py as a subprocess against the
+        freshly exported disagreement pool. Returns the fine-tuned ONNX path
+        on success, or None on ANY failure — the caller always has a safe
+        fallback (heads-only training on the current frozen embedding), so
+        this never raises.
+        """
+        try:
+            disagreement_path = self._export_disagreement_pool(run_id)
+        except Exception as e:
+            log.warning("disagreement pool export failed: %s", e)
+            return None
+
+        finetune_dir = EMBEDDING_DIR / f"finetuned_{run_id}"
+        finetune_onnx = finetune_dir / "model.onnx"
+        cmd = [
+            "python", str(Path("./router_model/embed_finetune.py")),
+            "--disagreement-pool", str(disagreement_path),
+            "--base-data-dir", str(BASE_DATA_DIR),
+            "--output-onnx", str(finetune_onnx),
+        ]
+        loop = asyncio.get_running_loop()
+        try:
+            proc = await loop.run_in_executor(None, _run_subprocess, cmd, 1800)
+        except Exception as e:
+            log.error("embedding fine-tune subprocess failed to run: %s", e)
+            return None
+        if proc.returncode != 0:
+            log.error("embedding fine-tune failed (exit %d): %s", proc.returncode, proc.stderr[-1000:])
+            return None
+        if not finetune_onnx.exists():
+            log.warning("embedding fine-tune reported success but no ONNX at %s", finetune_onnx)
+            return None
+        log.info("embedding fine-tune produced %s", finetune_onnx)
+        return str(finetune_onnx)
+
+    def _persist_as_boot_default(self, onnx_path: Path, heads_path: Path):
+        """Copy the just-promoted checkpoint to the static boot path
+        (gateway-config.json -> embedding.onnx_path / sibling heads.npz) and
+        update embedding.checksum_sha256, so this promotion survives a
+        process restart — not just the in-memory hot-swap. app.py's
+        init_app() only reads the static path at startup; it has no notion
+        of "latest promoted checkpoint" from the registry.
+
+        Best-effort: failures are logged, never fatal — the in-memory
+        hot-swap already succeeded, so the training run is still a success
+        even if this persistence step has a problem (e.g. read-only mount).
+        Single-instance mode only, matching OverlayManager's existing
+        constraint — multi mode ships config via image/volume.
+        """
+        if self.conf.config.get("mode") != "single":
+            log.info("mode=multi: skipping boot-default persistence (ship config via image/volume)")
+            return
+        try:
+            import shutil
+            boot_onnx = Path(
+                self.conf.config.get("embedding", {}).get("onnx_path")
+                or str(EMBEDDING_DIR / "model.onnx")
+            )
+            boot_heads = boot_onnx.with_name("heads.npz")
+            boot_onnx.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(onnx_path, boot_onnx)
+            shutil.copy(heads_path, boot_heads)
+            new_checksum = hashlib.sha256(boot_onnx.read_bytes()).hexdigest()
+
+            config_path = Path("./gateway-config.json")
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw.setdefault("embedding", {})["checksum_sha256"] = new_checksum
+            config_path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+            log.info("persisted boot default: %s (checksum=%s…)", boot_onnx, new_checksum[:16])
+        except Exception as e:
+            log.warning("failed to persist boot default (in-memory hot-swap still active): %s", e)
+
     async def _replay_drift_check(self, eval_results: dict, threshold_pct: float) -> float | None:
         """Replay last 100 decisions through the new model and measure drift."""
         try:
@@ -547,12 +695,34 @@ class TrainerWorker:
         """Auto-generate MODEL_CARD.md for this version."""
         per_vert = eval_results.get("per_vertical_accuracy", {})
         confusions = eval_results.get("confusion_top20", [])
+
+        train_meta: dict = {}
+        meta_path = CHECKPOINTS_DIR / f"{version_id}_meta.json"
+        if meta_path.exists():
+            try:
+                train_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception as e:
+                log.warning("could not read %s for model card: %s", meta_path, e)
+
+        embedding_note = (
+            "fine-tuned this run" if train_meta.get("embedding_onnx_override") else "frozen (stock)"
+        )
         card = f"""# Router Model Card — {version_id}
 
 **Generated:** {datetime.now(UTC).isoformat()}
 **Run:** {run_id}
-**Embedding:** {self.conf.config.get("embedding", {}).get("model_id", "unknown")}
+**Embedding:** {self.conf.config.get("embedding", {}).get("model_id", "unknown")} ({embedding_note})
 **Reviewer model:** {self.conf.reviewer().get("model", "unknown")}
+
+## Architecture
+
+| Field | Value |
+|-------|-------|
+| Heads architecture | {train_meta.get("architecture", "n/a")} |
+| Hidden dim | {train_meta.get("hidden_dim", "n/a")} |
+| Train / val samples | {train_meta.get("train_n", "n/a")} / {train_meta.get("val_n", "n/a")} |
+| Val accuracy (early-stop signal) | {train_meta.get("val_accuracy", "n/a")} |
+| Suggested calibration temperature | {train_meta.get("suggested_calibration_temperature", "n/a")} (compare to gateway-policy.json -> calibration.temperature) |
 
 ## Performance
 
