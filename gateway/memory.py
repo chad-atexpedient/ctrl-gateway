@@ -165,6 +165,9 @@ users = Table(
     Column("rps_limit", Integer, default=100),
     Column("concurrent_limit", Integer, default=20),
     Column("tokens_per_min", Integer, default=200000),
+    Column("daily_token_limit", Integer, default=0),
+    Column("plan_id", String(64), index=True),
+    Column("target_success_probability", Float, default=0.99),
     Column("created_at", DateTime, default=lambda: datetime.now(UTC)),
 )
 
@@ -173,6 +176,7 @@ usage_counters = Table(
     metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("tenant_id", String(64), index=True),
+    Column("endpoint_name", String(64), index=True),
     Column("ts", DateTime, default=lambda: datetime.now(UTC), index=True),
     Column("period_hour", String(13), index=True),
     Column("period_day", String(10), index=True),
@@ -182,6 +186,55 @@ usage_counters = Table(
     Column("cost_usd", Float, default=0.0),
     Column("request_count", Integer, default=0),
 )
+
+plan_quotas = Table(
+    "plan_quotas",
+    metadata,
+    Column("plan_id", String(64), primary_key=True),
+    Column("name", String(128)),
+    Column("daily_token_limit", Integer, default=0),
+    Column("daily_usd_limit", Float, default=0.0),
+    Column("required_success_probability", Float, default=0.99),
+    Column("allowed_models_json", Text),
+    Column("created_at", DateTime, default=lambda: datetime.now(UTC)),
+)
+
+tenant_plans = Table(
+    "tenant_plans",
+    metadata,
+    Column("tenant_id", String(64), primary_key=True),
+    Column("plan_id", String(64), ForeignKey("plan_quotas.plan_id"), index=True),
+    Column("effective_from", DateTime, default=lambda: datetime.now(UTC)),
+    Column("notes", Text),
+)
+
+model_token_limits = Table(
+    "model_token_limits",
+    metadata,
+    Column("tenant_id", String(64), primary_key=True),
+    Column("endpoint_name", String(64), primary_key=True),
+    Column("daily_token_limit", Integer, default=0),
+    Column("daily_usd_limit", Float, default=0.0),
+    Column("max_request_tokens", Integer, default=0),
+    Column("period_day", String(10), index=True),
+    Column("tokens_used", Integer, default=0),
+    Column("cost_used_usd", Float, default=0.0),
+    Column("updated_at", DateTime, default=lambda: datetime.now(UTC)),
+)
+
+model_quality_profiles = Table(
+    "model_quality_profiles",
+    metadata,
+    Column("endpoint_name", String(64), primary_key=True),
+    Column("vertical", String(64), primary_key=True),
+    Column("complexity_min", Integer, primary_key=True),
+    Column("complexity_max", Integer, primary_key=True),
+    Column("success_count", Integer, default=0),
+    Column("total_count", Integer, default=0),
+    Column("calibration_samples", Integer, default=0),
+    Column("last_updated", DateTime, default=lambda: datetime.now(UTC)),
+)
+
 
 breakers = Table(
     "breakers",
@@ -924,8 +977,8 @@ def _user_row_dict(row) -> dict:
     return d
 
 
-def record_usage(tenant_id: str, tokens_in: int, tokens_out: int, cost_usd: float):
-    _insert_usage(tenant_id, tokens_in, tokens_out, cost_usd, request_count=1)
+def record_usage(tenant_id: str, tokens_in: int, tokens_out: int, cost_usd: float, endpoint_name: str = "unknown"):
+    _insert_usage(tenant_id, tokens_in, tokens_out, cost_usd, request_count=1, endpoint_name=endpoint_name)
 
 
 def _insert_usage(
@@ -934,11 +987,13 @@ def _insert_usage(
     tokens_out: int,
     cost_usd: float,
     request_count: int,
+    endpoint_name: str = "unknown",
     conn=None,
 ):
     now = datetime.now(UTC)
     values = dict(
             tenant_id=tenant_id,
+            endpoint_name=endpoint_name,
             period_hour=now.strftime("%Y%m%d%H"),
             period_day=now.strftime("%Y%m%d"),
             period_month=now.strftime("%Y%m"),
@@ -954,6 +1009,350 @@ def _insert_usage(
         own_conn.execute(insert(usage_counters).values(**values))
 
 
+# --- Plan quotas ---
+
+
+def upsert_plan(
+    plan_id: str,
+    *,
+    name: str | None = None,
+    daily_token_limit: int | None = None,
+    daily_usd_limit: float | None = None,
+    required_success_probability: float | None = None,
+    allowed_models: list[str] | None = None,
+) -> dict:
+    """Insert or update a plan quota definition."""
+    with begin() as conn:
+        existing = conn.execute(
+            select(plan_quotas).where(plan_quotas.c.plan_id == plan_id)
+        ).first()
+        values: dict[str, Any] = {}
+        if name is not None:
+            values["name"] = name
+        if daily_token_limit is not None:
+            values["daily_token_limit"] = daily_token_limit
+        if daily_usd_limit is not None:
+            values["daily_usd_limit"] = daily_usd_limit
+        if required_success_probability is not None:
+            values["required_success_probability"] = required_success_probability
+        if allowed_models is not None:
+            values["allowed_models_json"] = json.dumps(allowed_models)
+        if existing:
+            if values:
+                conn.execute(
+                    update(plan_quotas).where(plan_quotas.c.plan_id == plan_id).values(**values)
+                )
+        else:
+            insert_values = {
+                "plan_id": plan_id,
+                "name": name or plan_id,
+                "daily_token_limit": daily_token_limit or 0,
+                "daily_usd_limit": daily_usd_limit or 0.0,
+                "required_success_probability": required_success_probability or 0.99,
+                "allowed_models_json": json.dumps(allowed_models or []),
+            }
+            conn.execute(insert(plan_quotas).values(**insert_values))
+        row = conn.execute(
+            select(plan_quotas).where(plan_quotas.c.plan_id == plan_id)
+        ).first()
+    return _plan_row_dict(row)
+
+
+def get_plan(plan_id: str) -> dict | None:
+    with engine().connect() as conn:
+        row = conn.execute(
+            select(plan_quotas).where(plan_quotas.c.plan_id == plan_id)
+        ).first()
+    return _plan_row_dict(row) if row else None
+
+
+def list_plans() -> list[dict]:
+    with engine().connect() as conn:
+        rows = conn.execute(select(plan_quotas).order_by(plan_quotas.c.plan_id)).all()
+    return [_plan_row_dict(r) for r in rows]
+
+
+def _plan_row_dict(row) -> dict:
+    d = dict(row._mapping)
+    for k, v in d.items():
+        if isinstance(v, datetime):
+            d[k] = v.isoformat()
+    if d.get("allowed_models_json"):
+        try:
+            d["allowed_models"] = json.loads(d.pop("allowed_models_json"))
+        except (json.JSONDecodeError, TypeError):
+            d["allowed_models"] = []
+    else:
+        d.pop("allowed_models_json", None)
+        d["allowed_models"] = []
+    return d
+
+
+def assign_tenant_plan(tenant_id: str, plan_id: str, notes: str | None = None) -> dict:
+    """Bind a tenant to a plan. Creates the tenant if missing."""
+    with begin() as conn:
+        existing = conn.execute(
+            select(tenant_plans).where(tenant_plans.c.tenant_id == tenant_id)
+        ).first()
+        if existing:
+            conn.execute(
+                update(tenant_plans)
+                .where(tenant_plans.c.tenant_id == tenant_id)
+                .values(plan_id=plan_id, notes=notes)
+            )
+        else:
+            conn.execute(
+                insert(tenant_plans).values(
+                    tenant_id=tenant_id, plan_id=plan_id, notes=notes
+                )
+            )
+        # Ensure the user row exists so the plan_id can be persisted on it.
+        user_existing = conn.execute(
+            select(users.c.tenant_id).where(users.c.tenant_id == tenant_id)
+        ).first()
+        if user_existing:
+            conn.execute(
+                update(users)
+                .where(users.c.tenant_id == tenant_id)
+                .values(plan_id=plan_id)
+            )
+        else:
+            conn.execute(
+                _insert_ignore(users, tenant_id=tenant_id, plan_id=plan_id)
+            )
+        row = conn.execute(
+            select(tenant_plans).where(tenant_plans.c.tenant_id == tenant_id)
+        ).first()
+    d = dict(row._mapping) if row else {"tenant_id": tenant_id, "plan_id": plan_id}
+    for k, v in d.items():
+        if isinstance(v, datetime):
+            d[k] = v.isoformat()
+    return d
+
+
+def get_tenant_plan(tenant_id: str) -> dict | None:
+    with engine().connect() as conn:
+        row = conn.execute(
+            select(tenant_plans).where(tenant_plans.c.tenant_id == tenant_id)
+        ).first()
+    if not row:
+        return None
+    d = dict(row._mapping)
+    for k, v in d.items():
+        if isinstance(v, datetime):
+            d[k] = v.isoformat()
+    return d
+
+
+def get_tenant_plan_quota(tenant_id: str) -> dict | None:
+    """Combined tenant plan + plan_quota record. None if tenant has no plan."""
+    tp = get_tenant_plan(tenant_id)
+    if not tp:
+        return None
+    plan = get_plan(tp["plan_id"])
+    if not plan:
+        return None
+    return {"tenant_id": tenant_id, "plan_id": tp["plan_id"], **{k: v for k, v in plan.items() if k != "plan_id"}}
+
+
+# --- Per-model token limits ---
+
+
+def upsert_model_token_limit(
+    tenant_id: str,
+    endpoint_name: str,
+    *,
+    daily_token_limit: int | None = None,
+    daily_usd_limit: float | None = None,
+    max_request_tokens: int | None = None,
+) -> dict:
+    """Set or update per-model token limits for a tenant."""
+    today = datetime.now(UTC).strftime("%Y%m%d")
+    with begin() as conn:
+        existing = conn.execute(
+            select(model_token_limits).where(
+                (model_token_limits.c.tenant_id == tenant_id)
+                & (model_token_limits.c.endpoint_name == endpoint_name)
+            )
+        ).first()
+        values: dict[str, Any] = {"updated_at": datetime.now(UTC)}
+        if daily_token_limit is not None:
+            values["daily_token_limit"] = daily_token_limit
+        if daily_usd_limit is not None:
+            values["daily_usd_limit"] = daily_usd_limit
+        if max_request_tokens is not None:
+            values["max_request_tokens"] = max_request_tokens
+        if existing:
+            conn.execute(
+                update(model_token_limits)
+                .where(
+                    (model_token_limits.c.tenant_id == tenant_id)
+                    & (model_token_limits.c.endpoint_name == endpoint_name)
+                )
+                .values(**values)
+            )
+        else:
+            insert_values = {
+                "tenant_id": tenant_id,
+                "endpoint_name": endpoint_name,
+                "period_day": today,
+                "tokens_used": 0,
+                "cost_used_usd": 0.0,
+                "daily_token_limit": daily_token_limit or 0,
+                "daily_usd_limit": daily_usd_limit or 0.0,
+                "max_request_tokens": max_request_tokens or 0,
+            }
+            conn.execute(insert(model_token_limits).values(**insert_values))
+        row = conn.execute(
+            select(model_token_limits).where(
+                (model_token_limits.c.tenant_id == tenant_id)
+                & (model_token_limits.c.endpoint_name == endpoint_name)
+            )
+        ).first()
+    return _model_limit_row_dict(row) if row else {}
+
+
+def get_model_token_limit(tenant_id: str, endpoint_name: str) -> dict | None:
+    with engine().connect() as conn:
+        row = conn.execute(
+            select(model_token_limits).where(
+                (model_token_limits.c.tenant_id == tenant_id)
+                & (model_token_limits.c.endpoint_name == endpoint_name)
+            )
+        ).first()
+    return _model_limit_row_dict(row) if row else None
+
+
+def list_model_token_limits(tenant_id: str) -> list[dict]:
+    with engine().connect() as conn:
+        rows = conn.execute(
+            select(model_token_limits)
+            .where(model_token_limits.c.tenant_id == tenant_id)
+            .order_by(model_token_limits.c.endpoint_name)
+        ).all()
+    return [_model_limit_row_dict(r) for r in rows]
+
+
+def _model_limit_row_dict(row) -> dict:
+    d = dict(row._mapping)
+    for k, v in d.items():
+        if isinstance(v, datetime):
+            d[k] = v.isoformat()
+    return d
+
+
+def get_today_token_spend(tenant_id: str, endpoint_name: str | None = None) -> int:
+    """Sum tokens_in + tokens_out for tenant today, optionally filtered by endpoint."""
+    today = datetime.now(UTC).strftime("%Y%m%d")
+    with engine().connect() as conn:
+        q = (
+            select(func.coalesce(func.sum(usage_counters.c.tokens_in + usage_counters.c.tokens_out), 0))
+            .where(usage_counters.c.tenant_id == tenant_id)
+            .where(usage_counters.c.period_day == today)
+        )
+        if endpoint_name is not None:
+            q = q.where(usage_counters.c.endpoint_name == endpoint_name)
+        row = conn.execute(q).first()
+        return int(row[0]) if row else 0
+
+
+def get_today_cost_spend(tenant_id: str, endpoint_name: str | None = None) -> float:
+    """Sum cost_usd for tenant today, optionally filtered by endpoint."""
+    today = datetime.now(UTC).strftime("%Y%m%d")
+    with engine().connect() as conn:
+        q = (
+            select(func.coalesce(func.sum(usage_counters.c.cost_usd), 0.0))
+            .where(usage_counters.c.tenant_id == tenant_id)
+            .where(usage_counters.c.period_day == today)
+        )
+        if endpoint_name is not None:
+            q = q.where(usage_counters.c.endpoint_name == endpoint_name)
+        row = conn.execute(q).first()
+        return float(row[0]) if row else 0.0
+
+
+# --- Model quality profiles ---
+
+
+def record_quality_sample(
+    endpoint_name: str,
+    vertical: str,
+    complexity: int,
+    success: bool,
+):
+    """Record a single (success/failure) outcome for a model on a vertical/complexity bucket.
+
+    Quality profiles are used by the budget-aware router to estimate the success
+    probability of a model on a given request. New combinations start with a
+    conservative prior (no data) until enough samples accumulate.
+    """
+    complexity = max(1, min(5, int(complexity)))
+    cx_lo = complexity
+    cx_hi = complexity
+    with begin() as conn:
+        existing = conn.execute(
+            select(model_quality_profiles).where(
+                (model_quality_profiles.c.endpoint_name == endpoint_name)
+                & (model_quality_profiles.c.vertical == vertical)
+                & (model_quality_profiles.c.complexity_min == cx_lo)
+                & (model_quality_profiles.c.complexity_max == cx_hi)
+            )
+        ).first()
+        if existing:
+            conn.execute(
+                update(model_quality_profiles)
+                .where(
+                    (model_quality_profiles.c.endpoint_name == endpoint_name)
+                    & (model_quality_profiles.c.vertical == vertical)
+                    & (model_quality_profiles.c.complexity_min == cx_lo)
+                    & (model_quality_profiles.c.complexity_max == cx_hi)
+                )
+                .values(
+                    success_count=model_quality_profiles.c.success_count + (1 if success else 0),
+                    total_count=model_quality_profiles.c.total_count + 1,
+                    calibration_samples=model_quality_profiles.c.calibration_samples + 1,
+                    last_updated=datetime.now(UTC),
+                )
+            )
+        else:
+            conn.execute(
+                insert(model_quality_profiles).values(
+                    endpoint_name=endpoint_name,
+                    vertical=vertical,
+                    complexity_min=cx_lo,
+                    complexity_max=cx_hi,
+                    success_count=1 if success else 0,
+                    total_count=1,
+                    calibration_samples=1,
+                )
+            )
+
+
+def get_quality_profile(
+    endpoint_name: str,
+    vertical: str,
+    complexity: int,
+) -> dict | None:
+    """Return {success_count, total_count, calibration_samples} for a model/vertical/complexity bucket."""
+    complexity = max(1, min(5, int(complexity)))
+    with engine().connect() as conn:
+        row = conn.execute(
+            select(model_quality_profiles).where(
+                (model_quality_profiles.c.endpoint_name == endpoint_name)
+                & (model_quality_profiles.c.vertical == vertical)
+                & (model_quality_profiles.c.complexity_min <= complexity)
+                & (model_quality_profiles.c.complexity_max >= complexity)
+            )
+        ).first()
+    if not row:
+        return None
+    d = dict(row._mapping)
+    for k, v in d.items():
+        if isinstance(v, datetime):
+            d[k] = v.isoformat()
+    return d
+
+
 def reserve_usage(
     tenant_id: str,
     *,
@@ -963,27 +1362,85 @@ def reserve_usage(
     estimated_tokens_in: int,
     estimated_tokens_out: int,
     estimated_cost_usd: float,
+    daily_token_limit: int = 0,
+    endpoint_name: str = "unknown",
+    model_token_limit: int = 0,
+    model_usd_limit: float = 0.0,
+    max_request_tokens: int = 0,
 ) -> tuple[bool, str | None]:
-    """Atomically check quotas and reserve estimated usage for one request."""
+    """Atomically check quotas and reserve estimated usage for one request.
+
+    Quotas (in order, all optional / 0 = unlimited):
+      - daily_token_limit: tenant-wide daily token cap
+      - budget_limit_usd: tenant-wide daily USD cap
+      - model_token_limit: per-model daily token cap for this endpoint
+      - model_usd_limit: per-model daily USD cap for this endpoint
+      - max_request_tokens: per-request token cap (input + estimated output)
+      - rps_limit: tenant-wide requests/sec
+      - token_limit_per_minute: tenant-wide tokens/minute
+    """
     from datetime import timedelta
 
     now = datetime.now(UTC)
+    today = now.strftime("%Y%m%d")
+    estimated_tokens = max(0, estimated_tokens_in) + max(0, estimated_tokens_out)
+
+    if max_request_tokens > 0 and estimated_tokens > max_request_tokens:
+        return False, f"max_request_tokens {max_request_tokens} exceeded (estimated {estimated_tokens})"
+
     with begin() as conn:
         user_q = select(users.c.tenant_id).where(users.c.tenant_id == tenant_id)
         if engine().dialect.name != "sqlite":
             user_q = user_q.with_for_update()
         conn.execute(user_q).first()
 
+        if daily_token_limit > 0:
+            tenant_tokens_today = conn.execute(
+                select(func.coalesce(func.sum(usage_counters.c.tokens_in + usage_counters.c.tokens_out), 0))
+                .where(usage_counters.c.tenant_id == tenant_id)
+                .where(usage_counters.c.period_day == today)
+            ).scalar_one()
+            if int(tenant_tokens_today) + estimated_tokens > daily_token_limit:
+                return False, (
+                    f"daily token limit {daily_token_limit} exceeded "
+                    f"(spent {int(tenant_tokens_today)} tokens)"
+                )
+
         if budget_limit_usd > 0:
             spent = conn.execute(
                 select(func.coalesce(func.sum(usage_counters.c.cost_usd), 0.0))
                 .where(usage_counters.c.tenant_id == tenant_id)
-                .where(usage_counters.c.period_day == now.strftime("%Y%m%d"))
+                .where(usage_counters.c.period_day == today)
             ).scalar_one()
             if float(spent) + estimated_cost_usd > budget_limit_usd:
                 return False, f"daily budget ${budget_limit_usd:.2f} exceeded (spent ${float(spent):.2f})"
 
-        estimated_tokens = max(0, estimated_tokens_in) + max(0, estimated_tokens_out)
+        if model_token_limit > 0:
+            model_tokens_today = conn.execute(
+                select(func.coalesce(func.sum(usage_counters.c.tokens_in + usage_counters.c.tokens_out), 0))
+                .where(usage_counters.c.tenant_id == tenant_id)
+                .where(usage_counters.c.endpoint_name == endpoint_name)
+                .where(usage_counters.c.period_day == today)
+            ).scalar_one()
+            if int(model_tokens_today) + estimated_tokens > model_token_limit:
+                return False, (
+                    f"model {endpoint_name} daily token limit {model_token_limit} exceeded "
+                    f"(spent {int(model_tokens_today)} tokens)"
+                )
+
+        if model_usd_limit > 0:
+            model_cost_today = conn.execute(
+                select(func.coalesce(func.sum(usage_counters.c.cost_usd), 0.0))
+                .where(usage_counters.c.tenant_id == tenant_id)
+                .where(usage_counters.c.endpoint_name == endpoint_name)
+                .where(usage_counters.c.period_day == today)
+            ).scalar_one()
+            if float(model_cost_today) + estimated_cost_usd > model_usd_limit:
+                return False, (
+                    f"model {endpoint_name} daily USD limit ${model_usd_limit:.2f} exceeded "
+                    f"(spent ${float(model_cost_today):.2f})"
+                )
+
         if rps_limit > 0:
             request_count = conn.execute(
                 select(func.coalesce(func.sum(usage_counters.c.request_count), 0))
@@ -1007,6 +1464,7 @@ def reserve_usage(
             max(0, estimated_tokens_out),
             max(0.0, estimated_cost_usd),
             request_count=1,
+            endpoint_name=endpoint_name,
             conn=conn,
         )
     return True, None
@@ -1022,6 +1480,7 @@ def settle_reserved_usage(
     actual_tokens_out: int,
     actual_cost_usd: float,
     completed: bool,
+    endpoint_name: str = "unknown",
 ):
     """Settle a reservation; failed requests release all reserved usage."""
     if completed:
@@ -1040,6 +1499,7 @@ def settle_reserved_usage(
         token_out_delta,
         cost_delta,
         request_count=request_count,
+        endpoint_name=endpoint_name,
     )
 
 

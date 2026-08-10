@@ -181,6 +181,22 @@ async def init_app(conf_path: str = "./gateway-config.json") -> web.Application:
     app.router.add_get("/admin/users/{tenant_id}/budget", get_user_budget)
     app.router.add_post("/admin/users/{tenant_id}/budget", set_user_budget)
     app.router.add_get("/admin/users/{tenant_id}/stats", get_user_stats)
+    # Subscription plans + per-model token limits
+    app.router.add_get("/admin/plans", admin_list_plans)
+    app.router.add_post("/admin/plans", admin_create_plan)
+    app.router.add_put("/admin/plans/{plan_id}", admin_update_plan)
+    app.router.add_post("/admin/users/{tenant_id}/subscription", admin_assign_plan)
+    app.router.add_delete("/admin/users/{tenant_id}/subscription", admin_unassign_plan)
+    app.router.add_get("/admin/users/{tenant_id}/subscription", admin_get_plan)
+    app.router.add_put("/admin/users/{tenant_id}/budget/tokens", admin_set_daily_token_budget)
+    app.router.add_get("/admin/users/{tenant_id}/models/{endpoint}/limits", admin_get_model_limits)
+    app.router.add_put("/admin/users/{tenant_id}/models/{endpoint}/limits", admin_set_model_limits)
+    app.router.add_get("/admin/users/{tenant_id}/limits", admin_get_all_limits)
+    app.router.add_get("/admin/models/quality", admin_list_quality_profiles)
+    app.router.add_post("/admin/models/quality", admin_record_quality_sample)
+    # User-facing (read-only) limits
+    app.router.add_get("/usage", get_my_usage)
+    app.router.add_get("/usage/limits", get_my_limits)
     app.router.add_get("/admin/flags", list_flags)
     app.router.add_get("/admin/provider-presets", get_provider_presets)
     # Provider/Key/Tier CRUD
@@ -469,6 +485,11 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                 )
 
             # Record the user's message in memory domain (for OM to compress later)
+            recall_enabled = (
+                memory_enabled
+                and int(conf.policy.get("memory", {}).get("semantic_recall_top_k", 0)) > 0
+                and not rt.is_stub()
+            )
             if memory_enabled:
                 try:
                     await asyncio.to_thread(
@@ -478,6 +499,7 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                         role="user",
                         content=text,
                         token_estimate=len(text) // 4,
+                        embed=recall_enabled,
                     )
                 except Exception as e:
                     log.warning("record user message failed: %s", e)
@@ -501,6 +523,7 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                 complexity=r.complexity,
                 vertical=r.vertical,
                 vertical_top2=r.vertical_top2,
+                projection=r.projection,
                 ood=ood,
                 model_version=r.model_version,
                 policy_version=conf.version,
@@ -569,7 +592,50 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
             else:
                 # Cost-first gate
                 endpoint_loads = request.app["endpoint_pool"].all_inflight()
-                decision = policy_mod.cost_first_route(ctx, conf, breaker_states, endpoint_loads)
+                # Use budget-aware routing when the tenant has a plan, a daily
+                # token budget, or any per-model token limits — otherwise the
+                # simpler cost-first picker is sufficient.
+                routing_cfg = conf.config.get("routing", {})
+                use_budget_aware = bool(
+                    routing_cfg.get("budget_aware", {}).get("enabled", True)
+                )
+                plan_quota = None
+                if use_budget_aware:
+                    plan_quota = (
+                        await asyncio.to_thread(memory.get_tenant_plan_quota, tenant_id)
+                    )
+                    tenant_st = tenant_mgr.get_or_create(tenant_id)
+                    has_token_limit = tenant_st.daily_token_limit > 0
+                    has_model_limits = bool(
+                        await asyncio.to_thread(
+                            memory.list_model_token_limits, tenant_id,
+                        )
+                    )
+                    if not (plan_quota or has_token_limit or has_model_limits):
+                        # Plain cost-first when there's no budget to enforce
+                        use_budget_aware = False
+                if use_budget_aware:
+                    try:
+                        budget_routed = policy_mod.budget_aware_route(
+                            ctx,
+                            conf,
+                            breaker_states,
+                            endpoint_loads,
+                            tenant_mgr=tenant_mgr,
+                            tenant_id=tenant_id,
+                            plan_quota=plan_quota,
+                        )
+                        decision = budget_routed.decision
+                    except policy_mod.BudgetError as e:
+                        # decision_id is not yet logged; return the error directly
+                        return _openai_error(
+                            e.code,
+                            e.message,
+                            429,
+                            error_type="insufficient_quota",
+                        )
+                else:
+                    decision = policy_mod.cost_first_route(ctx, conf, breaker_states, endpoint_loads)
 
                 # Observational memory: redirect to a higher tier if compacted context overflows
                 redirect, target_tier, reason = om.should_redirect_for_compaction(
@@ -655,6 +721,7 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                         estimated_tokens_in=ctx.estimated_input_tokens,
                         estimated_tokens_out=ctx.estimated_output_tokens,
                         estimated_cost_usd=decision.cost_usd,
+                        endpoint_name="swarm",
                     )
                 except tenant.BudgetExceeded as e:
                     return _openai_error("insufficient_quota", str(e), 429, error_type="insufficient_quota")
@@ -663,7 +730,9 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                         "tokens_per_minute_exceeded", "Token rate limit exceeded.", 429,
                         error_type="rate_limit_error", headers={"Retry-After": str(max(1, int(e.retry_after_seconds)))},
                     )
-                subtasks = swarm_mod.decompose(ctx, conf, conf.policy.get("swarm", {}))
+                subtasks = await swarm_mod.decompose(
+                    ctx, conf, conf.policy.get("swarm", {}), request.app["endpoint_pool"],
+                )
                 try:
                     swarm_result = await swarm_mod.execute_swarm(
                         ctx,
@@ -684,6 +753,7 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                         actual_tokens_out=0,
                         actual_cost_usd=0.0,
                         completed=False,
+                        endpoint_name="swarm",
                     )
                     raise
                 decision.tier = "swarm"
@@ -804,6 +874,7 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                             content=swarm_result.synthesis,
                             token_estimate=len(swarm_result.synthesis) // 4,
                             metadata={"tier": "swarm", "subtasks": swarm_result.subtask_count},
+                            embed=recall_enabled,
                         )
                 except Exception:
                     pass
@@ -821,6 +892,7 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                     actual_tokens_out=ctx.estimated_output_tokens,
                     actual_cost_usd=swarm_result.total_cost_usd,
                     completed=True,
+                    endpoint_name="swarm",
                 )
                 if memory_enabled:
                     _maybe_force_observe(request.app, tenant_id, session_id)
@@ -857,6 +929,13 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
             stream = bool(body.get("stream", False))
 
         # Atomically reserve estimated budget + tokens before dispatch.
+            # Pull per-model token limits for the chosen endpoint (if configured).
+            model_limit = await asyncio.to_thread(
+                memory.get_model_token_limit, tenant_id, decision.endpoint,
+            )
+            model_token_limit = int(model_limit.get("daily_token_limit", 0)) if model_limit else 0
+            model_usd_limit = float(model_limit.get("daily_usd_limit", 0)) if model_limit else 0.0
+            max_request_tokens = int(model_limit.get("max_request_tokens", 0)) if model_limit else 0
             try:
                 await asyncio.to_thread(
                     tenant_mgr.reserve_usage,
@@ -864,6 +943,10 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                     estimated_tokens_in=ctx.estimated_input_tokens,
                     estimated_tokens_out=ctx.estimated_output_tokens,
                     estimated_cost_usd=decision.cost_usd,
+                    endpoint_name=decision.endpoint,
+                    model_token_limit=model_token_limit,
+                    model_usd_limit=model_usd_limit,
+                    max_request_tokens=max_request_tokens,
                 )
             except tenant.BudgetExceeded as e:
                 await asyncio.to_thread(_finalize_decision, decision_id, 0.0, False, str(e))
@@ -911,6 +994,7 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                         actual_tokens_out=0,
                         actual_cost_usd=0.0,
                         completed=False,
+                        endpoint_name=decision.endpoint,
                     )
                     status = e.status if isinstance(e, endpoints.EndpointHTTPError) and 400 <= e.status < 500 else 502
                     return _openai_error(
@@ -963,6 +1047,7 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                     actual_tokens_out=ctx.estimated_output_tokens if response_ok else 0,
                     actual_cost_usd=decision.cost_usd if response_ok else 0.0,
                     completed=response_ok,
+                    endpoint_name=decision.endpoint,
                 )
                 await asyncio.to_thread(
                     memory.update_session,
@@ -980,6 +1065,7 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                             content=collected_text,
                             token_estimate=len(collected_text) // 4,
                             metadata={"tier": decision.tier, "model_version": r.model_version, "streamed": True},
+                            embed=recall_enabled,
                         )
                     except Exception:
                         pass
@@ -1018,6 +1104,7 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                         actual_tokens_out=0,
                         actual_cost_usd=0.0,
                         completed=False,
+                        endpoint_name=decision.endpoint,
                     )
                     return _openai_error(
                         "upstream_failed", "All eligible upstream providers failed.", 502,
@@ -1055,6 +1142,7 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                                 content=assistant_text,
                                 token_estimate=len(assistant_text) // 4,
                                 metadata={"tier": actual_tier, "model_version": r.model_version, "attempts": attempts},
+                                embed=recall_enabled,
                             )
                     except Exception as e:
                         log.warning("record assistant message failed: %s", e)
@@ -1074,6 +1162,7 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                     actual_tokens_out=int(usage.get("completion_tokens", 0)),
                     actual_cost_usd=actual_cost,
                     completed=True,
+                    endpoint_name=actual_endpoint,
                 )
                 if memory_enabled:
                     _maybe_force_observe(request.app, tenant_id, session_id)
@@ -1616,7 +1705,17 @@ async def create_user(request: web.Request):
 async def get_user_budget(request: web.Request):
     tenant_id = request.match_info["tenant_id"]
     spent = memory.get_today_spend(tenant_id)
-    return web.json_response({"tenant_id": tenant_id, "spent_today_usd": spent})
+    tokens_today = memory.get_today_token_spend(tenant_id)
+    tenant_st = request.app["tenant_mgr"].get_or_create(tenant_id)
+    return web.json_response({
+        "tenant_id": tenant_id,
+        "spent_today_usd": spent,
+        "tokens_today": tokens_today,
+        "daily_usd_limit": tenant_st.budget_usd_per_day,
+        "daily_token_limit": tenant_st.daily_token_limit,
+        "remaining_tokens_today": request.app["tenant_mgr"].remaining_tokens_today(tenant_id),
+        "target_success_probability": tenant_st.target_success_probability,
+    })
 
 
 async def set_user_budget(request: web.Request):
@@ -1625,9 +1724,19 @@ async def set_user_budget(request: web.Request):
     defaults = {"budget_usd_per_day": body.get("budget_usd_per_day", 1.0)}
     if "tier_access" in body:
         defaults["tier_access"] = body["tier_access"]
+    if "daily_token_limit" in body:
+        defaults["daily_token_limit"] = int(body["daily_token_limit"])
+    if "target_success_probability" in body:
+        defaults["target_success_probability"] = float(body["target_success_probability"])
+    if "tokens_per_min" in body:
+        defaults["tokens_per_min"] = int(body["tokens_per_min"])
+    if "rps_limit" in body:
+        defaults["rps_limit"] = int(body["rps_limit"])
+    if "concurrent_limit" in body:
+        defaults["concurrent_limit"] = int(body["concurrent_limit"])
     memory.get_or_create_user(tenant_id, defaults=defaults, overwrite=True)
     request.app["tenant_mgr"].refresh(tenant_id)
-    return web.json_response({"updated": True})
+    return web.json_response({"updated": True, "tenant_id": tenant_id})
 
 
 async def get_user_stats(request: web.Request):
@@ -1639,6 +1748,218 @@ async def get_user_stats(request: web.Request):
         "decision_count": len(decisions),
         "tier_distribution": dict(Counter(d["tier"] for d in decisions)),
         "spent_today_usd": memory.get_today_spend(tenant_id),
+    })
+
+
+# ---- Subscription plans + per-model token limits (admin) ----
+
+
+async def admin_list_plans(request: web.Request):
+    return web.json_response({"plans": await asyncio.to_thread(memory.list_plans)})
+
+
+async def admin_create_plan(request: web.Request):
+    body = await request.json()
+    plan_id = body.get("plan_id")
+    if not plan_id:
+        raise web.HTTPBadRequest(reason="plan_id required")
+    plan = await asyncio.to_thread(
+        memory.upsert_plan,
+        plan_id,
+        name=body.get("name"),
+        daily_token_limit=body.get("daily_token_limit"),
+        daily_usd_limit=body.get("daily_usd_limit"),
+        required_success_probability=body.get("required_success_probability"),
+        allowed_models=body.get("allowed_models"),
+    )
+    return web.json_response(plan, status=201)
+
+
+async def admin_update_plan(request: web.Request):
+    plan_id = request.match_info["plan_id"]
+    body = await request.json()
+    plan = await asyncio.to_thread(
+        memory.upsert_plan,
+        plan_id,
+        name=body.get("name"),
+        daily_token_limit=body.get("daily_token_limit"),
+        daily_usd_limit=body.get("daily_usd_limit"),
+        required_success_probability=body.get("required_success_probability"),
+        allowed_models=body.get("allowed_models"),
+    )
+    return web.json_response(plan)
+
+
+async def admin_assign_plan(request: web.Request):
+    tenant_id = request.match_info["tenant_id"]
+    body = await request.json()
+    plan_id = body.get("plan_id")
+    if not plan_id:
+        raise web.HTTPBadRequest(reason="plan_id required")
+    plan = await asyncio.to_thread(memory.get_plan, plan_id)
+    if not plan:
+        raise web.HTTPNotFound(reason=f"plan {plan_id} not found")
+    binding = await asyncio.to_thread(
+        memory.assign_tenant_plan, tenant_id, plan_id, notes=body.get("notes"),
+    )
+    request.app["tenant_mgr"].refresh(tenant_id)
+    return web.json_response(binding)
+
+
+async def admin_unassign_plan(request: web.Request):
+    tenant_id = request.match_info["tenant_id"]
+    # Unbinding = removing the plan_id reference on the user row.
+    await asyncio.to_thread(
+        memory.get_or_create_user,
+        tenant_id,
+        defaults={"plan_id": None},
+        overwrite=True,
+    )
+    request.app["tenant_mgr"].refresh(tenant_id)
+    return web.json_response({"updated": True, "tenant_id": tenant_id})
+
+
+async def admin_get_plan(request: web.Request):
+    tenant_id = request.match_info["tenant_id"]
+    binding = await asyncio.to_thread(memory.get_tenant_plan, tenant_id)
+    if not binding:
+        return web.json_response({"tenant_id": tenant_id, "plan_id": None})
+    quota = await asyncio.to_thread(memory.get_tenant_plan_quota, tenant_id)
+    return web.json_response({"binding": binding, "quota": quota})
+
+
+async def admin_set_daily_token_budget(request: web.Request):
+    tenant_id = request.match_info["tenant_id"]
+    body = await request.json()
+    daily_token_limit = int(body.get("daily_token_limit", 0))
+    target_success_probability = body.get("target_success_probability")
+    defaults: dict = {"daily_token_limit": daily_token_limit}
+    if target_success_probability is not None:
+        defaults["target_success_probability"] = float(target_success_probability)
+    await asyncio.to_thread(
+        memory.get_or_create_user, tenant_id, defaults=defaults, overwrite=True,
+    )
+    request.app["tenant_mgr"].refresh(tenant_id)
+    return web.json_response(
+        {"tenant_id": tenant_id, "daily_token_limit": daily_token_limit,
+         "target_success_probability": target_success_probability}
+    )
+
+
+async def admin_get_model_limits(request: web.Request):
+    tenant_id = request.match_info["tenant_id"]
+    endpoint = request.match_info["endpoint"]
+    ml = await asyncio.to_thread(memory.get_model_token_limit, tenant_id, endpoint)
+    if not ml:
+        return web.json_response({"tenant_id": tenant_id, "endpoint": endpoint,
+                                  "daily_token_limit": 0, "max_request_tokens": 0,
+                                  "daily_usd_limit": 0.0})
+    return web.json_response(ml)
+
+
+async def admin_set_model_limits(request: web.Request):
+    tenant_id = request.match_info["tenant_id"]
+    endpoint = request.match_info["endpoint"]
+    body = await request.json()
+    ml = await asyncio.to_thread(
+        memory.upsert_model_token_limit,
+        tenant_id,
+        endpoint,
+        daily_token_limit=body.get("daily_token_limit"),
+        daily_usd_limit=body.get("daily_usd_limit"),
+        max_request_tokens=body.get("max_request_tokens"),
+    )
+    return web.json_response(ml)
+
+
+async def admin_get_all_limits(request: web.Request):
+    tenant_id = request.match_info["tenant_id"]
+    tenant_st = request.app["tenant_mgr"].get_or_create(tenant_id)
+    plan_quota = await asyncio.to_thread(memory.get_tenant_plan_quota, tenant_id)
+    model_limits = await asyncio.to_thread(memory.list_model_token_limits, tenant_id)
+    return web.json_response({
+        "tenant_id": tenant_id,
+        "daily_token_limit": tenant_st.daily_token_limit,
+        "daily_usd_limit": tenant_st.budget_usd_per_day,
+        "rps_limit": tenant_st.rps_limit,
+        "concurrent_limit": tenant_st.concurrent_limit,
+        "tokens_per_min": tenant_st.tokens_per_min,
+        "target_success_probability": tenant_st.target_success_probability,
+        "plan_id": tenant_st.plan_id,
+        "plan_quota": plan_quota,
+        "model_limits": model_limits,
+        "remaining_tokens_today": request.app["tenant_mgr"].remaining_tokens_today(tenant_id),
+    })
+
+
+async def admin_list_quality_profiles(request: web.Request):
+    from sqlalchemy import select
+
+    with memory.engine().connect() as conn:
+        rows = conn.execute(
+            select(memory.model_quality_profiles)
+            .order_by(
+                memory.model_quality_profiles.c.endpoint_name,
+                memory.model_quality_profiles.c.vertical,
+                memory.model_quality_profiles.c.complexity_min,
+            )
+        ).all()
+    return web.json_response({
+        "profiles": [
+            {
+                **dict(r._mapping),
+                "success_rate": (
+                    int(r.success_count) / int(r.total_count)
+                    if int(r.total_count) > 0
+                    else 0.0
+                ),
+            }
+            for r in rows
+        ]
+    })
+
+
+async def admin_record_quality_sample(request: web.Request):
+    body = await request.json()
+    endpoint_name = body.get("endpoint_name")
+    vertical = body.get("vertical")
+    complexity = int(body.get("complexity", 1))
+    success = bool(body.get("success", False))
+    if not endpoint_name or not vertical:
+        raise web.HTTPBadRequest(reason="endpoint_name and vertical required")
+    await asyncio.to_thread(
+        memory.record_quality_sample, endpoint_name, vertical, complexity, success,
+    )
+    return web.json_response({"recorded": True})
+
+
+# ---- User-facing usage + limits ----
+
+
+async def get_my_usage(request: web.Request):
+    tenant_id = request.get("tenant_id") or "anonymous"
+    spent = memory.get_today_spend(tenant_id)
+    tokens_today = memory.get_today_token_spend(tenant_id)
+    return web.json_response({
+        "tenant_id": tenant_id,
+        "spent_today_usd": spent,
+        "tokens_today": tokens_today,
+    })
+
+
+async def get_my_limits(request: web.Request):
+    tenant_id = request.get("tenant_id") or "anonymous"
+    tenant_st = request.app["tenant_mgr"].get_or_create(tenant_id)
+    remaining = request.app["tenant_mgr"].remaining_tokens_today(tenant_id)
+    return web.json_response({
+        "tenant_id": tenant_id,
+        "daily_token_limit": tenant_st.daily_token_limit,
+        "daily_usd_limit": tenant_st.budget_usd_per_day,
+        "rps_limit": tenant_st.rps_limit,
+        "concurrent_limit": tenant_st.concurrent_limit,
+        "tokens_per_min": tenant_st.tokens_per_min,
+        "target_success_probability": tenant_st.target_success_probability,
+        "remaining_tokens_today": remaining,
     })
 
 

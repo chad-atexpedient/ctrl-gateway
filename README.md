@@ -62,6 +62,11 @@ request ──→ parse (vision? tools? stream?)
          │   ├─ escalate: OOD | low-conf | top-2 close | cost within margin
          │   ├─ tie-break: speed + health + load
          │   └─ ladder: context overflow ↑, breaker open ↓, error → fallback
+         ├─ budget-aware routing (when tenant has a plan or any token/model limit)
+         │   ├─ capability × per-model quality profile (Wilson lower bound)
+         │   ├─ remaining tenant/model token budget ≤ estimated tokens?
+         │   ├─ cascade chain ≥ target_success_probability (default 0.99)
+         │   └─ 99th-percentile cost to complete (geometric retry)
          ├─ transcode (per-endkind adapter: llamacpp / openai / ollama)
          └─ forward + stream (SSE passthrough)
                 ↓
@@ -69,10 +74,95 @@ request ──→ parse (vision? tools? stream?)
                 ↓
         async reviewer queue (post-response, batches of 10)
                 ↓
-        per-field agreement scoring → curated pool
+        per-model quality sample recorded (success/failure)
+                ↓
+        cascade P(success) updates → future routing decisions
                 ↓
         threshold met → auto-retrain heads → eval gate → atomic swap
 ```
+
+## Subscription budgets, per-model limits, and budget-aware routing
+
+Tenants can be assigned a **subscription plan** that bundles a daily token budget, a daily USD budget, a target success probability (default 99%), and a whitelist of allowed models. Additionally, admins can set per-model limits (daily tokens, daily USD, max-request-tokens) on top of any plan.
+
+### How the router uses these signals
+
+When a tenant has a plan, a daily token budget, or any per-model limit, the simple cost-first picker is replaced by `policy.budget_aware_route`. That routine:
+
+1. Builds candidate models as usual (capability-fit × cost), filtering out anything that can't fit in the remaining tenant/model token budget or isn't on the plan's allowed-models list.
+2. Estimates each candidate's P(success) from a per-model quality profile — Wilson lower bound (95% confidence) of observed success rate, capped to a conservative prior (0.5) until the model has ≥ 10 samples.
+3. Walks the eligible candidates in ascending-cost order, building a **cascade chain** until the union P("at least one succeeds") ≥ target_success_probability.
+4. Surfaces the 99th-percentile cost-to-complete (geometric retry model) in `routing_log.extra` for auditability.
+5. If no chain reaches the target, returns HTTP 429 `quality_target_unmet` — never silently routes to an inadequate model.
+
+### Admin endpoints
+
+```bash
+# Plans
+POST   /admin/plans                                   # create a plan
+PUT    /admin/plans/{plan_id}                         # update a plan
+GET    /admin/plans                                   # list plans
+
+# Per-tenant subscription
+POST   /admin/users/{tenant_id}/subscription         # assign a plan (body: plan_id)
+DELETE /admin/users/{tenant_id}/subscription         # unbind
+GET    /admin/users/{tenant_id}/subscription         # read binding + quota
+
+# Per-tenant daily token budget + target success probability
+PUT    /admin/users/{tenant_id}/budget/tokens
+       # body: {"daily_token_limit": 100000, "target_success_probability": 0.99}
+
+# Per-model limits
+PUT    /admin/users/{tenant_id}/models/{endpoint}/limits
+       # body: {"daily_token_limit": 50000, "daily_usd_limit": 5.0, "max_request_tokens": 4096}
+GET    /admin/users/{tenant_id}/models/{endpoint}/limits
+GET    /admin/users/{tenant_id}/limits                # all limits at once
+
+# Quality samples (recorded by the reviewer)
+GET    /admin/models/quality
+POST   /admin/models/quality
+       # body: {"endpoint_name": "tier1", "vertical": "programming", "complexity": 3, "success": true}
+```
+
+### User-facing endpoints
+
+```bash
+GET /usage          # today's spend + tokens
+GET /usage/limits    # the tenant's daily limits + remaining tokens
+```
+
+### Plan JSON example
+
+```json
+{
+  "plans": {
+    "free": {
+      "daily_token_limit": 100000,
+      "daily_usd_limit": 1.0,
+      "required_success_probability": 0.99,
+      "allowed_models": ["ollama_local"]
+    },
+    "pro": {
+      "daily_token_limit": 1000000,
+      "daily_usd_limit": 25.0,
+      "required_success_probability": 0.99,
+      "allowed_models": ["tier1_model", "tier2_model", "frontier"],
+      "model_limits": {
+        "frontier": {
+          "daily_token_limit": 250000,
+          "daily_usd_limit": 20.0,
+          "max_request_tokens": 128000
+        }
+      }
+    }
+  }
+}
+```
+
+### Closed-loop quality calibration
+
+`quality.record_quality_sample(endpoint, vertical, complexity, success)` is called by the reviewer worker after every labelled decision. Once a model accumulates ≥ 10 samples on a `(vertical, complexity)` bucket, its Wilson lower bound replaces the prior of 0.5. Over time, the cascade chain naturally shortens to the cheapest-fit model whose profile still meets the tenant's target.
+
 
 ## Observational memory (Mastra pattern)
 

@@ -4,10 +4,14 @@ Per-user:
   - Token bucket for RPS (in-memory + persistent counter for persistence across restarts)
   - Concurrent request semaphore
   - Daily USD budget (persisted in usage_counters)
+  - Daily token budget (per subscription, persisted in usage_counters)
+  - Per-model token and USD limits (persisted in model_token_limits)
   - Tokens-per-minute cap
+  - Target success probability (used by budget-aware routing)
 
 Tenant config is loaded from gateway-config.json -> tenants; users are
-created lazily via memory.get_or_create_user on first request.
+created lazily via memory.get_or_create_user on first request. Tenant plans
+(plan_quotas) further override budgets and constrain allowed_models.
 """
 from __future__ import annotations
 
@@ -15,7 +19,7 @@ import asyncio
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import memory
 
@@ -72,9 +76,12 @@ class TenantState:
     rps_limit: int
     concurrent_limit: int
     tokens_per_min: int
-    bucket: _TokenBucket
-    semaphore: asyncio.Semaphore
-    user_lock: threading.Lock
+    daily_token_limit: int = 0
+    target_success_probability: float = 0.99
+    plan_id: str | None = None
+    bucket: _TokenBucket = field(default_factory=lambda: _TokenBucket(rate_per_sec=100, capacity=200))
+    semaphore: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(20))
+    user_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class TenantManager:
@@ -92,18 +99,23 @@ class TenantManager:
             tier_access = json.loads(tier_access) if tier_access else []
         elif not tier_access:
             tier_access = self._default.get("tier_access", [])
+        rps = int(cfg.get("rps_limit") or self._default.get("rps_limit", 100))
+        conc = int(cfg.get("concurrent_limit") or self._default.get("concurrent_limit", 20))
         return TenantState(
             tenant_id=tenant_id,
             tier_access=tier_access,
             budget_usd_per_day=float(cfg.get("budget_usd_per_day") or self._default.get("budget_usd_per_day", 1.0)),
-            rps_limit=int(cfg.get("rps_limit") or self._default.get("rps_limit", 100)),
-            concurrent_limit=int(cfg.get("concurrent_limit") or self._default.get("concurrent_limit", 20)),
+            rps_limit=rps,
+            concurrent_limit=conc,
             tokens_per_min=int(cfg.get("tokens_per_min") or self._default.get("tokens_per_min", 200000)),
-            bucket=_TokenBucket(
-                rate_per_sec=int(cfg.get("rps_limit") or self._default.get("rps_limit", 100)),
-                capacity=int(cfg.get("rps_limit") or self._default.get("rps_limit", 100)) * 2,
+            daily_token_limit=int(cfg.get("daily_token_limit") or self._default.get("daily_token_limit", 0)),
+            target_success_probability=float(
+                cfg.get("target_success_probability")
+                or self._default.get("target_success_probability", 0.99)
             ),
-            semaphore=asyncio.Semaphore(int(cfg.get("concurrent_limit") or self._default.get("concurrent_limit", 20))),
+            plan_id=cfg.get("plan_id"),
+            bucket=_TokenBucket(rate_per_sec=rps, capacity=rps * 2),
+            semaphore=asyncio.Semaphore(conc),
             user_lock=threading.Lock(),
         )
 
@@ -119,14 +131,32 @@ class TenantManager:
             st = self._states.get(tenant_id)
             if st:
                 return st
-            # Precedence: config-file override > DB row > defaults
+            # Precedence: config-file override > DB row > plan quota > defaults
             if tenant_id in self._preconfigured:
                 merged = {**self._default, **self._preconfigured[tenant_id]}
                 st = self._build_state(tenant_id, merged)
             else:
                 db_cfg = memory.get_or_create_user(tenant_id, defaults=self._default)
-                keys = ("tier_access", "budget_usd_per_day", "rps_limit", "concurrent_limit", "tokens_per_min")
-                merged = {**self._default, **{k: v for k, v in db_cfg.items() if k in keys and v is not None}}
+                db_keys = (
+                    "tier_access",
+                    "budget_usd_per_day",
+                    "rps_limit",
+                    "concurrent_limit",
+                    "tokens_per_min",
+                    "daily_token_limit",
+                    "target_success_probability",
+                    "plan_id",
+                )
+                merged = {**self._default, **{k: v for k, v in db_cfg.items() if k in db_keys and v is not None}}
+                # Plan-level quota overrides (if tenant assigned to a plan)
+                plan_quota = memory.get_tenant_plan_quota(tenant_id)
+                if plan_quota:
+                    if plan_quota.get("daily_token_limit", 0):
+                        merged["daily_token_limit"] = plan_quota["daily_token_limit"]
+                    if plan_quota.get("daily_usd_limit", 0):
+                        merged["budget_usd_per_day"] = plan_quota["daily_usd_limit"]
+                    if plan_quota.get("required_success_probability"):
+                        merged["target_success_probability"] = plan_quota["required_success_probability"]
                 st = self._build_state(tenant_id, merged)
             self._states[tenant_id] = st
             return st
@@ -136,6 +166,29 @@ class TenantManager:
         with self._lock:
             self._states.pop(tenant_id, None)
         return self.get_or_create(tenant_id)
+
+    def remaining_tokens_today(self, tenant_id: str) -> int:
+        """Return remaining tenant-wide daily token budget. -1 = unlimited."""
+        st = self.get_or_create(tenant_id)
+        if st.daily_token_limit <= 0:
+            return -1
+        spent = memory.get_today_token_spend(tenant_id)
+        return max(0, st.daily_token_limit - spent)
+
+    def remaining_model_tokens_today(self, tenant_id: str, endpoint_name: str) -> int:
+        """Return remaining per-model daily token budget. -1 = unlimited."""
+        mtl = memory.get_model_token_limit(tenant_id, endpoint_name)
+        if not mtl or int(mtl.get("daily_token_limit", 0)) <= 0:
+            return -1
+        spent = memory.get_today_token_spend(tenant_id, endpoint_name)
+        return max(0, int(mtl["daily_token_limit"]) - spent)
+
+    def allowed_models(self, tenant_id: str) -> list[str] | None:
+        """Return list of allowed model names for the tenant's plan. None = unrestricted."""
+        plan_quota = memory.get_tenant_plan_quota(tenant_id)
+        if not plan_quota:
+            return None
+        return plan_quota.get("allowed_models") or None
 
     def check_rate_limit(self, tenant_id: str) -> None:
         st = self.get_or_create(tenant_id)
@@ -160,6 +213,10 @@ class TenantManager:
         estimated_tokens_in: int,
         estimated_tokens_out: int,
         estimated_cost_usd: float,
+        endpoint_name: str = "unknown",
+        model_token_limit: int = 0,
+        model_usd_limit: float = 0.0,
+        max_request_tokens: int = 0,
     ) -> None:
         st = self.get_or_create(tenant_id)
         ok, reason = memory.reserve_usage(
@@ -170,9 +227,19 @@ class TenantManager:
             estimated_tokens_in=estimated_tokens_in,
             estimated_tokens_out=estimated_tokens_out,
             estimated_cost_usd=estimated_cost_usd,
+            daily_token_limit=st.daily_token_limit,
+            endpoint_name=endpoint_name,
+            model_token_limit=model_token_limit,
+            model_usd_limit=model_usd_limit,
+            max_request_tokens=max_request_tokens,
         )
         if not ok:
-            if reason and reason.startswith("daily budget"):
+            if reason and (
+                reason.startswith("daily budget")
+                or reason.startswith("daily token limit")
+                or reason.startswith("model")
+                or reason.startswith("max_request_tokens")
+            ):
                 raise BudgetExceeded(reason)
             retry_after = 1.0 if reason and reason.startswith("requests-per-second") else 60.0
             raise RateLimited(retry_after_seconds=retry_after)
@@ -188,6 +255,7 @@ class TenantManager:
         actual_tokens_out: int,
         actual_cost_usd: float,
         completed: bool,
+        endpoint_name: str = "unknown",
     ) -> None:
         memory.settle_reserved_usage(
             tenant_id,
@@ -198,6 +266,7 @@ class TenantManager:
             actual_tokens_out=actual_tokens_out,
             actual_cost_usd=actual_cost_usd,
             completed=completed,
+            endpoint_name=endpoint_name,
         )
 
     def can_access_tier(self, tenant_id: str, tier_name: str) -> bool:

@@ -75,7 +75,7 @@ class MockUpstream:
         return f"http://127.0.0.1:{self.port}"
 
 
-def _base_config(tmpdir: str, *, ep_a: MockUpstream, ep_b: MockUpstream, reviewer: MockUpstream, auth: dict | None = None) -> dict:
+def _base_config(tmpdir: str, *, ep_a: MockUpstream, ep_b: MockUpstream, ep_ollama: MockUpstream, reviewer: MockUpstream, auth: dict | None = None) -> dict:
     return {
         "mode": "single",
         "db_url": f"sqlite:///{tmpdir}/itest.db",
@@ -111,11 +111,22 @@ def _base_config(tmpdir: str, *, ep_a: MockUpstream, ep_b: MockUpstream, reviewe
                 "breaker": {"failure_threshold": 2, "open_duration_seconds": 2, "half_open_max_probes": 1},
                 "health_probe": "/health",
             },
+            {
+                "name": "mock_ollama",
+                "kind": "ollama",
+                "base_url": ep_ollama.base_url,
+                "model_alias": "ollama-model",
+                # Deliberately expensive so cost-first never picks it over mock_a/mock_b.
+                "pricing": {"fixed_per_request": 5.0, "in_per_1k_tokens": 1.0, "out_per_1k_tokens": 1.0},
+                "concurrency": 4,
+                "breaker": {"failure_threshold": 2, "open_duration_seconds": 2, "half_open_max_probes": 1},
+                "health_probe": "/health",
+            },
         ],
         "tiers": [
             {
                 "name": "tier0",
-                "endpoints": ["mock_a", "mock_b"],
+                "endpoints": ["mock_a", "mock_b", "mock_ollama"],
                 "max_context": 32768,
                 "capability_per_vertical": {"_default": 0.95},
                 "max_tokens_bump": 0,
@@ -178,13 +189,18 @@ class IntegrationBase(unittest.TestCase):
         self.tmpdir = tempfile.mkdtemp()
         self.ep_a = MockUpstream("mock_a")
         self.ep_b = MockUpstream("mock_b")
+        self.ep_ollama = MockUpstream("mock_ollama")
         self.rev = MockUpstream("mock_reviewer", latency_ms=0)
         await self.ep_a.start()
         await self.ep_b.start()
+        await self.ep_ollama.start()
         await self.rev.start()
 
         self.conf_path = str(Path(self.tmpdir) / "gateway-config.json")
-        cfg = _base_config(self.tmpdir, ep_a=self.ep_a, ep_b=self.ep_b, reviewer=self.rev, auth=self._auth())
+        cfg = _base_config(
+            self.tmpdir, ep_a=self.ep_a, ep_b=self.ep_b,
+            ep_ollama=self.ep_ollama, reviewer=self.rev, auth=self._auth(),
+        )
         Path(self.conf_path).write_text(json.dumps(cfg), encoding="utf-8")
 
         from gateway import app as app_mod
@@ -204,6 +220,7 @@ class IntegrationBase(unittest.TestCase):
         # Client close triggers on_cleanup (workers stopped, pool closed)
         await self.ep_a.stop()
         await self.ep_b.stop()
+        await self.ep_ollama.stop()
         await self.rev.stop()
 
     # --- helpers ---
@@ -266,7 +283,7 @@ class TestChatPipeline(IntegrationBase):
         self.assertTrue(d["fallback_used"])
 
     def test_all_down_returns_502(self):
-        os.environ["MOCK_FAIL_ENDPOINTS"] = "mock_a,mock_b"
+        os.environ["MOCK_FAIL_ENDPOINTS"] = "mock_a,mock_b,mock_ollama"
         r = self.loop.run_until_complete(self._chat("will fail"))
         self.assertEqual(r.status, 502)
         trace = self._trace()
@@ -292,6 +309,37 @@ class TestChatPipeline(IntegrationBase):
         self.assertEqual(r.status, 404)
         data = self.loop.run_until_complete(r.json())
         self.assertEqual(data["error"]["code"], "model_not_found")
+
+
+class TestOllamaNative(IntegrationBase):
+    """Ollama native /api/chat must be decoded into OpenAI chat.completions."""
+
+    def test_ollama_native_response_decoded(self):
+        r = self.loop.run_until_complete(self.client.post("/v1/chat/completions", json={
+            "model": "mock_ollama",
+            "messages": [{"role": "user", "content": "native please"}],
+        }))
+        self.assertEqual(r.status, 200, self.loop.run_until_complete(r.text()))
+        data = self.loop.run_until_complete(r.json())
+        self.assertEqual(data["choices"][0]["message"]["content"], "ollama native from mock_ollama")
+        self.assertEqual(data["usage"]["total_tokens"], 8)
+        trace = self._trace()
+        self.assertEqual(trace["decisions"][0]["endpoint"], "mock_ollama")
+
+    def test_ollama_native_stream_translated_to_openai_sse(self):
+        r = self.loop.run_until_complete(self.client.post("/v1/chat/completions", json={
+            "model": "mock_ollama",
+            "messages": [{"role": "user", "content": "stream native"}],
+            "stream": True,
+        }))
+        self.assertEqual(r.status, 200)
+        body = self.loop.run_until_complete(r.text())
+        # Raw Ollama NDJSON has no "data:" framing — translation is proven by it.
+        self.assertIn("data: ", body)
+        self.assertIn('"object": "chat.completion.chunk"', body)
+        self.assertIn('"content": "ollama "', body)
+        self.assertIn('"content": "native"', body)
+        self.assertTrue(body.rstrip().endswith("data: [DONE]"))
 
 
 class TestFlywheel(IntegrationBase):
@@ -354,7 +402,7 @@ class TestOpsSurface(IntegrationBase):
 
     def test_ready_503_when_all_endpoints_down(self):
         # Health poller probes the mocks; make all fail
-        os.environ["MOCK_FAIL_ENDPOINTS"] = "mock_a,mock_b"
+        os.environ["MOCK_FAIL_ENDPOINTS"] = "mock_a,mock_b,mock_ollama"
         from gateway import app as app_mod
 
         async def force_poll():

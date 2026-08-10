@@ -120,15 +120,155 @@ broken format strings, wrong column names) actually surface.
 25. **The event loop must never block on DB/ONNX**: chat_completions offloads
     memory, router predict, usage reservation/settlement, and all DB writes
     via `asyncio.to_thread`. Keep new sync DB calls inside `to_thread`.
+26. **Router model artifact contract (v2, MLP heads)**: `heads.npz` now
+    REQUIRES `W_trunk1`/`b_trunk1` (shared trunk, `Linear(384, hidden)` +
+    ReLU) alongside the per-task `W_*`/`b_*` keys — `router.try_load_real`
+    validates this and refuses artifacts missing them, plus shape-checks
+    every head's input dim against the trunk's hidden dim. `train.py`,
+    `eval.py`'s `predict_with_heads`, and `router.py`'s `_run_heads` MUST all
+    compute the identical trunk-then-head forward pass. ReLU (not GELU) is
+    deliberate — it's the one activation numpy can replicate bit-exact from
+    the PyTorch training graph, so there's zero train/inference drift. No
+    backward compatibility with pre-v2 (pure-linear) heads — none exist yet,
+    train.py had never been exercised before this contract existed.
+27. **Structural-prototype centroids are computed for real now**: `train.py`
+    embeds each structural prototype's `centroid_seed_text`, runs it through
+    the trained projection head, and writes the averaged unit vector into
+    `prototypes.json`'s `centroid` field after every run. `policy.py`'s
+    `_compute_prototype_scores`/`_eval_prototype_match` use cosine similarity
+    against these when both `ctx.projection` and the centroid exist, else
+    fall back to keyword overlap (stub model / never-trained yet).
+    `RequestContext.projection` (from `RouterOutput.projection`, threaded
+    through in `app.py`) defaults to `None` — existing callers unaffected.
+28. **Embedding fine-tune has a built-in regression gate**:
+    `embed_finetune.py` measures triplet accuracy on a held-out split before
+    and after fine-tuning; if it does NOT improve, the script deliberately
+    skips writing an ONNX file. `trainer_worker._run_embedding_finetune`
+    treats a missing output as "no fine-tune happened" and falls back to
+    heads-only training on the current embedding — expected/safe, not a bug.
+29. **Embedding-finetune checksum handling**: when a run fine-tunes the
+    embedding, the hot-swap in `_run_training_run` passes
+    `checksum_sha256=None` (skips the static-checksum check — the artifact
+    was just produced in-process, trusted provenance) instead of comparing
+    against `gateway-config.json`'s old checksum, which would always
+    mismatch after a real fine-tune and silently block promotion. Ordinary
+    heads-only retrains still enforce the static checksum as before.
+30. **Auto-retrain promotions persist across restarts**:
+    `TrainerWorker._persist_as_boot_default` copies the newly promoted
+    checkpoint to the static boot path (`embedding.onnx_path` / sibling
+    `heads.npz`) and updates `embedding.checksum_sha256` in
+    `gateway-config.json` after every successful hot-swap — single-instance
+    mode only (mirrors invariant #24). Before this, `app.py.init_app()` only
+    ever read the static path at startup with no notion of "latest promoted
+    checkpoint," so a restart silently reverted to whatever was last
+    manually exported. Best-effort/non-fatal: failure here is logged, not
+    raised — the in-memory hot-swap already succeeded either way.
+31. **`swarm.decompose()` is async and takes a 4th `pool` argument** —
+    `app.py` calls `await swarm_mod.decompose(ctx, conf, swarm_cfg,
+    request.app["endpoint_pool"])`. Needed for `llm_plan` mode's planner LLM
+    call. `execute_swarm` runs subtasks in topological dependency layers
+    (`_topological_layers`) instead of one flat `asyncio.gather`; chunked
+    (non-llm_plan) subtasks have no `depends_on` so this collapses to the old
+    fully-parallel behavior for the existing default path.
+32. **Subscription token budgets + per-model limits + budget-aware routing**:
+    - `users.daily_token_limit` (INTEGER, default 0 = unlimited) and
+      `users.target_success_probability` (FLOAT, default 0.99) are the
+      per-tenant knobs. `plan_quotas` (plan_id, daily_token_limit,
+      daily_usd_limit, required_success_probability, allowed_models_json) and
+      `tenant_plans` (tenant_id → plan_id) override them when a tenant is
+      assigned a plan. `assign_tenant_plan` MUST create the user row first
+      (insert with `plan_id`) — otherwise the override silently never lands.
+    - `model_token_limits` (tenant_id + endpoint_name composite PK) carries
+      per-model `daily_token_limit`, `daily_usd_limit`, `max_request_tokens`.
+      `reserve_usage` checks tenant-wide daily token budget, daily USD budget,
+      per-model token+USD limits, **and** `max_request_tokens` (rejects
+      individual requests that exceed the per-call cap, not just daily totals).
+    - `reserve_usage`/`settle_usage` now take `endpoint_name` and write it
+      into `usage_counters.endpoint_name` so per-model spend queries
+      (e.g. `get_today_token_spend(tenant, endpoint)`) work. Failed requests
+      still release reserved tokens (negative delta) — never just leave them.
+    - `policy.budget_aware_route` is the new router. It builds a cascade
+      chain (`BudgetAwareCandidate[]`) ordered by ascending cost, walking
+      candidates until `cascade_success_probability(chain) >=
+      target_success_probability`. Throws `BudgetError("quality_target_unmet")`
+      when no chain reaches the target — caller maps to 429 `insufficient_quota`.
+      Falls back to `cost_first_route` when the tenant has no plan, no token
+      budget, and no per-model limits.
+    - `quality.estimate_success_probability` returns Wilson lower bound (95%
+      confidence) of observed success rate, clamped to a conservative prior
+      (0.5) when fewer than `min_samples` (=10) outcomes exist. This means
+      a new model with zero history CANNOT claim 100% confidence — to meet a
+      0.99 target via a single model you'd need > 300 samples with 0 failures.
+    - `policy.cost_to_complete_p99` is the 99th-percentile cost estimate
+      (geometric retry distribution, capped at `max_retries+1` attempts),
+      surfaced in `routing_log.extra.achieved_success_probability` /
+      `cost_to_complete_p99` for auditability.
+    - `BudgetError` is mapped to HTTP 429 with `error.code` =
+      `quality_target_unmet` and an `insufficient_quota` type by `app.py`.
+    - Admin: `POST /admin/plans`, `PUT /admin/plans/{id}`,
+      `POST /admin/users/{tenant}/subscription`, `PUT /admin/users/{tenant}/budget/tokens`,
+      `PUT /admin/users/{tenant}/models/{endpoint}/limits`,
+      `GET /admin/users/{tenant}/limits`. User-facing: `GET /usage`,
+      `GET /usage/limits`. All limit/budget edits call `tenant_mgr.refresh`
+      so the cached `TenantState` picks up the new values immediately.
+
+
+## Router model v2 — MLP heads, real embedding fine-tune, llm_plan swarm (UNVERIFIED)
+
+Written in a session with no bash/execution access (sandbox VM failed to
+start) — every file below was hand-verified for shape/contract consistency
+but **never actually run**. Treat as a draft PR that needs the checks below
+before it's trusted, same spirit as the rest of this section.
+
+Changed: `gateway/router.py` (MLP trunk inference), `router_model/train.py`
+(PyTorch trunk+heads training, class weighting, val split, early stopping,
+supervised-contrastive projection loss, centroid write-back),
+`router_model/eval.py` (mirrors the trunk forward pass), `router_model/
+embed_finetune.py` (real contrastive fine-tune, was a stub), `gateway/
+trainer_worker.py` (wires embedding fine-tune before heads training, boot-
+default persistence), `gateway/policy.py` + `gateway/app.py` (real
+cosine-similarity prototype matching), `gateway/swarm.py` + `gateway-
+policy.json` (llm_plan dependency-aware subtask planning), `requirements.txt`
+(torch uncommented — now required for training, still not required to run
+the gateway itself).
+
+Before trusting any of it:
+
+```powershell
+ruff check gateway tests router_model
+mypy gateway
+python -m unittest discover -s tests
+
+# then a real end-to-end pass:
+python router_model/generate_data.py --out router_model/data/base   # needs TEACHER_API_KEY
+python router_model/train.py --base-data-dir router_model/data/base --output-heads router_model/checkpoints/v1_heads.npz --output-onnx router_model/checkpoints/v1_model.onnx --output-metadata router_model/checkpoints/v1_meta.json
+python router_model/eval.py --heads router_model/checkpoints/v1_heads.npz --onnx router_model/checkpoints/v1_model.onnx --base-eval router_model/data/base/eval.jsonl --output-json router_model/checkpoints/v1_eval.json
+```
+
+Watch specifically for: PyTorch/numpy shape mismatches surfacing as
+`try_load_real` raising `ValueError` on load (the shape-check invariants in
+#26 are meant to catch this loudly rather than silently misrouting); the
+`torch.onnx.export` I/O signature in `embed_finetune.py` actually matching
+what `encode_with_embedding` feeds an ONNX session (`input_ids`,
+`attention_mask`, optional `token_type_ids` -> `last_hidden_state`); and
+whether `--projection-weight`'s supervised-contrastive loss actually helps
+prototype separation or needs re-weighting once real data exists.
 
 ## Known unfinished (do not assume working)
 
-- `router_model/embed_finetune.py` is a STUB — `POST /retrain
-  --allow-embedding-finetune` logs a warning and runs heads-only.
-- `router_model/train.py`/`eval.py` need a HuggingFace download
-  (bge-small-en-v1.5) — not exercised in CI.
+- `router_model/train.py`/`eval.py`/`embed_finetune.py` need a HuggingFace
+  download (bge-small-en-v1.5) and `pip install torch` — not exercised in
+  CI, and not run by the agent that wrote the v2 rewrite above. See that
+  section for exact verification commands.
 - `tests/mock_endpoints.py` covers llama/openai chat + stream + failure
-  scripting; add cases there for new endpoint behaviors.
+  scripting; add cases there for new endpoint behaviors, including swarm's
+  `llm_plan` planner calls once that path gets exercised.
 - The dashboard carries its API key in `sessionStorage` (`glint_api_key`);
   the event stream uses authenticated `fetch` streaming (EventSource cannot
   set headers). Named SSE events are consumed via `renderEvent`.
+- The "Glint Roman Empire lesson" is referenced by name in four places
+  (`gateway-config.json`, `gateway-policy.json`, `prototypes.json`,
+  `generate_data.py`) as if written up in README.md, but the actual incident
+  never got documented there — only the resulting rule did (topic prototypes
+  forbidden; prototypes encode difficulty profile, not topic). If you know
+  the real story, add it to README under structural prototypes.

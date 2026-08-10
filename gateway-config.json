@@ -6,23 +6,30 @@
   "host": "0.0.0.0",
   "port": 8076,
 
-  "_doc_tenants": "Default + per-user. tenant_id '*' is the default for any user not listed. tier_access is a whitelist; budget_usd_per_day caps daily spend; rps_limit caps requests/sec; concurrent_limit caps inflight.",
+  "_doc_tenants": "Default + per-user. tenant_id '*' is the default for any user not listed. tier_access is a whitelist; budget_usd_per_day caps daily spend; rps_limit caps requests/sec; concurrent_limit caps inflight; tokens_per_min caps token throughput; daily_token_limit caps daily tokens (0 = unlimited); target_success_probability is the routing target (default 0.99). Tenant plans (POST /admin/plans + POST /admin/users/{id}/subscription) further override these."
+  ,
   "tenants": {
     "*": {
       "tier_access": ["tier0", "tier1", "tier2"],
       "budget_usd_per_day": 1.0,
       "rps_limit": 100,
       "concurrent_limit": 20,
-      "tokens_per_min": 200000
+      "tokens_per_min": 200000,
+      "daily_token_limit": 0,
+      "target_success_probability": 0.99
     },
     "_doc_example": {
       "tier_access": ["tier0", "tier1", "tier2", "tier3", "tier4"],
       "budget_usd_per_day": 50.0,
       "rps_limit": 50,
       "concurrent_limit": 10,
-      "tokens_per_min": 100000
+      "tokens_per_min": 100000,
+      "daily_token_limit": 1000000,
+      "target_success_probability": 0.99
     }
   },
+
+  "_doc_plans": "Subscription plans (admin CRUD via /admin/plans). Plans can override daily_token_limit, daily_usd_limit, and required_success_probability, and can restrict allowed_models. Settings flow: tenant -> plan -> route policy. See README 'Subscription budgets' for the full picture.",
 
   "_doc_endpoints": "Providers are added via the dashboard Setup wizard or /admin/endpoints API. kind: openai | anthropic | gemini | ollama | llamacpp. See gateway/provider_presets.json for the full catalog of supported providers (US + Chinese + local).",
   "endpoints": [
