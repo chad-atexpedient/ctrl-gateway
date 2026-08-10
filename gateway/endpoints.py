@@ -35,7 +35,7 @@ class EndpointHTTPError(RuntimeError):
 class EndpointClient:
     """Wraps a single endpoint. Holds semaphore + breaker reference."""
 
-    def __init__(self, cfg_dict: dict):
+    def __init__(self, cfg_dict: dict, firewall_enforcer=None):
         self.cfg = cfg_dict
         self.name = cfg_dict["name"]
         self.semaphore = asyncio.Semaphore(cfg_dict.get("concurrency", 4))
@@ -48,6 +48,14 @@ class EndpointClient:
         self._last_used = 0.0
         self._lock = asyncio.Lock()
         self._session: aiohttp.ClientSession | None = None
+        # Optional reference to the in-process firewall enforcer. app.py
+        # sets this on the EndpointPool after both are constructed. `None`
+        # means no firewall (default — keeps tests simple).
+        self._firewall = firewall_enforcer
+
+    def set_firewall(self, enforcer) -> None:
+        """Attach the in-process firewall enforcer to this client."""
+        self._firewall = enforcer
 
     def breaker(self) -> circuit.CircuitBreaker:
         return circuit.registry().get(self.name, self._breaker_config)
@@ -65,6 +73,30 @@ class EndpointClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
+    def _check_firewall(self, url: str, tenant_id: str | None) -> None:
+        """Run the in-process firewall against an outbound URL.
+
+        Raises FirewallBlockedRequest when the request is not allowed.
+        Tenant context is optional — defaults to "anonymous" when absent.
+        """
+        if self._firewall is None:
+            return
+        # Localhost / 127.0.0.1 is always allowed (loopback) — we don't
+        # want to block the gateway from talking to mock endpoints, local
+        # ollama, etc.
+        from . import firewall as fw
+        domain = fw.extract_domain(url)
+        if domain in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+            return
+        result = self._firewall.check_outbound(url, tenant_id or "anonymous")
+        if not result.allowed:
+            raise fw.FirewallBlockedRequest(
+                endpoint=self.name,
+                target_url=url,
+                reason=result.reason,
+                matched_pattern=result.matched_pattern,
+            )
+
     async def health_check(self) -> bool:
         """Cheap probe. Returns True if endpoint reachable."""
         try:
@@ -81,12 +113,16 @@ class EndpointClient:
         self,
         transcoded: transcoder.TranscodedRequest,
         stream: bool,
+        tenant_id: str | None = None,
     ) -> dict | AsyncIterator[bytes]:
         """Send a request to the endpoint. Returns parsed JSON or async iterator of SSE chunks.
 
         For streaming, the returned async generator owns the semaphore + inflight
         counter for the entire stream lifetime (not just until the first chunk).
         """
+        # Firewall check runs synchronously and BEFORE breaker/semaphore so
+        # a blocked request doesn't deplete the breaker failure counter.
+        self._check_firewall(transcoded.url, tenant_id)
         br = self.breaker()
         if not br.allow():
             raise RuntimeError(f"breaker open for endpoint {self.name}")
@@ -181,9 +217,16 @@ class EndpointClient:
 class EndpointPool:
     """Manages all endpoint clients."""
 
-    def __init__(self):
+    def __init__(self, firewall_enforcer=None):
         self._clients: dict[str, EndpointClient] = {}
         self._lock = asyncio.Lock()
+        self._firewall = firewall_enforcer
+
+    def set_firewall(self, enforcer) -> None:
+        """Attach (or replace) the firewall enforcer and propagate to clients."""
+        self._firewall = enforcer
+        for c in self._clients.values():
+            c.set_firewall(enforcer)
 
     async def rebuild(self, conf: cfg.Config):
         """Rebuild pool from config (atomic ref swap)."""
@@ -193,10 +236,11 @@ class EndpointPool:
             existing = self._clients.get(name)
             if existing and existing.cfg == ep_cfg:
                 new_clients[name] = existing
+                existing.set_firewall(self._firewall)
             else:
                 if existing:
                     await existing.close()
-                new_clients[name] = EndpointClient(ep_cfg)
+                new_clients[name] = EndpointClient(ep_cfg, firewall_enforcer=self._firewall)
         async with self._lock:
             old = self._clients
             self._clients = new_clients
@@ -240,13 +284,14 @@ def pool() -> EndpointPool:
 async def stream_passthrough(
     endpoint_name: str,
     transcoded: transcoder.TranscodedRequest,
+    tenant_id: str | None = None,
 ) -> AsyncIterator[bytes]:
     """Wrap the stream so the semaphore is held for the entire stream lifetime.
 
     This is a helper for the app.py request handler.
     """
     client = pool().get(endpoint_name)
-    result = await client.send(transcoded, stream=True)
+    result = await client.send(transcoded, stream=True, tenant_id=tenant_id)
     if not isinstance(result, AsyncIterator):
         raise RuntimeError(f"stream request to {endpoint_name} returned a non-stream response")
     async for chunk in result:

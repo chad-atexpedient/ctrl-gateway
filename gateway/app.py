@@ -16,6 +16,8 @@ Endpoints: /v1/chat/completions (OpenAI-compatible), /v1/models, /stats,
 /config, /reload, /trace, /feedback, /accuracy, /export, /memory, /verticals,
 /cost, /review-stats, /retrain, /registry, /docs/model-card/<version>,
 /admin/users, /admin/users/<id>/budget, /admin/users/<id>/stats, /admin/flags,
+/admin/security/* (events, stats, injection-profiles, provider-allowlist,
+  host firewall sync, status, test),
 /health, /dashboard.
 """
 from __future__ import annotations
@@ -49,6 +51,7 @@ from . import (
     translation,
 )
 from . import config as cfg_mod
+from . import firewall as firewall_mod
 from . import memory_observational as om
 from . import metrics as metrics_mod
 from . import ood as ood_mod
@@ -59,6 +62,9 @@ from . import swarm as swarm_mod
 log = logging.getLogger("glint.app")
 
 INJECTION_PATTERNS: list = []
+INJECTION_PROFILES: list = []  # list[security.InjectionProfile]
+FIREWALL: firewall_mod.DomainAllowlistEnforcer | None = None
+HOST_FIREWALL: firewall_mod.HostFirewallManager | None = None
 
 
 async def init_app(conf_path: str = "./gateway-config.json") -> web.Application:
@@ -98,6 +104,44 @@ async def init_app(conf_path: str = "./gateway-config.json") -> web.Application:
     pool = endpoints.init_pool()
     await pool.rebuild(conf)
 
+    # Security hub: in-process firewall + host firewall manager.
+    # Both default to disabled. The in-process firewall is built from
+    # gateway-config.json security.provider_allowlist (and DB rows can be
+    # layered in via /admin/security/*).
+    fw_config = conf.config.get("security", {}).get("provider_allowlist", {}) or {}
+    enforcer = firewall_mod.DomainAllowlistEnforcer(
+        enabled=bool(fw_config.get("enabled", False)),
+        default_action=fw_config.get("default_action", "block"),
+    )
+    enforcer.load_from_config(fw_config)
+    # Layer DB-backed rules on top
+    try:
+        db_rules = await asyncio.to_thread(memory.list_provider_allowlist)
+    except Exception:
+        db_rules = []
+    enforcer.load_from_db(db_rules)
+    pool.set_firewall(enforcer)
+    global FIREWALL
+    FIREWALL = enforcer
+
+    # Host firewall (off by default; needs admin/root)
+    host_fw_config = fw_config.get("host_firewall", {}) or {}
+    host_fw = firewall_mod.HostFirewallManager(
+        enabled=bool(host_fw_config.get("enabled", False)),
+        platform=host_fw_config.get("platform", "auto"),
+        persist_on_shutdown=bool(host_fw_config.get("persist_on_shutdown", False)),
+    )
+    global HOST_FIREWALL
+    HOST_FIREWALL = host_fw
+    if host_fw.enabled:
+        # Sync once at startup. Failures are logged but never block startup.
+        try:
+            # Collect patterns from the enforcer's rules
+            patterns = [r.pattern for r in enforcer.list_rules() if r.tenant_id == "*"]
+            host_fw.sync(patterns)
+        except Exception as e:
+            log.warning("host firewall sync on startup failed: %s", e)
+
     # Tenant manager — default from tenants["*"], per-user overrides from the rest
     tenants_cfg = conf.config.get("tenants", {}) or {}
     default_tenant_cfg = tenants_cfg.get("*") or {
@@ -110,11 +154,39 @@ async def init_app(conf_path: str = "./gateway-config.json") -> web.Application:
     preconfigured = {k: v for k, v in tenants_cfg.items() if k != "*" and not str(k).startswith("_")}
     tenant.init_manager(default_tenant_cfg, preconfigured=preconfigured)
 
-    # Security patterns
-    global INJECTION_PATTERNS
+    # Security patterns + injection profiles
+    global INJECTION_PATTERNS, INJECTION_PROFILES
     INJECTION_PATTERNS = security.compile_patterns(
         conf.config.get("security", {}).get("injection_regex", [])
     )
+    # Seed built-in profiles (idempotent: skip if name already exists).
+    # We only seed + load when profiles are enabled (default = enabled).
+    profiles_enabled = bool(conf.config.get("security", {}).get("injection_profiles_enabled", True))
+    if profiles_enabled:
+        try:
+            await asyncio.to_thread(memory.seed_default_injection_profiles, security.DEFAULT_INJECTION_PROFILES)
+        except Exception as e:
+            log.warning("seed injection profiles failed: %s", e)
+        # Load all enabled profiles
+        try:
+            db_profiles = await asyncio.to_thread(memory.list_injection_profiles, True)
+        except Exception:
+            db_profiles = []
+        INJECTION_PROFILES = []
+        for row in db_profiles:
+            try:
+                INJECTION_PROFILES.append(security.InjectionProfile.from_config(
+                    name=row["name"],
+                    regexes=row.get("regexes", []),
+                    severity=row.get("severity", "medium"),
+                    action=row.get("action", "alert"),
+                    enabled=row.get("enabled", True),
+                    is_builtin=row.get("is_builtin", False),
+                ))
+            except Exception as e:
+                log.warning("skip invalid injection profile %r: %s", row.get("name"), e)
+    else:
+        INJECTION_PROFILES = []
 
     # Set current config for policy atom-eval
     policy_mod.set_current_config(conf)
@@ -198,6 +270,18 @@ async def init_app(conf_path: str = "./gateway-config.json") -> web.Application:
     app.router.add_get("/usage", get_my_usage)
     app.router.add_get("/usage/limits", get_my_limits)
     app.router.add_get("/admin/flags", list_flags)
+    app.router.add_get("/admin/security/events", admin_security_events)
+    app.router.add_get("/admin/security/events/stats", admin_security_stats)
+    app.router.add_get("/admin/security/injection-profiles", admin_list_injection_profiles)
+    app.router.add_post("/admin/security/injection-profiles", admin_create_injection_profile)
+    app.router.add_put("/admin/security/injection-profiles/{profile_id}", admin_update_injection_profile)
+    app.router.add_delete("/admin/security/injection-profiles/{profile_id}", admin_delete_injection_profile)
+    app.router.add_get("/admin/security/provider-allowlist", admin_list_provider_allowlist)
+    app.router.add_post("/admin/security/provider-allowlist", admin_upsert_provider_allowlist)
+    app.router.add_delete("/admin/security/provider-allowlist/{tenant_id}/{pattern}", admin_delete_provider_allowlist)
+    app.router.add_post("/admin/security/sync-firewall", admin_sync_host_firewall)
+    app.router.add_get("/admin/security/status", admin_security_status)
+    app.router.add_post("/admin/security/test", admin_security_test)
     app.router.add_get("/admin/provider-presets", get_provider_presets)
     # Provider/Key/Tier CRUD
     app.router.add_post("/admin/endpoints", admin_add_endpoint)
@@ -320,10 +404,55 @@ async def _apply_runtime_config(app: web.Application, conf: cfg_mod.Config):
     """Propagate a new immutable config snapshot to every live subsystem."""
     policy_mod.set_current_config(conf)
     await app["endpoint_pool"].rebuild(conf)
-    global INJECTION_PATTERNS
+    global INJECTION_PATTERNS, INJECTION_PROFILES, FIREWALL, HOST_FIREWALL
     INJECTION_PATTERNS = security.compile_patterns(
         conf.config.get("security", {}).get("injection_regex", [])
     )
+    # Refresh injection profiles from the DB
+    profiles_enabled = bool(conf.config.get("security", {}).get("injection_profiles_enabled", True))
+    if profiles_enabled:
+        try:
+            db_profiles = await asyncio.to_thread(memory.list_injection_profiles, True)
+        except Exception:
+            db_profiles = []
+        new_profiles = []
+        for row in db_profiles:
+            try:
+                new_profiles.append(security.InjectionProfile.from_config(
+                    name=row["name"],
+                    regexes=row.get("regexes", []),
+                    severity=row.get("severity", "medium"),
+                    action=row.get("action", "alert"),
+                    enabled=row.get("enabled", True),
+                    is_builtin=row.get("is_builtin", False),
+                ))
+            except Exception:
+                pass
+        INJECTION_PROFILES = new_profiles
+    else:
+        INJECTION_PROFILES = []
+    # Refresh in-process firewall
+    fw_config = conf.config.get("security", {}).get("provider_allowlist", {}) or {}
+    enforcer = firewall_mod.DomainAllowlistEnforcer(
+        enabled=bool(fw_config.get("enabled", False)),
+        default_action=fw_config.get("default_action", "block"),
+    )
+    enforcer.load_from_config(fw_config)
+    try:
+        db_rules = await asyncio.to_thread(memory.list_provider_allowlist)
+    except Exception:
+        db_rules = []
+    enforcer.load_from_db(db_rules)
+    app["endpoint_pool"].set_firewall(enforcer)
+    FIREWALL = enforcer
+    # Re-sync host firewall if enabled
+    if HOST_FIREWALL and HOST_FIREWALL.enabled:
+        try:
+            patterns = [r.pattern for r in enforcer.list_rules() if r.tenant_id == "*"]
+            HOST_FIREWALL.sync(patterns)
+        except Exception as e:
+            log.warning("host firewall sync on hot-reload failed: %s", e)
+
     app["auth_manager"].update(conf.config.get("auth", {}))
     app["reviewer_worker"].update_config(conf)
     app["trainer_worker"].update_config(conf)
@@ -341,7 +470,7 @@ async def _apply_runtime_config(app: web.Application, conf: cfg_mod.Config):
         onnx_path = conf.config.get("embedding", {}).get("onnx_path")
         heads_path = onnx_path.replace("model.onnx", "heads.npz") if onnx_path else None
         loaded = False
-        if onnx_path and heads_path and Path(onnx_path).exists() and Path(heads_path).exists():
+        if onnx_path and heads_path and Path(onnx_path).exists() and heads_path and Path(heads_path).exists():
             loaded = await asyncio.to_thread(
                 app["router"].try_load_real,
                 onnx_path=onnx_path,
@@ -380,6 +509,13 @@ async def _cleanup_resources(app: web.Application):
     pool = app.get("endpoint_pool")
     if pool:
         await pool.close_all()
+    # Optionally clear host-level firewall rules (only when persist_on_shutdown=False)
+    global HOST_FIREWALL
+    if HOST_FIREWALL and HOST_FIREWALL.enabled and not HOST_FIREWALL.persist_on_shutdown:
+        try:
+            HOST_FIREWALL.clear()
+        except Exception as e:
+            log.warning("host firewall clear on shutdown failed: %s", e)
     await asyncio.to_thread(memory.close_engine)
 
 
@@ -440,13 +576,108 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
     text = _extract_text(last_user.get("content", ""))
     has_image = _has_image(last_user.get("content"))
 
-    # Security check (informational; never alters routing)
-    inj = security.check_injection(
-        text,
-        INJECTION_PATTERNS,
-        strip_control_tokens=bool(conf.config.get("security", {}).get("strip_control_tokens", True)),
-    )
-    has_injection = inj.has_injection_signal
+    # Security check — profile-based. Each profile has a severity + action
+    # (block / alert / log). High-severity matches with action=block reject
+    # the request with HTTP 400. Routing is NEVER altered by injection
+    # signals (we still classify + route as if the user typed normally).
+    if INJECTION_PROFILES:
+        inj = security.check_injection_with_action(
+            text,
+            INJECTION_PROFILES,
+            strip_control_tokens=bool(conf.config.get("security", {}).get("strip_control_tokens", True)),
+        )
+    else:
+        # Fallback to legacy single-list check
+        legacy = security.check_injection(
+            text,
+            INJECTION_PATTERNS,
+            strip_control_tokens=bool(conf.config.get("security", {}).get("strip_control_tokens", True)),
+        )
+        inj = security.InjectionResult(
+            has_injection=legacy.has_injection_signal,
+            severity="medium",
+            matched_profiles=[
+                {"name": "legacy", "pattern": p, "severity": "medium"}
+                for p in legacy.matched_patterns
+            ],
+            action="alert",
+            sanitized_text=legacy.sanitized_text,
+        )
+    has_injection = inj.has_injection
+
+    # Block-or-alert handling for injection matches.
+    if has_injection and inj.action == "block":
+        # Security event audit + log
+        top = inj.matched_profiles[0] if inj.matched_profiles else {
+            "name": "unknown", "pattern": "", "severity": inj.severity,
+        }
+        event_id = 0
+        try:
+            event_id = await asyncio.to_thread(
+                memory.record_security_event,
+                tenant_id,
+                "injection_blocked",
+                inj.severity,
+                f"blocked injection: {top['name']}",
+                matched_pattern=top.get("pattern", "")[:256],
+                query_preview=text[:1000],
+                action_taken="block",
+                request_metadata={"endpoint": "chat_completions"},
+            )
+        except Exception as e:
+            log.warning("record security event failed: %s", e)
+        # Also write to flagged_inputs for backwards compat
+        try:
+            await asyncio.to_thread(
+                memory.flag_input,
+                tenant_id,
+                None,
+                "injection_blocked",
+                top.get("pattern", "")[:256],
+                text,
+                "blocked",
+                inj.severity,
+                top.get("name"),
+                event_id,
+            )
+        except Exception as e:
+            log.warning("flag_input failed: %s", e)
+        return _openai_error(
+            "injection_blocked",
+            "Request blocked by security policy.",
+            400,
+            error_type="invalid_request_error",
+        )
+    elif has_injection and inj.action == "alert":
+        try:
+            top = inj.matched_profiles[0]
+            await asyncio.to_thread(
+                memory.record_security_event,
+                tenant_id,
+                "injection_alerted",
+                inj.severity,
+                f"alerted injection: {top['name']}",
+                matched_pattern=top.get("pattern", "")[:256],
+                query_preview=text[:1000],
+                action_taken="alert",
+            )
+        except Exception as e:
+            log.warning("record security event failed: %s", e)
+    elif has_injection and inj.action == "log":
+        try:
+            top = inj.matched_profiles[0]
+            await asyncio.to_thread(
+                memory.record_security_event,
+                tenant_id,
+                "injection_alerted",
+                "low",
+                f"logged injection: {top['name']}",
+                matched_pattern=top.get("pattern", "")[:256],
+                query_preview=text[:1000],
+                action_taken="log",
+            )
+        except Exception as e:
+            log.warning("record security event failed: %s", e)
 
     # Session
     session_id = request.headers.get("X-Session-Id") or str(uuid.uuid4())
@@ -821,14 +1052,20 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                 extra=decision.extra or None,
             )
 
-            # Flag injection if detected
+            # Flag injection if detected (backwards-compat audit trail)
             if has_injection:
+                if isinstance(inj, security.InjectionResult):
+                    matched_for_log = "; ".join(
+                        m.get("pattern", "") for m in inj.matched_profiles
+                    )
+                else:
+                    matched_for_log = "; ".join(inj.matched_patterns)
                 await asyncio.to_thread(
                     memory.flag_input,
                     tenant_id=tenant_id,
                     decision_id=decision_id,
                     reason="injection_signal",
-                    matched_regex="; ".join(inj.matched_patterns)[:200],
+                    matched_regex=matched_for_log[:200],
                     query_preview=text[:200],
                     action_taken="logged_routing_unaffected",
                 )
@@ -977,7 +1214,7 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                         "X-Gateway-Memory-Tokens": str(memory_ctx.total_tokens_estimate),
                     },
                 )
-                stream_iter = endpoints.stream_passthrough(decision.endpoint, transcoded).__aiter__()
+                stream_iter = endpoints.stream_passthrough(decision.endpoint, transcoded, tenant_id=tenant_id).__aiter__()
                 try:
                     first_chunk = await anext(stream_iter)
                 except Exception as e:
@@ -1087,7 +1324,7 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
             else:
                 try:
                     resp_data, actual_endpoint, actual_tier, attempts = await _forward_with_fallback(
-                        request.app, conf, decision, forwarded_body, breaker_states,
+                        request.app, conf, decision, forwarded_body, breaker_states, tenant_id,
                     )
                 except Exception as e:
                     log.warning("all endpoints failed for decision %d: %s", decision_id, e)
@@ -1378,6 +1615,7 @@ async def _forward_with_fallback(
     decision: policy_mod.RoutingDecision,
     forwarded_body: dict,
     breaker_states: dict[str, str],
+    tenant_id: str,
 ) -> tuple[dict, str, str, int]:
     """Try the chosen endpoint, then other endpoints in the same tier, then
     the configured fallback endpoint. Returns (resp_data, endpoint, tier, attempts).
@@ -1414,7 +1652,7 @@ async def _forward_with_fallback(
         try:
             transcoded = transcoder.transcode(ep_cfg, tier_cfg, forwarded_body)
             client = pool.get(ep_name)
-            resp_data = await client.send(transcoded, stream=False)
+            resp_data = await client.send(transcoded, stream=False, tenant_id=tenant_id)
             if not isinstance(resp_data, dict):
                 raise RuntimeError(f"endpoint {ep_name} returned a non-dict response")
             if attempts > 1:
@@ -2208,6 +2446,308 @@ async def list_flags(request: web.Request):
     limit = int(request.query.get("limit", 100))
     reason = request.query.get("reason")
     return web.json_response({"flags": memory.list_flagged(limit=limit, reason=reason)})
+
+
+# ============================================================
+# Security Hub — /admin/security/*
+# ============================================================
+
+
+async def admin_security_events(request: web.Request):
+    """List security events. Filters: tenant_id, event_type, severity, since, limit."""
+    from datetime import datetime as _dt
+    tenant_id = request.query.get("tenant_id") or None
+    event_type = request.query.get("event_type") or None
+    severity = request.query.get("severity") or None
+    limit = min(int(request.query.get("limit", 100)), 1000)
+    since_raw = request.query.get("since")
+    since = None
+    if since_raw:
+        try:
+            since = _dt.fromisoformat(since_raw.replace("Z", "+00:00"))
+        except ValueError:
+            return _openai_error(
+                "invalid_since",
+                "since must be ISO 8601.",
+                400,
+                error_type="invalid_request_error",
+            )
+    events = await asyncio.to_thread(
+        memory.list_security_events,
+        tenant_id=tenant_id,
+        event_type=event_type,
+        severity=severity,
+        since=since,
+        limit=limit,
+    )
+    return web.json_response({"events": events, "count": len(events)})
+
+
+async def admin_security_stats(request: web.Request):
+    """Aggregated security stats for the dashboard."""
+    tenant_id = request.query.get("tenant_id") or None
+    window_days = int(request.query.get("window_days", 7))
+    stats = await asyncio.to_thread(
+        memory.security_event_stats,
+        tenant_id=tenant_id,
+        window_days=window_days,
+    )
+    return web.json_response(stats)
+
+
+async def admin_list_injection_profiles(request: web.Request):
+    enabled_only = request.query.get("enabled_only", "false").lower() in ("1", "true", "yes")
+    profiles = await asyncio.to_thread(memory.list_injection_profiles, enabled_only)
+    return web.json_response({"profiles": profiles, "count": len(profiles)})
+
+
+async def admin_create_injection_profile(request: web.Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return _openai_error("invalid_body", "JSON body required.", 400, error_type="invalid_request_error")
+    name = body.get("name")
+    regexes = body.get("regexes") or []
+    severity = body.get("severity", "medium")
+    action = body.get("action", "alert")
+    enabled = bool(body.get("enabled", True))
+    if not name or not isinstance(regexes, list):
+        return _openai_error(
+            "invalid_profile",
+            "name (str) and regexes (list[str]) are required.",
+            400,
+            error_type="invalid_request_error",
+        )
+    try:
+        pid = await asyncio.to_thread(
+            memory.create_injection_profile,
+            name=name,
+            regexes=regexes,
+            severity=severity,
+            action=action,
+            enabled=enabled,
+            is_builtin=False,
+        )
+    except ValueError as e:
+        return _openai_error("invalid_profile", str(e), 400, error_type="invalid_request_error")
+    return web.json_response({"id": pid, "name": name}, status=201)
+
+
+async def admin_update_injection_profile(request: web.Request):
+    profile_id = int(request.match_info["profile_id"])
+    try:
+        body = await request.json()
+    except Exception:
+        return _openai_error("invalid_body", "JSON body required.", 400, error_type="invalid_request_error")
+    try:
+        ok = await asyncio.to_thread(
+            memory.update_injection_profile,
+            profile_id,
+            name=body.get("name"),
+            regexes=body.get("regexes"),
+            severity=body.get("severity"),
+            action=body.get("action"),
+            enabled=body.get("enabled"),
+        )
+    except ValueError as e:
+        return _openai_error("invalid_profile", str(e), 400, error_type="invalid_request_error")
+    if not ok:
+        return _openai_error("not_found", f"profile {profile_id} not found.", 404)
+    # Refresh in-memory profiles
+    global INJECTION_PROFILES
+    try:
+        db_profiles = await asyncio.to_thread(memory.list_injection_profiles, True)
+        INJECTION_PROFILES = [
+            security.InjectionProfile.from_config(
+                name=row["name"],
+                regexes=row.get("regexes", []),
+                severity=row.get("severity", "medium"),
+                action=row.get("action", "alert"),
+                enabled=row.get("enabled", True),
+                is_builtin=row.get("is_builtin", False),
+            )
+            for row in db_profiles
+        ]
+    except Exception:
+        pass
+    return web.json_response({"id": profile_id, "updated": True})
+
+
+async def admin_delete_injection_profile(request: web.Request):
+    profile_id = int(request.match_info["profile_id"])
+    try:
+        ok = await asyncio.to_thread(memory.delete_injection_profile, profile_id)
+    except ValueError as e:
+        return _openai_error("cannot_delete", str(e), 400, error_type="invalid_request_error")
+    if not ok:
+        return _openai_error("not_found", f"profile {profile_id} not found.", 404)
+    global INJECTION_PROFILES
+    try:
+        db_profiles = await asyncio.to_thread(memory.list_injection_profiles, True)
+        INJECTION_PROFILES = [
+            security.InjectionProfile.from_config(
+                name=row["name"],
+                regexes=row.get("regexes", []),
+                severity=row.get("severity", "medium"),
+                action=row.get("action", "alert"),
+                enabled=row.get("enabled", True),
+                is_builtin=row.get("is_builtin", False),
+            )
+            for row in db_profiles
+        ]
+    except Exception:
+        pass
+    return web.json_response({"id": profile_id, "deleted": True})
+
+
+async def admin_list_provider_allowlist(request: web.Request):
+    tenant_id = request.query.get("tenant_id") or None
+    rules = await asyncio.to_thread(memory.list_provider_allowlist, tenant_id)
+    return web.json_response({"rules": rules, "count": len(rules)})
+
+
+async def admin_upsert_provider_allowlist(request: web.Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return _openai_error("invalid_body", "JSON body required.", 400, error_type="invalid_request_error")
+    tenant_id = body.get("tenant_id", "*")
+    pattern = body.get("pattern") or body.get("domain_pattern")
+    action = body.get("action", "allow")
+    notes = body.get("notes")
+    if not pattern:
+        return _openai_error(
+            "invalid_rule",
+            "pattern (str) is required.",
+            400,
+            error_type="invalid_request_error",
+        )
+    try:
+        await asyncio.to_thread(
+            memory.upsert_provider_allowlist,
+            tenant_id, pattern, action, notes,
+        )
+    except ValueError as e:
+        return _openai_error("invalid_rule", str(e), 400, error_type="invalid_request_error")
+    # Reload enforcer
+    global FIREWALL
+    if FIREWALL is not None:
+        try:
+            fw_cfg = request.app["conf_mgr"].current().config.get(
+                "security", {},
+            ).get("provider_allowlist", {})
+            FIREWALL.load_from_config(fw_cfg)
+            db_rules = await asyncio.to_thread(memory.list_provider_allowlist)
+            FIREWALL.load_from_db(db_rules)
+            # Re-sync host firewall
+            if HOST_FIREWALL and HOST_FIREWALL.enabled:
+                patterns = [r.pattern for r in FIREWALL.list_rules() if r.tenant_id == "*"]
+                HOST_FIREWALL.sync(patterns)
+        except Exception:
+            pass
+    return web.json_response({"tenant_id": tenant_id, "pattern": pattern, "action": action}, status=201)
+
+
+async def admin_delete_provider_allowlist(request: web.Request):
+    tenant_id = request.match_info["tenant_id"]
+    pattern = request.match_info["pattern"]
+    ok = await asyncio.to_thread(
+        memory.delete_provider_allowlist, tenant_id, pattern,
+    )
+    if not ok:
+        return _openai_error("not_found", "rule not found.", 404)
+    global FIREWALL
+    if FIREWALL is not None:
+        try:
+            fw_cfg = request.app["conf_mgr"].current().config.get(
+                "security", {},
+            ).get("provider_allowlist", {})
+            FIREWALL.load_from_config(fw_cfg)
+            db_rules = await asyncio.to_thread(memory.list_provider_allowlist)
+            FIREWALL.load_from_db(db_rules)
+        except Exception:
+            pass
+    return web.json_response({"deleted": True, "tenant_id": tenant_id, "pattern": pattern})
+
+
+async def admin_sync_host_firewall(request: web.Request):
+    """Manually trigger host firewall sync."""
+    if HOST_FIREWALL is None:
+        return _openai_error("no_firewall", "host firewall not configured.", 400)
+    try:
+        patterns = [r.pattern for r in (FIREWALL.list_rules() if FIREWALL else []) if r.tenant_id == "*"]
+        HOST_FIREWALL.sync(patterns)
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+    state = HOST_FIREWALL.state
+    return web.json_response({
+        "ok": state.in_sync,
+        "enabled": state.enabled,
+        "platform": state.platform,
+        "rules": [
+            {"pattern": r.pattern, "ip": r.ip, "rule_name": r.rule_name}
+            for r in state.rules
+        ],
+        "last_sync_error": state.last_sync_error,
+    })
+
+
+async def admin_security_status(request: web.Request):
+    """Single-shot status for the security tab: enforcer stats + host fw state + DB counts."""
+    enforcer_stats = FIREWALL.stats if FIREWALL else None
+    host_state = HOST_FIREWALL.state if HOST_FIREWALL else None
+    fw_cfg = request.app["conf_mgr"].current().config.get(
+        "security", {},
+    ).get("provider_allowlist", {})
+    return web.json_response({
+        "firewall": {
+            "enabled": bool(fw_cfg.get("enabled", False)),
+            "default_action": fw_cfg.get("default_action", "block"),
+            "in_process_stats": {
+                "checks_total": enforcer_stats.checks_total if enforcer_stats else 0,
+                "blocks_total": enforcer_stats.blocks_total if enforcer_stats else 0,
+                "alerts_total": enforcer_stats.alerts_total if enforcer_stats else 0,
+            } if enforcer_stats else None,
+            "rules_count": len(FIREWALL.list_rules()) if FIREWALL else 0,
+            "host_firewall": {
+                "enabled": host_state.enabled if host_state else False,
+                "platform": host_state.platform if host_state else "auto",
+                "in_sync": host_state.in_sync if host_state else False,
+                "rules_count": len(host_state.rules) if host_state else 0,
+                "last_sync_error": host_state.last_sync_error if host_state else None,
+            } if host_state else None,
+        },
+        "injection_profiles_loaded": len(INJECTION_PROFILES),
+    })
+
+
+async def admin_security_test(request: web.Request):
+    """Test endpoint — checks a URL/domain against the in-process firewall without
+    actually making an HTTP request. Useful for debugging."""
+    try:
+        body = await request.json()
+    except Exception:
+        return _openai_error("invalid_body", "JSON body required.", 400, error_type="invalid_request_error")
+    url = body.get("url")
+    tenant_id = body.get("tenant_id") or "anonymous"
+    if not url:
+        return _openai_error(
+            "invalid_request",
+            "url (str) is required.",
+            400,
+            error_type="invalid_request_error",
+        )
+    if FIREWALL is None:
+        return _openai_error("no_firewall", "firewall not initialized.", 400)
+    result = FIREWALL.check_outbound(url, tenant_id)
+    return web.json_response({
+        "url": url,
+        "tenant_id": tenant_id,
+        "allowed": result.allowed,
+        "action": result.action,
+        "matched_pattern": result.matched_pattern,
+        "reason": result.reason,
+    })
 
 
 async def health(request: web.Request):

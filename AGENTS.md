@@ -211,6 +211,66 @@ broken format strings, wrong column names) actually surface.
       `GET /admin/users/{tenant}/limits`. User-facing: `GET /usage`,
       `GET /usage/limits`. All limit/budget edits call `tenant_mgr.refresh`
       so the cached `TenantState` picks up the new values immediately.
+33. **Security Hub — firewall + injection detection (gateway-level + host-level)**:
+    - Three new tables: `security_events` (unified audit log: ts, tenant_id,
+      event_type, severity, reason, matched_pattern, query_preview,
+      endpoint_target, action_taken, request_metadata_json), `provider_allowlist`
+      (tenant_id + domain_pattern composite PK, action=allow|block), and
+      `injection_profiles` (DB-backed named regex sets with severity +
+      action + enabled + is_builtin). `flagged_inputs` gained `severity`,
+      `matched_profile`, `security_event_id` columns; `purge_old_flags` now
+      also purges `security_events`.
+    - `gateway.security.InjectionProfile.from_config()` validates severity
+      (low|medium|high|critical) and action (block|alert|log) at construction.
+      `check_injection_with_action(profiles)` returns the highest-severity
+      match across all enabled profiles; the action of the highest-severity
+      profile wins. `DEFAULT_INJECTION_PROFILES` (seeded at startup, marked
+      `is_builtin=True` so they can't be deleted) covers jailbreak,
+      role_override, context_escape, router_manipulation, data_exfiltration,
+      semantic_dos — all `action=block` except `data_exfiltration=alert`.
+    - Injection detection CAN now block requests — invariant #1 still
+      holds (routing is never altered), but a `block`-action profile returns
+      HTTP 400 with `error.code = injection_blocked` BEFORE any routing
+      decision happens. The routing pipeline below the injection check still
+      classifies normally when the prompt is allowed.
+    - `gateway/firewall.py` provides two layers:
+      - `DomainAllowlistEnforcer`: in-process. `load_from_config()` ingests
+        `security.provider_allowlist` from gateway-config.json;
+        `load_from_db()` layers DB-backed rules on top (config rules
+        preserved unless shadowed by a same-key DB rule). Tenant-specific
+        rules win over global rules; unknown domains fall back to
+        `default_action` (default: block). Loopback (localhost/127.0.0.1)
+        is always allowed to keep local ollama/mock endpoints reachable.
+      - `HostFirewallManager`: optional, off by default. Windows uses
+        `netsh advfirewall firewall add rule dir=out action=block
+        remoteip=<ip>`; Linux uses `iptables -A OUTPUT -d <ip> -j DROP
+        -m comment --comment <name>`. Both are idempotent on rule name
+        (sha256-derived). Requires admin/root; gracefully degrades to
+        disabled state when privileges are missing. `persist_on_shutdown`
+        controls whether rules survive a gateway exit.
+    - `EndpointClient.send(tenant_id=...)` runs the firewall check BEFORE
+      the breaker so a blocked request doesn't trip the breaker.
+      `stream_passthrough(tenant_id=...)` and `_forward_with_fallback`
+      thread tenant_id through. Localhost URLs bypass the check.
+    - `/admin/security/*` is a new admin sub-API:
+      `events`, `events/stats`, `injection-profiles` (CRUD),
+      `provider-allowlist` (CRUD), `sync-firewall` (manual host fw sync),
+      `status` (combined enforcer + host-fw state), `test` (dry-run a URL
+      against the enforcer). All require `admin` scope. CRUD on
+      injection-profiles and provider-allowlist updates the in-memory
+      enforcer/profiles immediately — no config reload required.
+    - Dashboard has a new "Security" tab (`gateway/dashboard/index.html`)
+      showing: 7-day event counts, critical/high severity count, in-process
+      blocks, profile count, firewall status (in-process + host), allowlist
+      CRUD, profile enable/disable, manual firewall sync, and the 20 most
+      recent events. Pure vanilla JS — no external deps.
+    - Config (gateway-config.json `security.provider_allowlist`):
+      `enabled=false` (default off — gateway still enforces the admin's
+      configured endpoints because each `EndpointPool.rebuild()` rebuilds
+      clients with `firewall_enforcer` set, but with `enabled=false` the
+      enforcer short-circuits to allow). `default_action='block'` is the
+      safest default — only configured provider domains work. `host_firewall`
+      sub-config controls system-level rules.
 
 
 ## Router model v2 — MLP heads, real embedding fine-tune, llm_plan swarm (UNVERIFIED)

@@ -164,6 +164,99 @@ GET /usage/limits    # the tenant's daily limits + remaining tokens
 `quality.record_quality_sample(endpoint, vertical, complexity, success)` is called by the reviewer worker after every labelled decision. Once a model accumulates ≥ 10 samples on a `(vertical, complexity)` bucket, its Wilson lower bound replaces the prior of 0.5. Over time, the cascade chain naturally shortens to the cheapest-fit model whose profile still meets the tenant's target.
 
 
+## Security Hub (firewall + prompt-injection prevention)
+
+Built-in security at the gateway/router layer — no MCP or external tools needed. Three concerns, one API surface (`/admin/security/*`) and one dashboard tab (`Security`).
+
+### Provider firewall — block non-configured domains
+
+Two layers, both shipped:
+
+1. **In-process firewall** (`gateway/firewall.py` → `DomainAllowlistEnforcer`). Every outbound HTTP request from the gateway is checked against an admin-curated allowlist before being sent. `default_action: "block"` (the safe default) means anything not on the allowlist gets a 403 with `error.code = firewall_blocked`. The allowlist is seeded from each `endpoints[*].base_url` at config load, so by default the gateway can ONLY talk to providers you have explicitly configured.
+2. **Host-level firewall** (`HostFirewallManager`). Optional, off by default. On Windows, `netsh advfirewall firewall add rule dir=out action=block remoteip=<ip>`. On Linux, `iptables -A OUTPUT -d <ip> -j DROP`. Both are idempotent on rule name, fail gracefully when the gateway lacks admin/root, and re-sync on config hot-reload.
+
+```jsonc
+"security": {
+  "provider_allowlist": {
+    "enabled": true,
+    "default_action": "block",          // "block" or "allow"
+    "global_patterns": [                // tenant_id="*"
+      "api.openai.com", "*.anthropic.com", "api.groq.com"
+    ],
+    "tenant_overrides": {
+      "alice": {"patterns": ["evil.com"], "action": "block"}
+    },
+    "host_firewall": {
+      "enabled": false,                 // off by default; needs admin/root
+      "platform": "auto",               // windows | linux | macos | auto
+      "persist_on_shutdown": false      // false = clear rules on graceful shutdown
+    }
+  }
+}
+```
+
+Loopback (`localhost`, `127.0.0.1`) always bypasses the check — your local ollama and the test mock endpoints keep working even when the firewall is fully armed. The firewall check runs before the breaker so blocked requests don't trip the breaker counter.
+
+### Prompt-injection prevention — block + alert
+
+Six built-in profiles seeded at startup (`security.DEFAULT_INJECTION_PROFILES`); each profile carries a `severity` (low|medium|high|critical) and an `action` (block|alert|log). The highest-severity match wins.
+
+| Profile | Severity | Action |
+|---|---|---|
+| `jailbreak` | critical | block |
+| `router_manipulation` | critical | block |
+| `role_override` | high | block |
+| `context_escape` | high | block |
+| `semantic_dos` | high | block |
+| `data_exfiltration` | medium | alert |
+
+`action=block` returns HTTP 400 with `error.code = injection_blocked` BEFORE any routing decision — the prompt never reaches the model. `action=alert` logs to `security_events` and continues routing. All matches also write to `flagged_inputs` for backwards-compat with the legacy audit trail. **Routing is never altered by injection signals** (invariant #1 still holds).
+
+You can add custom profiles at runtime without code changes:
+
+```bash
+curl -X POST http://localhost:8076/admin/security/injection-profiles \
+  -H "X-User-Id: admin" \
+  -d '{"name":"my_rules","regexes":["(?i)leak the system prompt"],"severity":"high","action":"block"}'
+
+curl -X PUT http://localhost:8076/admin/security/injection-profiles/7 \
+  -d '{"enabled": false}'
+
+curl -X DELETE http://localhost:8076/admin/security/injection-profiles/7
+```
+
+Built-in profiles can't be deleted (toggle `enabled=false` instead).
+
+### Admin API (`/admin/security/*`)
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/admin/security/events` | Audit log (filterable by `tenant_id`, `event_type`, `severity`, `since`, `limit`) |
+| `GET` | `/admin/security/events/stats` | Aggregated counts by type/severity, daily timeline, top patterns |
+| `GET` | `/admin/security/injection-profiles` | List profiles (`?enabled_only=true` filter) |
+| `POST` | `/admin/security/injection-profiles` | Create profile (admin scope) |
+| `PUT` | `/admin/security/injection-profiles/{id}` | Toggle/update profile |
+| `DELETE` | `/admin/security/injection-profiles/{id}` | Delete (refuses built-ins) |
+| `GET` | `/admin/security/provider-allowlist` | List rules (`?tenant_id=...`) |
+| `POST` | `/admin/security/provider-allowlist` | Add rule (tenant_id, pattern, action) |
+| `DELETE` | `/admin/security/provider-allowlist/{tenant_id}/{pattern}` | Remove rule |
+| `POST` | `/admin/security/sync-firewall` | Manually trigger host-firewall sync |
+| `GET` | `/admin/security/status` | Combined in-process + host-firewall state |
+| `POST` | `/admin/security/test` | Dry-run: check a URL against the enforcer |
+
+All endpoints require `admin` scope. CRUD operations on injection profiles and provider allowlist update the in-memory enforcer immediately — no config reload required.
+
+### Dashboard
+
+A new **Security** tab in `/dashboard` shows:
+- 7-day event counts (total, critical+high, in-process blocks, profile count)
+- Firewall status (in-process + host-fw rule counts, in-sync flag, last error)
+- Provider allowlist CRUD UI
+- Injection profile list with one-click toggle
+- Manual host-firewall sync button
+- 20 most recent security events (filterable per-tenant)
+
+
 ## Observational memory (Mastra pattern)
 
 The gateway is the chokepoint for every chat completion, which means it can implement the three-tier memory + observational memory pattern at the routing layer — no per-app memory work needed.

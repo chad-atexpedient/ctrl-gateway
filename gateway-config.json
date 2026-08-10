@@ -213,7 +213,7 @@
     }
   },
 
-  "_doc_security": "Prompt injection detection regexes. Matches are flagged in flagged_inputs and trigger a security_alert; routing is NEVER altered by the injection.",
+  "_doc_security": "Prompt injection detection regexes (legacy flat list, still scanned as fallback). The richer profile-based system is enabled via injection_profiles_enabled and managed at runtime via /admin/security/injection-profiles. Matches are flagged in flagged_inputs AND security_events; profiles with action='block' reject the request with HTTP 400. Routing is NEVER altered by injection signals.",
   "security": {
     "injection_regex": [
       "(?i)ignore (all )?(previous|above|prior) (instructions|prompts|rules)",
@@ -228,8 +228,34 @@
       "(?i)override (routing|the router)",
       "(?i)\\bdan\\b.*\\bjailbreak\\b"
     ],
+    "injection_profiles_enabled": true,
     "strip_control_tokens": true,
-    "_doc_flag_action": "When matched: log to flagged_inputs, continue normal routing (do NOT trust the injection, do NOT penalize the user beyond alerting)."
+    "_doc_flag_action": "When matched via profiles: action='block' returns 400, action='alert' logs to security_events, action='log' records at info level. Routing NEVER depends on injection signals.",
+    "_doc_provider_allowlist": "Gateway-level + host-level firewall for provider domains. enabled=false by default; turn on to enforce that the gateway only talks to admin-approved domains. global_patterns (tenant_id='*') seed the allowlist; tenant_overrides add per-tenant allow/block rules (DB rows layer on top). host_firewall requires admin/root privileges; on Windows it uses netsh, on Linux iptables. persist_on_shutdown=true leaves rules on the host after exit; false (default) clears them on graceful shutdown.",
+    "provider_allowlist": {
+      "enabled": false,
+      "default_action": "block",
+      "global_patterns": [
+        "localhost",
+        "127.0.0.1"
+      ],
+      "tenant_overrides": {},
+      "host_firewall": {
+        "enabled": false,
+        "platform": "auto",
+        "persist_on_shutdown": false
+      }
+    },
+    "_doc_pii_detection": "Optional regex-based PII detection in user prompts. enabled=false by default; when on, matches are logged to security_events with severity=medium and action_taken=alert. Does NOT block the request (PII in prompts is a logging concern, not a security boundary).",
+    "pii_detection": {
+      "enabled": false,
+      "patterns": [
+        "\\b\\d{3}-\\d{2}-\\d{4}\\b",
+        "\\b(?:\\d[ -]*?){13,16}\\b",
+        "\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Z|a-z]{2,}\\b"
+      ]
+    },
+    "semantic_dos_threshold": 8000
   },
 
   "_doc_drift": "Distribution drift detection. Tracks per-vertical request share week-over-week. Shift > threshold pauses auto-retrain.",

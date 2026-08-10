@@ -4,19 +4,26 @@ SQLAlchemy core (schema-only; no ORM) — same schema works for SQLite (single
 mode) and Postgres (multi mode). Driver is selected from db_url.
 
 Tables:
-  routing_log    — every routing decision (immutable append-only)
-  feedback       — human feedback (correct/wrong) for routing decisions
-  sessions       — working memory: previous tier per session
-  model_versions — registry of router checkpoint versions
-  checkpoints    — registry: per-version eval scores + rollback pointers
-  flagged_inputs — suspicious / injection-flagged prompts
-  users          — tenant config + current spend
-  usage_counters — token counts per user per period (for budget enforcement)
-  breakers       — per-endpoint circuit breaker state
-  review_queue   — async reviewer queue (Postgres LISTEN/NOTIFY in multi mode)
-  review_results — reviewer outputs (per-field labels)
-  curated_samples — high-agreement samples for training (versioned)
-  live_eval_set  — periodically sampled live-traffic eval
+  routing_log      — every routing decision (immutable append-only)
+  feedback         — human feedback (correct/wrong) for routing decisions
+  sessions         — working memory: previous tier per session
+  model_versions   — registry of router checkpoint versions
+  checkpoints      — registry: per-version eval scores + rollback pointers
+  flagged_inputs   — suspicious / injection-flagged prompts
+  security_events  — unified audit log for all security signals
+  provider_allowlist — per-tenant domain allowlist/block rules
+  injection_profiles — configurable injection rule sets (DB-backed)
+  users            — tenant config + current spend
+  usage_counters   — token counts per user per period (for budget enforcement)
+  plan_quotas      — subscription plan definitions
+  tenant_plans     — tenant → plan assignment
+  model_token_limits — per-model per-tenant daily token/USD caps
+  model_quality_profiles — calibrated success rate per model+vertical+complexity
+  breakers         — per-endpoint circuit breaker state
+  review_queue     — async reviewer queue (Postgres LISTEN/NOTIFY in multi mode)
+  review_results   — reviewer outputs (per-field labels)
+  curated_samples  — high-agreement samples for training (versioned)
+  live_eval_set    — periodically sampled live-traffic eval
 """
 from __future__ import annotations
 
@@ -151,9 +158,52 @@ flagged_inputs = Table(
     Column("tenant_id", String(64), index=True),
     Column("decision_id", Integer),
     Column("reason", String(32), index=True),
+    Column("severity", String(16), default="medium", index=True),
+    Column("matched_profile", String(64)),
     Column("matched_regex", String(256)),
     Column("query_preview", Text),
     Column("action_taken", String(32)),
+    Column("security_event_id", Integer, index=True),
+)
+
+security_events = Table(
+    "security_events",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("ts", DateTime, default=lambda: datetime.now(UTC), index=True),
+    Column("tenant_id", String(64), index=True),
+    Column("event_type", String(40), index=True),
+    Column("severity", String(16), default="medium", index=True),
+    Column("reason", Text),
+    Column("matched_pattern", String(256)),
+    Column("query_preview", Text),
+    Column("endpoint_target", String(256)),
+    Column("action_taken", String(32)),
+    Column("request_metadata_json", Text),
+)
+
+provider_allowlist = Table(
+    "provider_allowlist",
+    metadata,
+    Column("tenant_id", String(64), primary_key=True),
+    Column("domain_pattern", String(256), primary_key=True),
+    Column("action", String(16), default="allow"),
+    Column("created_at", DateTime, default=lambda: datetime.now(UTC)),
+    Column("notes", Text),
+)
+
+injection_profiles = Table(
+    "injection_profiles",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("name", String(64), unique=True),
+    Column("regexes_json", Text),
+    Column("severity", String(16), default="medium"),
+    Column("action", String(16), default="alert"),
+    Column("enabled", Boolean, default=True),
+    Column("is_builtin", Boolean, default=False),
+    Column("created_at", DateTime, default=lambda: datetime.now(UTC)),
+    Column("updated_at", DateTime, default=lambda: datetime.now(UTC)),
 )
 
 users = Table(
@@ -1786,16 +1836,23 @@ def mark_checkpoint_rolled_back(checkpoint_id: str, reason: str):
 def flag_input(
     tenant_id: str, decision_id: int | None, reason: str,
     matched_regex: str, query_preview: str, action_taken: str,
-):
+    severity: str = "medium",
+    matched_profile: str | None = None,
+    security_event_id: int | None = None,
+) -> int:
     with begin() as conn:
-        conn.execute(insert(flagged_inputs).values(
+        result = conn.execute(insert(flagged_inputs).values(
             tenant_id=tenant_id,
             decision_id=decision_id,
             reason=reason,
+            severity=severity,
+            matched_profile=matched_profile,
             matched_regex=matched_regex,
             query_preview=query_preview[:1000],
             action_taken=action_taken,
+            security_event_id=security_event_id,
         ))
+        return int(result.inserted_primary_key[0])
 
 
 def list_flagged(limit: int = 100, reason: str | None = None) -> list[dict]:
@@ -1812,6 +1869,390 @@ def list_flagged(limit: int = 100, reason: str | None = None) -> list[dict]:
                     item[key] = value.isoformat()
             out.append(item)
         return out
+
+
+# ---------------------------------------------------------------------------
+# Security events (unified audit log)
+# ---------------------------------------------------------------------------
+
+
+VALID_SECURITY_EVENT_TYPES = {
+    "injection_blocked",
+    "injection_alerted",
+    "provider_blocked",
+    "provider_alerted",
+    "rate_violation",
+    "budget_exhausted",
+    "semantic_dos",
+    "pii_detected",
+    "firewall_sync",
+}
+
+VALID_SECURITY_SEVERITIES = {"low", "medium", "high", "critical"}
+
+
+def record_security_event(
+    tenant_id: str,
+    event_type: str,
+    severity: str,
+    reason: str,
+    matched_pattern: str | None = None,
+    query_preview: str | None = None,
+    endpoint_target: str | None = None,
+    action_taken: str | None = None,
+    request_metadata: dict | None = None,
+) -> int:
+    """Write a security event. Returns the new id.
+
+    Validates event_type and severity are in the known sets; unknown values
+    are stored verbatim but logged so we can spot typos. Returns 0 on insert
+    failure rather than raising (callers are in the hot path).
+    """
+    if event_type not in VALID_SECURITY_EVENT_TYPES:
+        log.warning("record_security_event: unknown event_type=%s", event_type)
+    if severity not in VALID_SECURITY_SEVERITIES:
+        log.warning("record_security_event: unknown severity=%s", severity)
+    metadata_json = json.dumps(request_metadata) if request_metadata else None
+    try:
+        with begin() as conn:
+            result = conn.execute(insert(security_events).values(
+                tenant_id=tenant_id,
+                event_type=event_type,
+                severity=severity,
+                reason=reason[:1000],
+                matched_pattern=matched_pattern[:256] if matched_pattern else None,
+                query_preview=query_preview[:1000] if query_preview else None,
+                endpoint_target=endpoint_target[:256] if endpoint_target else None,
+                action_taken=action_taken[:32] if action_taken else None,
+                request_metadata_json=metadata_json,
+            ))
+            return int(result.inserted_primary_key[0])
+    except Exception as e:
+        log.warning("record_security_event failed: %s", e)
+        return 0
+
+
+def list_security_events(
+    tenant_id: str | None = None,
+    event_type: str | None = None,
+    severity: str | None = None,
+    since: datetime | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    with engine().connect() as conn:
+        q = select(security_events).order_by(security_events.c.id.desc()).limit(limit)
+        if tenant_id:
+            q = q.where(security_events.c.tenant_id == tenant_id)
+        if event_type:
+            q = q.where(security_events.c.event_type == event_type)
+        if severity:
+            q = q.where(security_events.c.severity == severity)
+        if since:
+            q = q.where(security_events.c.ts >= since)
+        rows = conn.execute(q).all()
+        out = []
+        for row in rows:
+            item = dict(row._mapping)
+            for key, value in item.items():
+                if isinstance(value, datetime):
+                    item[key] = value.isoformat()
+            out.append(item)
+        return out
+
+
+def security_event_stats(
+    tenant_id: str | None = None,
+    window_days: int = 7,
+) -> dict:
+    """Return aggregated security stats: counts by type/severity, daily timeline, top patterns."""
+    from datetime import timedelta
+    cutoff = datetime.now(UTC) - timedelta(days=max(1, window_days))
+    with engine().connect() as conn:
+        base = select(security_events).where(security_events.c.ts >= cutoff)
+        if tenant_id:
+            base = base.where(security_events.c.tenant_id == tenant_id)
+
+        # Count by type
+        by_type_q = select(
+            security_events.c.event_type,
+            func.count(security_events.c.id).label("cnt"),
+        ).where(security_events.c.ts >= cutoff)
+        if tenant_id:
+            by_type_q = by_type_q.where(security_events.c.tenant_id == tenant_id)
+        by_type_q = by_type_q.group_by(security_events.c.event_type)
+        by_type = {
+            row.event_type: int(row.cnt)
+            for row in conn.execute(by_type_q).all()
+        }
+
+        # Count by severity
+        by_severity_q = select(
+            security_events.c.severity,
+            func.count(security_events.c.id).label("cnt"),
+        ).where(security_events.c.ts >= cutoff)
+        if tenant_id:
+            by_severity_q = by_severity_q.where(security_events.c.tenant_id == tenant_id)
+        by_severity_q = by_severity_q.group_by(security_events.c.severity)
+        by_severity = {
+            row.severity: int(row.cnt)
+            for row in conn.execute(by_severity_q).all()
+        }
+
+        # Daily timeline (last N days)
+        timeline_q = select(
+            func.substr(security_events.c.ts.cast(type_=String), 1, 10).label("day"),
+            security_events.c.event_type,
+            func.count(security_events.c.id).label("cnt"),
+        ).where(security_events.c.ts >= cutoff)
+        if tenant_id:
+            timeline_q = timeline_q.where(security_events.c.tenant_id == tenant_id)
+        timeline_q = timeline_q.group_by("day", security_events.c.event_type)
+        timeline_rows = conn.execute(timeline_q).all()
+        timeline: dict = {}
+        for row in timeline_rows:
+            day = str(row.day)
+            timeline.setdefault(day, {})[row.event_type] = int(row.cnt)
+
+        # Top patterns (limit 10)
+        patterns_q = (
+            select(
+                security_events.c.matched_pattern,
+                func.count(security_events.c.id).label("cnt"),
+            )
+            .where(security_events.c.ts >= cutoff)
+            .where(security_events.c.matched_pattern.is_not(None))
+        )
+        if tenant_id:
+            patterns_q = patterns_q.where(security_events.c.tenant_id == tenant_id)
+        patterns_q = (
+            patterns_q.group_by(security_events.c.matched_pattern)
+            .order_by(func.count(security_events.c.id).desc())
+            .limit(10)
+        )
+        top_patterns = [
+            {"pattern": str(row.matched_pattern or ""), "count": int(row.cnt)}
+            for row in conn.execute(patterns_q).all()
+        ]
+
+        total_q = select(func.count(security_events.c.id)).where(
+            security_events.c.ts >= cutoff
+        )
+        if tenant_id:
+            total_q = total_q.where(security_events.c.tenant_id == tenant_id)
+        total = int(conn.execute(total_q).scalar() or 0)
+
+        return {
+            "total": total,
+            "by_type": by_type,
+            "by_severity": by_severity,
+            "timeline": timeline,
+            "top_patterns": top_patterns,
+            "window_days": window_days,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Provider allowlist
+# ---------------------------------------------------------------------------
+
+
+def upsert_provider_allowlist(
+    tenant_id: str,
+    domain_pattern: str,
+    action: str = "allow",
+    notes: str | None = None,
+) -> None:
+    """Insert or update a domain rule for a tenant. tenant_id='*' is global."""
+    if action not in ("allow", "block"):
+        raise ValueError(f"action must be 'allow' or 'block', got {action!r}")
+    with begin() as conn:
+        conn.execute(_insert_ignore(provider_allowlist,
+            tenant_id=tenant_id,
+            domain_pattern=domain_pattern,
+            action=action,
+            notes=notes,
+        ))
+        conn.execute(
+            update(provider_allowlist)
+            .where(provider_allowlist.c.tenant_id == tenant_id)
+            .where(provider_allowlist.c.domain_pattern == domain_pattern)
+            .values(action=action, notes=notes)
+        )
+
+
+def list_provider_allowlist(tenant_id: str | None = None) -> list[dict]:
+    with engine().connect() as conn:
+        q = select(provider_allowlist).order_by(
+            provider_allowlist.c.tenant_id,
+            provider_allowlist.c.domain_pattern,
+        )
+        if tenant_id:
+            q = q.where(provider_allowlist.c.tenant_id == tenant_id)
+        rows = conn.execute(q).all()
+        out = []
+        for row in rows:
+            item = dict(row._mapping)
+            for key, value in item.items():
+                if isinstance(value, datetime):
+                    item[key] = value.isoformat()
+            out.append(item)
+        return out
+
+
+def delete_provider_allowlist(tenant_id: str, domain_pattern: str) -> bool:
+    with begin() as conn:
+        result = conn.execute(
+            delete(provider_allowlist)
+            .where(provider_allowlist.c.tenant_id == tenant_id)
+            .where(provider_allowlist.c.domain_pattern == domain_pattern)
+        )
+        return (result.rowcount or 0) > 0
+
+
+# ---------------------------------------------------------------------------
+# Injection profiles (DB-backed, overrides config defaults)
+# ---------------------------------------------------------------------------
+
+
+def list_injection_profiles(enabled_only: bool = False) -> list[dict]:
+    with engine().connect() as conn:
+        q = select(injection_profiles).order_by(injection_profiles.c.id)
+        if enabled_only:
+            q = q.where(injection_profiles.c.enabled == True)  # noqa: E712
+        rows = conn.execute(q).all()
+        out = []
+        for row in rows:
+            item = dict(row._mapping)
+            for key, value in item.items():
+                if isinstance(value, datetime):
+                    item[key] = value.isoformat()
+            # Parse regexes_json for convenience
+            if item.get("regexes_json"):
+                try:
+                    item["regexes"] = json.loads(item["regexes_json"])
+                except (json.JSONDecodeError, TypeError):
+                    item["regexes"] = []
+            else:
+                item["regexes"] = []
+            out.append(item)
+        return out
+
+
+def get_injection_profile(profile_id: int) -> dict | None:
+    with engine().connect() as conn:
+        row = conn.execute(
+            select(injection_profiles).where(injection_profiles.c.id == profile_id)
+        ).first()
+        if not row:
+            return None
+        item = dict(row._mapping)
+        for key, value in item.items():
+            if isinstance(value, datetime):
+                item[key] = value.isoformat()
+        if item.get("regexes_json"):
+            try:
+                item["regexes"] = json.loads(item["regexes_json"])
+            except (json.JSONDecodeError, TypeError):
+                item["regexes"] = []
+        else:
+            item["regexes"] = []
+        return item
+
+
+def create_injection_profile(
+    name: str,
+    regexes: list[str],
+    severity: str = "medium",
+    action: str = "alert",
+    enabled: bool = True,
+    is_builtin: bool = False,
+) -> int:
+    if severity not in VALID_SECURITY_SEVERITIES:
+        raise ValueError(f"invalid severity: {severity}")
+    if action not in ("block", "alert", "log"):
+        raise ValueError(f"action must be block|alert|log, got {action!r}")
+    with begin() as conn:
+        result = conn.execute(insert(injection_profiles).values(
+            name=name,
+            regexes_json=json.dumps(regexes),
+            severity=severity,
+            action=action,
+            enabled=enabled,
+            is_builtin=is_builtin,
+        ))
+        return int(result.inserted_primary_key[0])
+
+
+def update_injection_profile(
+    profile_id: int,
+    name: str | None = None,
+    regexes: list[str] | None = None,
+    severity: str | None = None,
+    action: str | None = None,
+    enabled: bool | None = None,
+) -> bool:
+    values: dict = {"updated_at": datetime.now(UTC)}
+    if name is not None:
+        values["name"] = name
+    if regexes is not None:
+        values["regexes_json"] = json.dumps(regexes)
+    if severity is not None:
+        if severity not in VALID_SECURITY_SEVERITIES:
+            raise ValueError(f"invalid severity: {severity}")
+        values["severity"] = severity
+    if action is not None:
+        if action not in ("block", "alert", "log"):
+            raise ValueError(f"action must be block|alert|log, got {action!r}")
+        values["action"] = action
+    if enabled is not None:
+        values["enabled"] = enabled
+    with begin() as conn:
+        result = conn.execute(
+            update(injection_profiles).where(injection_profiles.c.id == profile_id).values(**values)
+        )
+        return (result.rowcount or 0) > 0
+
+
+def delete_injection_profile(profile_id: int) -> bool:
+    """Delete a profile. Refuses to delete built-in profiles (is_builtin=True)."""
+    with begin() as conn:
+        row = conn.execute(
+            select(injection_profiles).where(injection_profiles.c.id == profile_id)
+        ).first()
+        if not row:
+            return False
+        if row.is_builtin:
+            raise ValueError("cannot delete built-in injection profile")
+        result = conn.execute(
+            delete(injection_profiles).where(injection_profiles.c.id == profile_id)
+        )
+        return (result.rowcount or 0) > 0
+
+
+def seed_default_injection_profiles(defaults: list[dict]) -> int:
+    """Seed builtin profiles. Idempotent (skips if name already exists).
+
+    Each entry in `defaults` is a dict with keys: name, regexes (list[str]),
+    severity, action. Returns the number of profiles inserted.
+    """
+    inserted = 0
+    with begin() as conn:
+        for entry in defaults:
+            existing = conn.execute(
+                select(injection_profiles).where(injection_profiles.c.name == entry["name"])
+            ).first()
+            if existing:
+                continue
+            conn.execute(insert(injection_profiles).values(
+                name=entry["name"],
+                regexes_json=json.dumps(entry.get("regexes", [])),
+                severity=entry.get("severity", "medium"),
+                action=entry.get("action", "alert"),
+                enabled=entry.get("enabled", True),
+                is_builtin=True,
+            ))
+            inserted += 1
+    return inserted
 
 
 def review_stats(tenant_id: str | None = None) -> dict:
@@ -1919,7 +2360,7 @@ def purge_old_traces(days: int) -> int:
 
 
 def purge_old_flags(days: int) -> int:
-    """Delete flagged_inputs older than `days` (config logging.flagged_retention_days)."""
+    """Delete flagged_inputs AND security_events older than `days` (config logging.flagged_retention_days)."""
     if days <= 0:
         return 0
     from datetime import timedelta
@@ -1929,7 +2370,10 @@ def purge_old_flags(days: int) -> int:
             result = conn.execute(
                 delete(flagged_inputs).where(flagged_inputs.c.ts < cutoff)
             )
-        return result.rowcount or 0
+            events_result = conn.execute(
+                delete(security_events).where(security_events.c.ts < cutoff)
+            )
+        return (result.rowcount or 0) + (events_result.rowcount or 0)
     except Exception as e:
         log.warning("purge_old_flags failed: %s", e)
         return 0

@@ -70,6 +70,7 @@ nav .right{margin-left:auto;display:flex;align-items:center;gap:8px;padding:8px 
     <div class="tab" data-tab="keys" onclick="showTab('keys')">Keys</div>
     <div class="tab" data-tab="routing" onclick="showTab('routing')">Routing</div>
     <div class="tab" data-tab="flywheel" onclick="showTab('flywheel')">Flywheel</div>
+    <div class="tab" data-tab="security" onclick="showTab('security')">Security</div>
     <div class="right">
       <span id="key-status" style="font-size:11px;opacity:.6"></span>
       <button class="btn sm" onclick="promptForKey()">Set Key</button>
@@ -154,6 +155,64 @@ nav .right{margin-left:auto;display:flex;align-items:center;gap:8px;padding:8px 
     <h2>Routing Tiers</h2>
     <p style="color:var(--dim);margin-bottom:16px">Each tier maps to provider endpoints. The cost-first policy picks the cheapest tier with sufficient capability.</p>
     <div id="tiers-container"></div>
+  </section>
+</div>
+
+<!-- ===== SECURITY TAB ===== -->
+<div class="tab-content" id="tab-security">
+  <section>
+    <h2>Security Hub</h2>
+    <p style="color:var(--dim);font-size:12px;margin-bottom:16px">
+      In-process firewall + host-level firewall rules + prompt-injection detection. All controls are also exposed under <code>/admin/security/*</code>.
+    </p>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:16px;margin-bottom:16px">
+      <div class="card"><div class="title">Security Events (7d)</div><div style="font-size:28px;font-weight:700;color:var(--accent)" id="sec-total">—</div></div>
+      <div class="card"><div class="title">Critical / High</div><div style="font-size:28px;font-weight:700;color:var(--red)" id="sec-critical">—</div></div>
+      <div class="card"><div class="title">In-Process Blocks</div><div style="font-size:28px;font-weight:700;color:var(--accent2)" id="sec-blocks">—</div></div>
+      <div class="card"><div class="title">Injection Profiles</div><div style="font-size:28px;font-weight:700;color:var(--t2)" id="sec-profiles">—</div></div>
+    </div>
+
+    <div class="card">
+      <h3>Firewall Status</h3>
+      <div id="sec-firewall-status" style="font-size:13px">—</div>
+      <div style="margin-top:12px">
+        <button class="btn" onclick="syncHostFirewall()">Sync Host Firewall Now</button>
+        <button class="btn" onclick="loadSecurityTab()">Refresh</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Provider Allowlist</h3>
+      <p style="color:var(--dim);font-size:11px;margin-bottom:12px">
+        Patterns use exact match (e.g. <code>api.openai.com</code>) or wildcard prefix (e.g. <code>*.anthropic.com</code>).
+        Use <code>tenant_id = *</code> for global rules.
+      </p>
+      <div style="display:flex;gap:8px;margin-bottom:12px">
+        <input id="sec-rule-tenant" placeholder="tenant_id (default: *)" style="width:140px">
+        <input id="sec-rule-pattern" placeholder="api.openai.com or *.anthropic.com" style="flex:1">
+        <select id="sec-rule-action"><option value="allow">allow</option><option value="block">block</option></select>
+        <button class="btn primary" onclick="addAllowlistRule()">Add</button>
+      </div>
+      <table><thead><tr><th>Tenant</th><th>Pattern</th><th>Action</th><th>Action</th></tr></thead>
+      <tbody id="sec-allowlist-table"></tbody></table>
+    </div>
+
+    <div class="card">
+      <h3>Injection Profiles</h3>
+      <p style="color:var(--dim);font-size:11px;margin-bottom:12px">
+        Profiles match user prompts via regexes; severity=critical|high|medium|low, action=block|alert|log.
+        Built-in profiles can't be deleted; toggle <code>enabled</code> to deactivate.
+      </p>
+      <table><thead><tr><th>Name</th><th>Severity</th><th>Action</th><th>Enabled</th><th>Regexes</th><th>Built-in</th><th>Toggle</th></tr></thead>
+      <tbody id="sec-profiles-table"></tbody></table>
+    </div>
+
+    <div class="card">
+      <h3>Recent Security Events</h3>
+      <table><thead><tr><th>Time</th><th>Tenant</th><th>Type</th><th>Severity</th><th>Reason</th><th>Action</th></tr></thead>
+      <tbody id="sec-events-table"></tbody></table>
+    </div>
   </section>
 </div>
 
@@ -281,6 +340,128 @@ function showTab(name) {
   if (name === 'keys') loadKeys();
   if (name === 'routing') loadTiers();
   if (name === 'flywheel') loadFlywheel();
+  if (name === 'security') loadSecurityTab();
+}
+
+// ---- SECURITY TAB ----
+async function loadSecurityTab() {
+  const [stats, status, allowlist, profiles, events] = await Promise.all([
+    fetchJSON('/admin/security/events/stats'),
+    fetchJSON('/admin/security/status'),
+    fetchJSON('/admin/security/provider-allowlist'),
+    fetchJSON('/admin/security/injection-profiles'),
+    fetchJSON('/admin/security/events?limit=20'),
+  ]);
+  if (stats) {
+    document.getElementById('sec-total').textContent = stats.total || 0;
+    const crit = (stats.by_severity?.critical || 0) + (stats.by_severity?.high || 0);
+    document.getElementById('sec-critical').textContent = crit;
+  }
+  if (status) {
+    document.getElementById('sec-blocks').textContent = status.firewall?.in_process_stats?.blocks_total || 0;
+    document.getElementById('sec-profiles').textContent = status.injection_profiles_loaded || 0;
+    const f = status.firewall || {};
+    const hf = f.host_firewall || {};
+    let s = '';
+    s += '<div><b>In-process:</b> ' + (f.enabled ? 'enabled' : 'disabled') + ' (default: ' + f.default_action + ', rules: ' + f.rules_count + ')</div>';
+    s += '<div><b>Host:</b> ' + (hf.enabled ? 'enabled' : 'disabled') + ' (platform: ' + hf.platform + ', in_sync: ' + hf.in_sync + ', rules: ' + hf.rules_count + ')</div>';
+    if (hf.last_sync_error) s += '<div style="color:var(--red);font-size:11px">last error: ' + hf.last_sync_error + '</div>';
+    document.getElementById('sec-firewall-status').innerHTML = s;
+  }
+  if (allowlist) {
+    const tbody = document.getElementById('sec-allowlist-table');
+    tbody.innerHTML = '';
+    (allowlist.rules || []).forEach(r => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td>' + escapeHtml(r.tenant_id) + '</td>' +
+        '<td><code>' + escapeHtml(r.domain_pattern) + '</code></td>' +
+        '<td>' + escapeHtml(r.action) + '</td>' +
+        '<td><button class="btn sm" onclick="deleteAllowlistRule(\'' + escapeHtml(r.tenant_id) + '\', \'' + escapeHtml(r.domain_pattern) + '\')">Delete</button></td>';
+      tbody.appendChild(tr);
+    });
+    if (!(allowlist.rules || []).length) {
+      tbody.innerHTML = '<tr><td colspan="4" style="color:var(--dim);font-style:italic">No rules yet.</td></tr>';
+    }
+  }
+  if (profiles) {
+    const tbody = document.getElementById('sec-profiles-table');
+    tbody.innerHTML = '';
+    (profiles.profiles || []).forEach(p => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td>' + escapeHtml(p.name) + '</td>' +
+        '<td>' + escapeHtml(p.severity) + '</td>' +
+        '<td>' + escapeHtml(p.action) + '</td>' +
+        '<td>' + (p.enabled ? 'yes' : 'no') + '</td>' +
+        '<td style="font-size:10px;color:var(--dim)">' + (p.regexes ? p.regexes.length : 0) + ' pattern(s)</td>' +
+        '<td>' + (p.is_builtin ? 'yes' : 'no') + '</td>' +
+        '<td><button class="btn sm" onclick="toggleProfile(' + p.id + ', ' + (p.enabled ? 'false' : 'true') + ')">' + (p.enabled ? 'Disable' : 'Enable') + '</button></td>';
+      tbody.appendChild(tr);
+    });
+    if (!(profiles.profiles || []).length) {
+      tbody.innerHTML = '<tr><td colspan="7" style="color:var(--dim);font-style:italic">No profiles yet.</td></tr>';
+    }
+  }
+  if (events) {
+    const tbody = document.getElementById('sec-events-table');
+    tbody.innerHTML = '';
+    (events.events || []).slice(0, 20).forEach(e => {
+      const tr = document.createElement('tr');
+      const sev = escapeHtml(e.severity || '');
+      const sevColor = sev === 'critical' ? 'var(--red)' : sev === 'high' ? 'var(--red)' : sev === 'medium' ? 'var(--accent)' : 'var(--dim)';
+      tr.innerHTML = '<td style="font-size:10px">' + escapeHtml(e.ts || '') + '</td>' +
+        '<td>' + escapeHtml(e.tenant_id || '') + '</td>' +
+        '<td>' + escapeHtml(e.event_type || '') + '</td>' +
+        '<td style="color:' + sevColor + '">' + sev + '</td>' +
+        '<td>' + escapeHtml((e.reason || '').slice(0, 80)) + '</td>' +
+        '<td>' + escapeHtml(e.action_taken || '') + '</td>';
+      tbody.appendChild(tr);
+    });
+    if (!(events.events || []).length) {
+      tbody.innerHTML = '<tr><td colspan="6" style="color:var(--dim);font-style:italic">No events yet.</td></tr>';
+    }
+  }
+}
+
+async function addAllowlistRule() {
+  const tenant = document.getElementById('sec-rule-tenant').value || '*';
+  const pattern = document.getElementById('sec-rule-pattern').value.trim();
+  const action = document.getElementById('sec-rule-action').value;
+  if (!pattern) { alert('pattern is required'); return; }
+  const r = await fetchJSON('/admin/security/provider-allowlist', {
+    method: 'POST',
+    body: JSON.stringify({ tenant_id: tenant, pattern, action }),
+  });
+  if (r) {
+    document.getElementById('sec-rule-pattern').value = '';
+    loadSecurityTab();
+  }
+}
+
+async function deleteAllowlistRule(tenant, pattern) {
+  if (!confirm('Delete rule ' + tenant + ' / ' + pattern + '?')) return;
+  const r = await fetchJSON('/admin/security/provider-allowlist/' + encodeURIComponent(tenant) + '/' + encodeURIComponent(pattern), { method: 'DELETE' });
+  if (r) loadSecurityTab();
+}
+
+async function toggleProfile(id, enabled) {
+  const r = await fetchJSON('/admin/security/injection-profiles/' + id, {
+    method: 'PUT',
+    body: JSON.stringify({ enabled: enabled === 'true' }),
+  });
+  if (r) loadSecurityTab();
+}
+
+async function syncHostFirewall() {
+  const r = await fetchJSON('/admin/security/sync-firewall', { method: 'POST' });
+  if (r) {
+    alert(r.in_sync ? 'Host firewall synced (' + r.rules.length + ' rules)' : 'Sync failed: ' + r.last_sync_error);
+    loadSecurityTab();
+  }
+}
+
+function escapeHtml(s) {
+  if (s == null) return '';
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 }
 
 // ---- LIVE TAB ----
