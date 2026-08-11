@@ -24,6 +24,15 @@ Tables:
   review_results   — reviewer outputs (per-field labels)
   curated_samples  — high-agreement samples for training (versioned)
   live_eval_set    — periodically sampled live-traffic eval
+  plugins          — gateway plugin registry (manifest-based connectors)
+  a2a_agents       — external A2A agent registry (jsonrpc/openai/anthropic/custom)
+  a2a_virtual_servers — named bundles of A2A agents
+  a2a_metrics      — per-agent invocation history (success rate, latency)
+  prompt_templates — DB-backed prompt template registry
+  webhooks         — webhook subscribers (fan-out from event bus)
+  webhook_deliveries — delivery log (success/failure/response)
+  contextforge_sync_log — ContextForge connector sync history
+  federated_tools  — tools federated from external sources (ContextForge, etc.)
 """
 from __future__ import annotations
 
@@ -389,6 +398,154 @@ trainer_state = Table(
     metadata,
     Column("key", String(64), primary_key=True),
     Column("value", Text),
+)
+
+
+# ----- Plugin system, A2A registry, prompt templates, webhooks, cache -----
+
+
+plugins = Table(
+    "plugins",
+    metadata,
+    Column("name", String(64), primary_key=True),
+    Column("version", String(32)),
+    Column("description", Text),
+    Column("prefix", String(128)),
+    Column("module_path", String(256)),
+    Column("config_json", Text),
+    Column("enabled", Boolean, default=True),
+    Column("loaded", Boolean, default=False),
+    Column("loaded_at", DateTime),
+    Column("error", Text),
+    Column("is_builtin", Boolean, default=False),
+    Column("created_at", DateTime, default=lambda: datetime.now(UTC)),
+    Column("updated_at", DateTime, default=lambda: datetime.now(UTC)),
+)
+
+
+a2a_agents = Table(
+    "a2a_agents",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("name", String(64), unique=True),
+    Column("endpoint_url", String(256)),
+    Column("agent_type", String(32)),
+    Column("description", Text),
+    Column("auth_type", String(32), default="none"),
+    Column("auth_value_encrypted", Text),
+    Column("enabled", Boolean, default=True),
+    Column("protocol_version", String(16)),
+    Column("capabilities_json", Text),
+    Column("config_json", Text),
+    Column("tags_json", Text),
+    Column("created_at", DateTime, default=lambda: datetime.now(UTC)),
+    Column("updated_at", DateTime, default=lambda: datetime.now(UTC)),
+)
+
+
+a2a_virtual_servers = Table(
+    "a2a_virtual_servers",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("name", String(64), unique=True),
+    Column("description", Text),
+    Column("associated_agents_json", Text),
+    Column("enabled", Boolean, default=True),
+    Column("created_at", DateTime, default=lambda: datetime.now(UTC)),
+    Column("updated_at", DateTime, default=lambda: datetime.now(UTC)),
+)
+
+
+a2a_metrics = Table(
+    "a2a_metrics",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("agent_id", Integer, ForeignKey("a2a_agents.id"), index=True),
+    Column("ts", DateTime, default=lambda: datetime.now(UTC), index=True),
+    Column("tenant_id", String(64), index=True),
+    Column("success", Boolean),
+    Column("latency_ms", Float),
+    Column("error", Text),
+    Column("interaction_type", String(32)),
+)
+
+
+prompt_templates = Table(
+    "prompt_templates",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("name", String(64), unique=True),
+    Column("description", Text),
+    Column("template_text", Text),
+    Column("variables_json", Text),
+    Column("category", String(64), index=True),
+    Column("enabled", Boolean, default=True),
+    Column("is_builtin", Boolean, default=False),
+    Column("version", Integer, default=1),
+    Column("source", String(32), default="manual"),
+    Column("created_at", DateTime, default=lambda: datetime.now(UTC)),
+    Column("updated_at", DateTime, default=lambda: datetime.now(UTC)),
+)
+
+
+webhooks = Table(
+    "webhooks",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("name", String(64), unique=True),
+    Column("url", String(512)),
+    Column("events_json", Text),
+    Column("secret", String(128)),
+    Column("enabled", Boolean, default=True),
+    Column("description", Text),
+    Column("created_at", DateTime, default=lambda: datetime.now(UTC)),
+    Column("updated_at", DateTime, default=lambda: datetime.now(UTC)),
+)
+
+
+webhook_deliveries = Table(
+    "webhook_deliveries",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("webhook_id", Integer, ForeignKey("webhooks.id"), index=True),
+    Column("ts", DateTime, default=lambda: datetime.now(UTC), index=True),
+    Column("event_type", String(64), index=True),
+    Column("tenant_id", String(64), index=True),
+    Column("status_code", Integer),
+    Column("response_body", Text),
+    Column("payload_json", Text),
+    Column("error", Text),
+    Column("attempt", Integer, default=1),
+    Column("duration_ms", Float),
+)
+
+
+contextforge_sync_log = Table(
+    "contextforge_sync_log",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("ts", DateTime, default=lambda: datetime.now(UTC), index=True),
+    Column("sync_type", String(32), index=True),
+    Column("source", String(256)),
+    Column("items_synced", Integer, default=0),
+    Column("items_added", Integer, default=0),
+    Column("items_updated", Integer, default=0),
+    Column("errors_json", Text),
+    Column("duration_ms", Float),
+)
+
+
+federated_tools = Table(
+    "federated_tools",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("name", String(128), unique=True),
+    Column("source", String(32), index=True),
+    Column("source_url", String(512)),
+    Column("tool_json", Text),
+    Column("enabled", Boolean, default=True),
+    Column("last_synced", DateTime),
+    Column("created_at", DateTime, default=lambda: datetime.now(UTC)),
 )
 
 
@@ -2377,3 +2534,866 @@ def purge_old_flags(days: int) -> int:
     except Exception as e:
         log.warning("purge_old_flags failed: %s", e)
         return 0
+
+
+# =====================================================================
+# Plugin system — CRUD for gateway plugins (manifest-based connectors)
+# =====================================================================
+
+
+def upsert_plugin(
+    name: str,
+    version: str | None = None,
+    description: str | None = None,
+    prefix: str | None = None,
+    module_path: str | None = None,
+    config: dict | None = None,
+    enabled: bool = True,
+    is_builtin: bool = False,
+) -> dict:
+    """Insert or update a plugin record. Returns the resulting row as a dict."""
+    config_json = json.dumps(config or {})
+    now = datetime.now(UTC)
+    try:
+        with begin() as conn:
+            existing = conn.execute(
+                select(plugins).where(plugins.c.name == name)
+            ).mappings().first()
+            if existing:
+                conn.execute(
+                    update(plugins)
+                    .where(plugins.c.name == name)
+                    .values(
+                        version=version or existing["version"],
+                        description=description or existing["description"],
+                        prefix=prefix or existing["prefix"],
+                        module_path=module_path or existing["module_path"],
+                        config_json=config_json,
+                        enabled=enabled,
+                        is_builtin=is_builtin or existing["is_builtin"],
+                        updated_at=now,
+                    )
+                )
+            else:
+                conn.execute(
+                    insert(plugins).values(
+                        name=name,
+                        version=version or "0.0.0",
+                        description=description or "",
+                        prefix=prefix or "",
+                        module_path=module_path or "",
+                        config_json=config_json,
+                        enabled=enabled,
+                        loaded=False,
+                        is_builtin=is_builtin,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+        row = get_plugin(name)
+        return row or {}
+    except Exception as e:
+        log.warning("upsert_plugin failed: %s", e)
+        return {}
+
+
+def get_plugin(name: str) -> dict | None:
+    try:
+        with begin() as conn:
+            row = conn.execute(
+                select(plugins).where(plugins.c.name == name)
+            ).mappings().first()
+            return dict(row) if row else None
+    except Exception as e:
+        log.warning("get_plugin failed: %s", e)
+        return None
+
+
+def list_plugins(enabled_only: bool = False) -> list[dict]:
+    try:
+        with begin() as conn:
+            stmt = select(plugins)
+            if enabled_only:
+                stmt = stmt.where(plugins.c.enabled.is_(True))
+            stmt = stmt.order_by(plugins.c.name.asc())
+            return [dict(r) for r in conn.execute(stmt).mappings().all()]
+    except Exception as e:
+        log.warning("list_plugins failed: %s", e)
+        return []
+
+
+def set_plugin_loaded(
+    name: str,
+    loaded: bool,
+    loaded_at: datetime | None = None,
+    error: str | None = None,
+) -> bool:
+    try:
+        with begin() as conn:
+            result = conn.execute(
+                update(plugins)
+                .where(plugins.c.name == name)
+                .values(
+                    loaded=loaded,
+                    loaded_at=loaded_at,
+                    error=error,
+                    updated_at=datetime.now(UTC),
+                )
+            )
+        return bool(result.rowcount and result.rowcount > 0)
+    except Exception as e:
+        log.warning("set_plugin_loaded failed: %s", e)
+        return False
+
+
+def set_plugin_enabled(name: str, enabled: bool) -> bool:
+    try:
+        with begin() as conn:
+            result = conn.execute(
+                update(plugins)
+                .where(plugins.c.name == name)
+                .values(enabled=enabled, updated_at=datetime.now(UTC))
+            )
+        return bool(result.rowcount and result.rowcount > 0)
+    except Exception as e:
+        log.warning("set_plugin_enabled failed: %s", e)
+        return False
+
+
+def delete_plugin(name: str) -> bool:
+    """Refuse to delete builtin plugins."""
+    try:
+        with begin() as conn:
+            row = conn.execute(
+                select(plugins.c.is_builtin).where(plugins.c.name == name)
+            ).first()
+            if row and row[0]:
+                return False
+            conn.execute(delete(plugins).where(plugins.c.name == name))
+            return True
+    except Exception as e:
+        log.warning("delete_plugin failed: %s", e)
+        return False
+
+
+# =====================================================================
+# A2A agent registry — CRUD for external A2A agents
+# =====================================================================
+
+
+VALID_A2A_AGENT_TYPES = {"jsonrpc", "openai", "anthropic", "custom"}
+VALID_A2A_AUTH_TYPES = {"none", "api_key", "bearer", "oauth"}
+
+
+def upsert_a2a_agent(
+    name: str,
+    endpoint_url: str,
+    agent_type: str,
+    description: str = "",
+    auth_type: str = "none",
+    auth_value: str | None = None,
+    protocol_version: str | None = None,
+    capabilities: dict | None = None,
+    config: dict | None = None,
+    tags: list[str] | None = None,
+    enabled: bool = True,
+) -> dict:
+    """Insert or update an A2A agent. auth_value is stored as-is (callers
+    should encrypt out-of-band if needed — gateway reads plaintext).
+    """
+    if agent_type not in VALID_A2A_AGENT_TYPES:
+        return {"error": f"invalid agent_type: {agent_type}"}
+    if auth_type not in VALID_A2A_AUTH_TYPES:
+        return {"error": f"invalid auth_type: {auth_type}"}
+    now = datetime.now(UTC)
+    capabilities_json = json.dumps(capabilities or {})
+    config_json = json.dumps(config or {})
+    tags_json = json.dumps(tags or [])
+    try:
+        with begin() as conn:
+            existing = conn.execute(
+                select(a2a_agents).where(a2a_agents.c.name == name)
+            ).mappings().first()
+            if existing:
+                conn.execute(
+                    update(a2a_agents)
+                    .where(a2a_agents.c.name == name)
+                    .values(
+                        endpoint_url=endpoint_url,
+                        agent_type=agent_type,
+                        description=description,
+                        auth_type=auth_type,
+                        auth_value_encrypted=auth_value or existing["auth_value_encrypted"],
+                        protocol_version=protocol_version or existing["protocol_version"],
+                        capabilities_json=capabilities_json,
+                        config_json=config_json,
+                        tags_json=tags_json,
+                        enabled=enabled,
+                        updated_at=now,
+                    )
+                )
+            else:
+                conn.execute(
+                    insert(a2a_agents).values(
+                        name=name,
+                        endpoint_url=endpoint_url,
+                        agent_type=agent_type,
+                        description=description,
+                        auth_type=auth_type,
+                        auth_value_encrypted=auth_value or "",
+                        protocol_version=protocol_version or "1.0",
+                        capabilities_json=capabilities_json,
+                        config_json=config_json,
+                        tags_json=tags_json,
+                        enabled=enabled,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+        row = get_a2a_agent_by_name(name)
+        return row or {}
+    except Exception as e:
+        log.warning("upsert_a2a_agent failed: %s", e)
+        return {"error": str(e)}
+
+
+def get_a2a_agent(agent_id: int) -> dict | None:
+    try:
+        with begin() as conn:
+            row = conn.execute(
+                select(a2a_agents).where(a2a_agents.c.id == agent_id)
+            ).mappings().first()
+            return dict(row) if row else None
+    except Exception as e:
+        log.warning("get_a2a_agent failed: %s", e)
+        return None
+
+
+def get_a2a_agent_by_name(name: str) -> dict | None:
+    try:
+        with begin() as conn:
+            row = conn.execute(
+                select(a2a_agents).where(a2a_agents.c.name == name)
+            ).mappings().first()
+            return dict(row) if row else None
+    except Exception as e:
+        log.warning("get_a2a_agent_by_name failed: %s", e)
+        return None
+
+
+def list_a2a_agents(enabled_only: bool = False) -> list[dict]:
+    try:
+        with begin() as conn:
+            stmt = select(a2a_agents)
+            if enabled_only:
+                stmt = stmt.where(a2a_agents.c.enabled.is_(True))
+            stmt = stmt.order_by(a2a_agents.c.name.asc())
+            return [dict(r) for r in conn.execute(stmt).mappings().all()]
+    except Exception as e:
+        log.warning("list_a2a_agents failed: %s", e)
+        return []
+
+
+def set_a2a_agent_enabled(agent_id: int, enabled: bool) -> bool:
+    try:
+        with begin() as conn:
+            result = conn.execute(
+                update(a2a_agents)
+                .where(a2a_agents.c.id == agent_id)
+                .values(enabled=enabled, updated_at=datetime.now(UTC))
+            )
+        return bool(result.rowcount and result.rowcount > 0)
+    except Exception as e:
+        log.warning("set_a2a_agent_enabled failed: %s", e)
+        return False
+
+
+def delete_a2a_agent(agent_id: int) -> bool:
+    try:
+        with begin() as conn:
+            conn.execute(delete(a2a_metrics).where(a2a_metrics.c.agent_id == agent_id))
+            conn.execute(delete(a2a_agents).where(a2a_agents.c.id == agent_id))
+            return True
+    except Exception as e:
+        log.warning("delete_a2a_agent failed: %s", e)
+        return False
+
+
+def record_a2a_metric(
+    agent_id: int,
+    tenant_id: str,
+    success: bool,
+    latency_ms: float,
+    interaction_type: str = "invoke",
+    error: str | None = None,
+) -> int:
+    try:
+        with begin() as conn:
+            result = conn.execute(
+                insert(a2a_metrics).values(
+                    agent_id=agent_id,
+                    tenant_id=tenant_id,
+                    success=success,
+                    latency_ms=latency_ms,
+                    interaction_type=interaction_type,
+                    error=error or "",
+                )
+            )
+            return int(result.inserted_primary_key[0]) if result.inserted_primary_key else 0
+    except Exception as e:
+        log.warning("record_a2a_metric failed: %s", e)
+        return 0
+
+
+def a2a_agent_metrics_summary(agent_id: int) -> dict:
+    try:
+        with begin() as conn:
+            total = conn.execute(
+                select(func.count()).select_from(a2a_metrics)
+                .where(a2a_metrics.c.agent_id == agent_id)
+            ).scalar() or 0
+            ok = conn.execute(
+                select(func.count()).select_from(a2a_metrics)
+                .where(a2a_metrics.c.agent_id == agent_id, a2a_metrics.c.success.is_(True))
+            ).scalar() or 0
+            row = conn.execute(
+                select(
+                    func.min(a2a_metrics.c.latency_ms),
+                    func.max(a2a_metrics.c.latency_ms),
+                    func.avg(a2a_metrics.c.latency_ms),
+                ).where(a2a_metrics.c.agent_id == agent_id)
+            ).first()
+            last_ts = conn.execute(
+                select(func.max(a2a_metrics.c.ts)).where(a2a_metrics.c.agent_id == agent_id)
+            ).scalar()
+            return {
+                "agent_id": agent_id,
+                "total_invocations": int(total),
+                "successful": int(ok),
+                "success_rate": float(ok / total) if total else 0.0,
+                "latency_min_ms": float(row[0]) if row and row[0] is not None else 0.0,
+                "latency_max_ms": float(row[1]) if row and row[1] is not None else 0.0,
+                "latency_avg_ms": float(row[2]) if row and row[2] is not None else 0.0,
+                "last_interaction": last_ts.isoformat() if last_ts else None,
+            }
+    except Exception as e:
+        log.warning("a2a_agent_metrics_summary failed: %s", e)
+        return {}
+
+
+# =====================================================================
+# A2A virtual servers — group agents into named bundles
+# =====================================================================
+
+
+def upsert_a2a_virtual_server(
+    name: str,
+    description: str = "",
+    associated_agents: list[int] | None = None,
+    enabled: bool = True,
+) -> dict:
+    now = datetime.now(UTC)
+    agents_json = json.dumps(associated_agents or [])
+    try:
+        with begin() as conn:
+            existing = conn.execute(
+                select(a2a_virtual_servers).where(a2a_virtual_servers.c.name == name)
+            ).mappings().first()
+            if existing:
+                conn.execute(
+                    update(a2a_virtual_servers)
+                    .where(a2a_virtual_servers.c.name == name)
+                    .values(
+                        description=description,
+                        associated_agents_json=agents_json,
+                        enabled=enabled,
+                        updated_at=now,
+                    )
+                )
+            else:
+                conn.execute(
+                    insert(a2a_virtual_servers).values(
+                        name=name,
+                        description=description,
+                        associated_agents_json=agents_json,
+                        enabled=enabled,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+        row = get_a2a_virtual_server_by_name(name)
+        return row or {}
+    except Exception as e:
+        log.warning("upsert_a2a_virtual_server failed: %s", e)
+        return {"error": str(e)}
+
+
+def get_a2a_virtual_server(server_id: int) -> dict | None:
+    try:
+        with begin() as conn:
+            row = conn.execute(
+                select(a2a_virtual_servers).where(a2a_virtual_servers.c.id == server_id)
+            ).mappings().first()
+            return dict(row) if row else None
+    except Exception as e:
+        log.warning("get_a2a_virtual_server failed: %s", e)
+        return None
+
+
+def get_a2a_virtual_server_by_name(name: str) -> dict | None:
+    try:
+        with begin() as conn:
+            row = conn.execute(
+                select(a2a_virtual_servers).where(a2a_virtual_servers.c.name == name)
+            ).mappings().first()
+            return dict(row) if row else None
+    except Exception as e:
+        log.warning("get_a2a_virtual_server_by_name failed: %s", e)
+        return None
+
+
+def list_a2a_virtual_servers() -> list[dict]:
+    try:
+        with begin() as conn:
+            return [
+                dict(r)
+                for r in conn.execute(
+                    select(a2a_virtual_servers).order_by(a2a_virtual_servers.c.name.asc())
+                ).mappings().all()
+            ]
+    except Exception as e:
+        log.warning("list_a2a_virtual_servers failed: %s", e)
+        return []
+
+
+def delete_a2a_virtual_server(server_id: int) -> bool:
+    try:
+        with begin() as conn:
+            conn.execute(
+                delete(a2a_virtual_servers).where(a2a_virtual_servers.c.id == server_id)
+            )
+            return True
+    except Exception as e:
+        log.warning("delete_a2a_virtual_server failed: %s", e)
+        return False
+
+
+# =====================================================================
+# Prompt templates — DB-backed prompt template registry
+# =====================================================================
+
+
+def upsert_prompt_template(
+    name: str,
+    template_text: str,
+    description: str = "",
+    variables: list[str] | None = None,
+    category: str = "general",
+    enabled: bool = True,
+    is_builtin: bool = False,
+    source: str = "manual",
+) -> dict:
+    """Insert or update a prompt template."""
+    if not name or not template_text:
+        return {"error": "name and template_text required"}
+    variables_json = json.dumps(variables or [])
+    now = datetime.now(UTC)
+    try:
+        with begin() as conn:
+            existing = conn.execute(
+                select(prompt_templates).where(prompt_templates.c.name == name)
+            ).mappings().first()
+            if existing:
+                conn.execute(
+                    update(prompt_templates)
+                    .where(prompt_templates.c.name == name)
+                    .values(
+                        description=description,
+                        template_text=template_text,
+                        variables_json=variables_json,
+                        category=category,
+                        enabled=enabled,
+                        source=source,
+                        version=existing["version"] + 1,
+                        updated_at=now,
+                    )
+                )
+            else:
+                conn.execute(
+                    insert(prompt_templates).values(
+                        name=name,
+                        description=description,
+                        template_text=template_text,
+                        variables_json=variables_json,
+                        category=category,
+                        enabled=enabled,
+                        is_builtin=is_builtin,
+                        version=1,
+                        source=source,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+        row = get_prompt_template_by_name(name)
+        return row or {}
+    except Exception as e:
+        log.warning("upsert_prompt_template failed: %s", e)
+        return {"error": str(e)}
+
+
+def get_prompt_template(template_id: int) -> dict | None:
+    try:
+        with begin() as conn:
+            row = conn.execute(
+                select(prompt_templates).where(prompt_templates.c.id == template_id)
+            ).mappings().first()
+            return dict(row) if row else None
+    except Exception as e:
+        log.warning("get_prompt_template failed: %s", e)
+        return None
+
+
+def get_prompt_template_by_name(name: str) -> dict | None:
+    try:
+        with begin() as conn:
+            row = conn.execute(
+                select(prompt_templates).where(prompt_templates.c.name == name)
+            ).mappings().first()
+            return dict(row) if row else None
+    except Exception as e:
+        log.warning("get_prompt_template_by_name failed: %s", e)
+        return None
+
+
+def list_prompt_templates(
+    enabled_only: bool = False, category: str | None = None
+) -> list[dict]:
+    try:
+        with begin() as conn:
+            stmt = select(prompt_templates)
+            if enabled_only:
+                stmt = stmt.where(prompt_templates.c.enabled.is_(True))
+            if category:
+                stmt = stmt.where(prompt_templates.c.category == category)
+            stmt = stmt.order_by(prompt_templates.c.category.asc(), prompt_templates.c.name.asc())
+            return [dict(r) for r in conn.execute(stmt).mappings().all()]
+    except Exception as e:
+        log.warning("list_prompt_templates failed: %s", e)
+        return []
+
+
+def set_prompt_template_enabled(template_id: int, enabled: bool) -> bool:
+    try:
+        with begin() as conn:
+            result = conn.execute(
+                update(prompt_templates)
+                .where(prompt_templates.c.id == template_id)
+                .values(enabled=enabled, updated_at=datetime.now(UTC))
+            )
+        return bool(result.rowcount and result.rowcount > 0)
+    except Exception as e:
+        log.warning("set_prompt_template_enabled failed: %s", e)
+        return False
+
+
+def delete_prompt_template(template_id: int) -> bool:
+    """Refuse to delete builtin templates."""
+    try:
+        with begin() as conn:
+            row = conn.execute(
+                select(prompt_templates.c.is_builtin).where(
+                    prompt_templates.c.id == template_id
+                )
+            ).first()
+            if row and row[0]:
+                return False
+            conn.execute(
+                delete(prompt_templates).where(prompt_templates.c.id == template_id)
+            )
+            return True
+    except Exception as e:
+        log.warning("delete_prompt_template failed: %s", e)
+        return False
+
+
+# =====================================================================
+# Webhooks — fan-out event delivery
+# =====================================================================
+
+
+def upsert_webhook(
+    name: str,
+    url: str,
+    events: list[str],
+    secret: str = "",
+    enabled: bool = True,
+    description: str = "",
+) -> dict:
+    if not name or not url:
+        return {"error": "name and url required"}
+    events_json = json.dumps(events or [])
+    now = datetime.now(UTC)
+    try:
+        with begin() as conn:
+            existing = conn.execute(
+                select(webhooks).where(webhooks.c.name == name)
+            ).mappings().first()
+            if existing:
+                conn.execute(
+                    update(webhooks)
+                    .where(webhooks.c.name == name)
+                    .values(
+                        url=url,
+                        events_json=events_json,
+                        secret=secret,
+                        enabled=enabled,
+                        description=description,
+                        updated_at=now,
+                    )
+                )
+            else:
+                conn.execute(
+                    insert(webhooks).values(
+                        name=name,
+                        url=url,
+                        events_json=events_json,
+                        secret=secret,
+                        enabled=enabled,
+                        description=description,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+        row = get_webhook_by_name(name)
+        return row or {}
+    except Exception as e:
+        log.warning("upsert_webhook failed: %s", e)
+        return {"error": str(e)}
+
+
+def get_webhook(webhook_id: int) -> dict | None:
+    try:
+        with begin() as conn:
+            row = conn.execute(
+                select(webhooks).where(webhooks.c.id == webhook_id)
+            ).mappings().first()
+            return dict(row) if row else None
+    except Exception as e:
+        log.warning("get_webhook failed: %s", e)
+        return None
+
+
+def get_webhook_by_name(name: str) -> dict | None:
+    try:
+        with begin() as conn:
+            row = conn.execute(
+                select(webhooks).where(webhooks.c.name == name)
+            ).mappings().first()
+            return dict(row) if row else None
+    except Exception as e:
+        log.warning("get_webhook_by_name failed: %s", e)
+        return None
+
+
+def list_webhooks(enabled_only: bool = False) -> list[dict]:
+    try:
+        with begin() as conn:
+            stmt = select(webhooks)
+            if enabled_only:
+                stmt = stmt.where(webhooks.c.enabled.is_(True))
+            stmt = stmt.order_by(webhooks.c.name.asc())
+            return [dict(r) for r in conn.execute(stmt).mappings().all()]
+    except Exception as e:
+        log.warning("list_webhooks failed: %s", e)
+        return []
+
+
+def delete_webhook(webhook_id: int) -> bool:
+    try:
+        with begin() as conn:
+            conn.execute(
+                delete(webhook_deliveries).where(webhook_deliveries.c.webhook_id == webhook_id)
+            )
+            conn.execute(delete(webhooks).where(webhooks.c.id == webhook_id))
+            return True
+    except Exception as e:
+        log.warning("delete_webhook failed: %s", e)
+        return False
+
+
+def record_webhook_delivery(
+    webhook_id: int,
+    event_type: str,
+    tenant_id: str | None,
+    status_code: int | None,
+    payload_json: str,
+    response_body: str = "",
+    error: str = "",
+    attempt: int = 1,
+    duration_ms: float = 0.0,
+) -> int:
+    try:
+        with begin() as conn:
+            result = conn.execute(
+                insert(webhook_deliveries).values(
+                    webhook_id=webhook_id,
+                    event_type=event_type,
+                    tenant_id=tenant_id,
+                    status_code=status_code,
+                    response_body=response_body[:4000] if response_body else "",
+                    payload_json=payload_json[:8000],
+                    error=error[:1000] if error else "",
+                    attempt=attempt,
+                    duration_ms=duration_ms,
+                )
+            )
+            return int(result.inserted_primary_key[0]) if result.inserted_primary_key else 0
+    except Exception as e:
+        log.warning("record_webhook_delivery failed: %s", e)
+        return 0
+
+
+def list_webhook_deliveries(
+    webhook_id: int | None = None, limit: int = 100
+) -> list[dict]:
+    try:
+        with begin() as conn:
+            stmt = select(webhook_deliveries)
+            if webhook_id is not None:
+                stmt = stmt.where(webhook_deliveries.c.webhook_id == webhook_id)
+            stmt = stmt.order_by(webhook_deliveries.c.ts.desc()).limit(limit)
+            return [dict(r) for r in conn.execute(stmt).mappings().all()]
+    except Exception as e:
+        log.warning("list_webhook_deliveries failed: %s", e)
+        return []
+
+
+# =====================================================================
+# ContextForge sync log + federated tools
+# =====================================================================
+
+
+def record_contextforge_sync(
+    sync_type: str,
+    source: str,
+    items_synced: int = 0,
+    items_added: int = 0,
+    items_updated: int = 0,
+    errors: list[str] | None = None,
+    duration_ms: float = 0.0,
+) -> int:
+    errors_json = json.dumps(errors or [])
+    try:
+        with begin() as conn:
+            result = conn.execute(
+                insert(contextforge_sync_log).values(
+                    sync_type=sync_type,
+                    source=source,
+                    items_synced=items_synced,
+                    items_added=items_added,
+                    items_updated=items_updated,
+                    errors_json=errors_json,
+                    duration_ms=duration_ms,
+                )
+            )
+            return int(result.inserted_primary_key[0]) if result.inserted_primary_key else 0
+    except Exception as e:
+        log.warning("record_contextforge_sync failed: %s", e)
+        return 0
+
+
+def list_contextforge_sync_log(limit: int = 50) -> list[dict]:
+    try:
+        with begin() as conn:
+            return [
+                dict(r)
+                for r in conn.execute(
+                    select(contextforge_sync_log)
+                    .order_by(contextforge_sync_log.c.ts.desc())
+                    .limit(limit)
+                ).mappings().all()
+            ]
+    except Exception as e:
+        log.warning("list_contextforge_sync_log failed: %s", e)
+        return []
+
+
+def upsert_federated_tool(
+    name: str,
+    source: str,
+    source_url: str,
+    tool: dict,
+    enabled: bool = True,
+) -> dict:
+    """Insert or update a federated tool record (from ContextForge, etc.)."""
+    tool_json = json.dumps(tool)
+    now = datetime.now(UTC)
+    try:
+        with begin() as conn:
+            existing = conn.execute(
+                select(federated_tools).where(federated_tools.c.name == name)
+            ).mappings().first()
+            if existing:
+                conn.execute(
+                    update(federated_tools)
+                    .where(federated_tools.c.name == name)
+                    .values(
+                        source=source,
+                        source_url=source_url,
+                        tool_json=tool_json,
+                        enabled=enabled,
+                        last_synced=now,
+                    )
+                )
+            else:
+                conn.execute(
+                    insert(federated_tools).values(
+                        name=name,
+                        source=source,
+                        source_url=source_url,
+                        tool_json=tool_json,
+                        enabled=enabled,
+                        last_synced=now,
+                        created_at=now,
+                    )
+                )
+        row = get_federated_tool(name)
+        return row or {}
+    except Exception as e:
+        log.warning("upsert_federated_tool failed: %s", e)
+        return {"error": str(e)}
+
+
+def get_federated_tool(name: str) -> dict | None:
+    try:
+        with begin() as conn:
+            row = conn.execute(
+                select(federated_tools).where(federated_tools.c.name == name)
+            ).mappings().first()
+            return dict(row) if row else None
+    except Exception as e:
+        log.warning("get_federated_tool failed: %s", e)
+        return None
+
+
+def list_federated_tools(enabled_only: bool = False) -> list[dict]:
+    try:
+        with begin() as conn:
+            stmt = select(federated_tools)
+            if enabled_only:
+                stmt = stmt.where(federated_tools.c.enabled.is_(True))
+            stmt = stmt.order_by(federated_tools.c.name.asc())
+            return [dict(r) for r in conn.execute(stmt).mappings().all()]
+    except Exception as e:
+        log.warning("list_federated_tools failed: %s", e)
+        return []
+
+
+def delete_federated_tool(name: str) -> bool:
+    try:
+        with begin() as conn:
+            conn.execute(delete(federated_tools).where(federated_tools.c.name == name))
+            return True
+    except Exception as e:
+        log.warning("delete_federated_tool failed: %s", e)
+        return False

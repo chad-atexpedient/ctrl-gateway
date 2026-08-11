@@ -34,6 +34,7 @@ from pathlib import Path
 
 from aiohttp import web
 
+from . import a2a_registry as a2a_mod
 from . import admin as admin_mod
 from . import auth as auth_mod
 from . import (
@@ -51,13 +52,20 @@ from . import (
     translation,
 )
 from . import config as cfg_mod
+from . import contextforge_client as cf_mod
 from . import firewall as firewall_mod
+from . import mcp_discovery as mcp_disc_mod
+from . import mcp_facade as mcp_facade_mod
 from . import memory_observational as om
 from . import metrics as metrics_mod
 from . import ood as ood_mod
+from . import plugin as plugin_mod
 from . import policy as policy_mod
+from . import prompt_registry as prompt_mod
 from . import router as router_mod
 from . import swarm as swarm_mod
+from . import tool_cache as tool_cache_mod
+from . import webhook_dispatcher as webhook_mod
 
 log = logging.getLogger("glint.app")
 
@@ -65,6 +73,11 @@ INJECTION_PATTERNS: list = []
 INJECTION_PROFILES: list = []  # list[security.InjectionProfile]
 FIREWALL: firewall_mod.DomainAllowlistEnforcer | None = None
 HOST_FIREWALL: firewall_mod.HostFirewallManager | None = None
+PLUGIN_LOADER: plugin_mod.PluginLoader | None = None
+TOOL_CACHE: tool_cache_mod.ToolCache | None = None
+WEBHOOK_DISPATCHER: webhook_mod.WebhookDispatcher | None = None
+CONTEXTFORGE_CLIENT: cf_mod.ContextForgeClient | None = None
+MCP_DISCOVERY_TASK: asyncio.Task | None = None
 
 
 async def init_app(conf_path: str = "./gateway-config.json") -> web.Application:
@@ -188,6 +201,74 @@ async def init_app(conf_path: str = "./gateway-config.json") -> web.Application:
     else:
         INJECTION_PROFILES = []
 
+    # Tool cache (LRU + TTL)
+    cache_config = conf.config.get("tool_cache", {}) or {}
+    if cache_config.get("enabled", False):
+        TOOL_CACHE = tool_cache_mod.init_cache(
+            max_entries=int(cache_config.get("max_entries", 1024)),
+            default_ttl_seconds=int(cache_config.get("default_ttl_seconds", 300)),
+            per_tool_ttl_seconds=cache_config.get("per_tool_ttl_seconds") or {},
+            bypass_keys=cache_config.get("bypass_keys") or [],
+        )
+    else:
+        TOOL_CACHE = None
+
+    # Webhook dispatcher
+    webhook_config = conf.config.get("webhooks", {}) or {}
+    if webhook_config.get("enabled", True):
+        WEBHOOK_DISPATCHER = webhook_mod.init_dispatcher(
+            max_retries=int(webhook_config.get("max_retries", 3)),
+            initial_backoff_seconds=float(webhook_config.get("initial_backoff_seconds", 1.0)),
+            backoff_multiplier=float(webhook_config.get("backoff_multiplier", 2.0)),
+            delivery_timeout_seconds=float(webhook_config.get("delivery_timeout_seconds", 10.0)),
+            max_concurrent_deliveries=int(webhook_config.get("max_concurrent_deliveries", 16)),
+        )
+
+    # Built-in prompt templates
+    prompt_config = conf.config.get("prompts", {}) or {}
+    if prompt_config.get("enabled", True):
+        try:
+            await asyncio.to_thread(prompt_mod.seed_builtin_templates)
+        except Exception as e:
+            log.warning("seed builtin prompt templates failed: %s", e)
+
+    # IBM ContextForge connector
+    cf_config = conf.config.get("contextforge", {}) or {}
+    if cf_config.get("enabled", False):
+        try:
+            CONTEXTFORGE_CLIENT = cf_mod.init_client(
+                mode=cf_config.get("mode", "embedded"),
+                external_url=cf_config.get("external_url") or None,
+                api_key=cf_config.get("api_key") or None,
+                sync_interval_seconds=int(cf_config.get("sync_interval_seconds", 300)),
+                auto_sync=bool(cf_config.get("auto_sync", False)),
+                timeout_seconds=float(cf_config.get("timeout_seconds", 30.0)),
+            )
+            # Best-effort one-shot sync at startup
+            try:
+                sync_results = await CONTEXTFORGE_CLIENT.sync_all()
+                for sync_type, result in sync_results.items():
+                    events.emit(
+                        events.EventSource.CONTEXTFORGE,
+                        f"sync.{sync_type}",
+                        {
+                            "items_synced": result.items_synced,
+                            "items_added": result.items_added,
+                            "items_updated": result.items_updated,
+                            "errors": result.errors,
+                            "duration_ms": result.duration_ms,
+                        },
+                        severity=events.EventSeverity.INFO,
+                    )
+            except Exception as e:
+                log.warning("ContextForge initial sync failed: %s", e)
+            if CONTEXTFORGE_CLIENT.auto_sync:
+                CONTEXTFORGE_CLIENT.start_sync_loop()
+        except Exception as e:
+            log.warning("ContextForge client init failed: %s", e)
+    else:
+        CONTEXTFORGE_CLIENT = None
+
     # Set current config for policy atom-eval
     policy_mod.set_current_config(conf)
 
@@ -226,10 +307,28 @@ async def init_app(conf_path: str = "./gateway-config.json") -> web.Application:
     app["router_config_signature"] = _router_config_signature(conf)
     app["max_body_bytes"] = max_body_bytes
     app["cors_origins"] = list(conf.config.get("http", {}).get("cors_origins", []) or [])
+    app["tool_cache"] = TOOL_CACHE
+    app["webhook_dispatcher"] = WEBHOOK_DISPATCHER
+    app["contextforge_client"] = CONTEXTFORGE_CLIENT
     app.middlewares.append(auth_mod.body_size_middleware)
     app.middlewares.append(auth_mod.cors_middleware)
     app.middlewares.append(auth_mod.security_headers_middleware)
     app.middlewares.append(auth_mod.auth_middleware)
+
+    # Plugin loader (after middlewares so plugin routes see auth middleware)
+    plugins_config = conf.config.get("plugins", {}) or {}
+    if plugins_config.get("enabled", True):
+        global PLUGIN_LOADER
+        PLUGIN_LOADER = plugin_mod.init_loader(
+            app=app,
+            config=conf,
+            event_bus=events.bus(),
+            plugin_root=plugins_config.get("root", "./plugins"),
+            scan_interval_seconds=int(plugins_config.get("scan_interval_seconds", 30)),
+            auto_load=bool(plugins_config.get("auto_load", True)),
+        )
+        if plugins_config.get("auto_load", True):
+            PLUGIN_LOADER.start_watch()
 
     # Routes
     app.router.add_post("/v1/chat/completions", chat_completions)
@@ -282,6 +381,48 @@ async def init_app(conf_path: str = "./gateway-config.json") -> web.Application:
     app.router.add_post("/admin/security/sync-firewall", admin_sync_host_firewall)
     app.router.add_get("/admin/security/status", admin_security_status)
     app.router.add_post("/admin/security/test", admin_security_test)
+    # Plugins
+    app.router.add_get("/admin/plugins", admin_list_plugins)
+    app.router.add_get("/admin/plugins/{name}", admin_get_plugin)
+    app.router.add_post("/admin/plugins/{name}", admin_upsert_plugin)
+    app.router.add_delete("/admin/plugins/{name}", admin_delete_plugin)
+    app.router.add_post("/admin/plugins/{name}/reload", admin_reload_plugin)
+    app.router.add_post("/admin/plugins/{name}/enable", admin_enable_plugin)
+    app.router.add_post("/admin/plugins/{name}/disable", admin_disable_plugin)
+    # A2A agents
+    app.router.add_get("/admin/a2a/agents", admin_list_a2a_agents)
+    app.router.add_post("/admin/a2a/agents", admin_create_a2a_agent)
+    app.router.add_get("/admin/a2a/agents/{agent_id}", admin_get_a2a_agent)
+    app.router.add_put("/admin/a2a/agents/{agent_id}", admin_update_a2a_agent)
+    app.router.add_delete("/admin/a2a/agents/{agent_id}", admin_delete_a2a_agent)
+    app.router.add_post("/admin/a2a/agents/{agent_id}/invoke", admin_invoke_a2a_agent)
+    app.router.add_get("/admin/a2a/agents/{agent_id}/metrics", admin_a2a_agent_metrics)
+    # A2A virtual servers
+    app.router.add_get("/admin/a2a/servers", admin_list_a2a_servers)
+    app.router.add_post("/admin/a2a/servers", admin_create_a2a_server)
+    app.router.add_delete("/admin/a2a/servers/{server_id}", admin_delete_a2a_server)
+    # ContextForge
+    app.router.add_post("/admin/contextforge/sync", admin_contextforge_sync)
+    app.router.add_get("/admin/contextforge/sync-log", admin_contextforge_sync_log)
+    app.router.add_get("/admin/contextforge/tools", admin_contextforge_tools)
+    # MCP discovery
+    app.router.add_post("/admin/mcp/discover", admin_mcp_discover)
+    # Prompts
+    app.router.add_get("/admin/prompts", admin_list_prompts)
+    app.router.add_post("/admin/prompts", admin_create_prompt)
+    app.router.add_get("/admin/prompts/{template_id}", admin_get_prompt)
+    app.router.add_put("/admin/prompts/{template_id}", admin_update_prompt)
+    app.router.add_delete("/admin/prompts/{template_id}", admin_delete_prompt)
+    # Webhooks
+    app.router.add_get("/admin/webhooks", admin_list_webhooks)
+    app.router.add_post("/admin/webhooks", admin_create_webhook)
+    app.router.add_delete("/admin/webhooks/{webhook_id}", admin_delete_webhook)
+    app.router.add_get("/admin/webhooks/deliveries", admin_webhook_deliveries)
+    # Tool cache
+    app.router.add_get("/admin/cache/stats", admin_cache_stats)
+    app.router.add_post("/admin/cache/invalidate", admin_cache_invalidate)
+    # MCP facade — unified JSON-RPC endpoint for tools/list, tools/call, prompts/list
+    app.router.add_post("/mcp", mcp_facade_mod.handle_mcp_rpc)
     app.router.add_get("/admin/provider-presets", get_provider_presets)
     # Provider/Key/Tier CRUD
     app.router.add_post("/admin/endpoints", admin_add_endpoint)
@@ -453,6 +594,18 @@ async def _apply_runtime_config(app: web.Application, conf: cfg_mod.Config):
         except Exception as e:
             log.warning("host firewall sync on hot-reload failed: %s", e)
 
+    # Refresh tool cache settings
+    cache_config = conf.config.get("tool_cache", {}) or {}
+    if cache_config.get("enabled", False):
+        app["tool_cache"] = tool_cache_mod.init_cache(
+            max_entries=int(cache_config.get("max_entries", 1024)),
+            default_ttl_seconds=int(cache_config.get("default_ttl_seconds", 300)),
+            per_tool_ttl_seconds=cache_config.get("per_tool_ttl_seconds") or {},
+            bypass_keys=cache_config.get("bypass_keys") or [],
+        )
+    else:
+        app["tool_cache"] = None
+
     app["auth_manager"].update(conf.config.get("auth", {}))
     app["reviewer_worker"].update_config(conf)
     app["trainer_worker"].update_config(conf)
@@ -516,6 +669,23 @@ async def _cleanup_resources(app: web.Application):
             HOST_FIREWALL.clear()
         except Exception as e:
             log.warning("host firewall clear on shutdown failed: %s", e)
+    # Stop plugin loader watch loop
+    if PLUGIN_LOADER is not None:
+        PLUGIN_LOADER.stop_watch()
+    # Close ContextForge client
+    cf_client = app.get("contextforge_client")
+    if cf_client is not None:
+        try:
+            await cf_client.close()
+        except Exception as e:
+            log.warning("contextforge client close failed: %s", e)
+    # Close webhook dispatcher session
+    webhook_dispatcher = webhook_mod.dispatcher()
+    if webhook_dispatcher is not None:
+        try:
+            await webhook_dispatcher.close()
+        except Exception as e:
+            log.warning("webhook dispatcher close failed: %s", e)
     await asyncio.to_thread(memory.close_engine)
 
 
@@ -1155,6 +1325,36 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                 memory_ctx,
                 conf,
             )
+
+            # Prompt template auto-injection by vertical category
+            prompt_cfg = conf.config.get("prompts", {}) or {}
+            if prompt_cfg.get("enabled", True) and prompt_cfg.get("auto_inject", False):
+                category = prompt_mod.category_for_vertical(r.vertical)
+                if category:
+                    try:
+                        templates = await asyncio.to_thread(
+                            memory.list_prompt_templates,
+                            True,  # enabled_only
+                            category,
+                        )
+                        if templates:
+                            tmpl = templates[0]
+                            variables = {
+                                "vertical": r.vertical,
+                                "complexity": str(r.complexity),
+                                "tenant_id": tenant_id,
+                                "session_id": session_id,
+                            }
+                            rendered = prompt_mod.render_template(
+                                tmpl["template_text"], variables
+                            )
+                            # Prepend as system message (don't override existing)
+                            existing_msgs = forwarded_body["messages"]
+                            forwarded_body["messages"] = [
+                                {"role": "system", "content": rendered}
+                            ] + existing_msgs
+                    except Exception as e:
+                        log.debug("prompt auto-inject skipped: %s", e)
 
             # Translation mode: rewrite system prompt for translation intents
             if trans_mode in ("rewrite", "dedicated_endpoint") and trans_intent is not None and trans_intent.is_translation:
@@ -2974,6 +3174,426 @@ async def events_recent(request: web.Request):
         "events": [e.to_dict() for e in recent],
         "count": len(recent),
     })
+
+
+# ============================================================
+# Plugin admin handlers
+# ============================================================
+
+
+def _jsonify(value):
+    """Convert a value to a JSON-safe form. Datetimes -> ISO strings."""
+    if isinstance(value, dict):
+        return {k: _jsonify(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_jsonify(v) for v in value]
+    if isinstance(value, tuple):
+        return [_jsonify(v) for v in value]
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
+
+async def admin_list_plugins(request: web.Request):
+    return web.json_response({"plugins": [_jsonify(p) for p in memory.list_plugins()]})
+
+
+async def admin_get_plugin(request: web.Request):
+    name = request.match_info["name"]
+    plugin = memory.get_plugin(name)
+    if plugin is None:
+        return web.json_response({"error": "plugin not found"}, status=404)
+    return web.json_response(_jsonify(plugin))
+
+
+async def admin_upsert_plugin(request: web.Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    name = body.get("name") or request.match_info.get("name")
+    if not name:
+        return web.json_response({"error": "name required"}, status=400)
+    row = memory.upsert_plugin(
+        name=name,
+        version=body.get("version"),
+        description=body.get("description"),
+        prefix=body.get("prefix"),
+        module_path=body.get("module_path"),
+        config=body.get("config"),
+        enabled=bool(body.get("enabled", True)),
+        is_builtin=bool(body.get("is_builtin", False)),
+    )
+    return web.json_response(_jsonify(row))
+
+
+async def admin_delete_plugin(request: web.Request):
+    name = request.match_info["name"]
+    if not memory.delete_plugin(name):
+        return web.json_response({"error": "plugin is builtin or not found"}, status=400)
+    return web.json_response({"deleted": name})
+
+
+async def admin_reload_plugin(request: web.Request):
+    name = request.match_info["name"]
+    loader = plugin_mod.loader()
+    if loader is None:
+        return web.json_response({"error": "plugin loader not initialized"}, status=400)
+    ok = loader.reload(name)
+    if not ok:
+        return web.json_response({"error": "plugin not loaded"}, status=404)
+    return web.json_response({"reloaded": name})
+
+
+async def admin_enable_plugin(request: web.Request):
+    name = request.match_info["name"]
+    memory.set_plugin_enabled(name, True)
+    return web.json_response({"name": name, "enabled": True})
+
+
+async def admin_disable_plugin(request: web.Request):
+    name = request.match_info["name"]
+    memory.set_plugin_enabled(name, False)
+    return web.json_response({"name": name, "enabled": False})
+
+
+# ============================================================
+# A2A admin handlers
+# ============================================================
+
+
+async def admin_list_a2a_agents(request: web.Request):
+    return web.json_response({"agents": [_jsonify(a) for a in memory.list_a2a_agents()]})
+
+
+async def admin_create_a2a_agent(request: web.Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    if not body.get("name") or not body.get("endpoint_url") or not body.get("agent_type"):
+        return web.json_response({"error": "name, endpoint_url, agent_type required"}, status=400)
+    row = memory.upsert_a2a_agent(
+        name=body["name"],
+        endpoint_url=body["endpoint_url"],
+        agent_type=body["agent_type"],
+        description=body.get("description", ""),
+        auth_type=body.get("auth_type", "none"),
+        auth_value=body.get("auth_value"),
+        protocol_version=body.get("protocol_version"),
+        capabilities=body.get("capabilities"),
+        config=body.get("config"),
+        tags=body.get("tags"),
+        enabled=bool(body.get("enabled", True)),
+    )
+    if "error" in row:
+        return web.json_response(row, status=400)
+    return web.json_response(_jsonify(row))
+
+
+async def admin_get_a2a_agent(request: web.Request):
+    agent_id = int(request.match_info["agent_id"])
+    row = memory.get_a2a_agent(agent_id)
+    if row is None:
+        return web.json_response({"error": "agent not found"}, status=404)
+    return web.json_response(_jsonify(row))
+
+
+async def admin_update_a2a_agent(request: web.Request):
+    agent_id = int(request.match_info["agent_id"])
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    existing = memory.get_a2a_agent(agent_id)
+    if existing is None:
+        return web.json_response({"error": "agent not found"}, status=404)
+    row = memory.upsert_a2a_agent(
+        name=existing["name"],
+        endpoint_url=body.get("endpoint_url", existing["endpoint_url"]),
+        agent_type=body.get("agent_type", existing["agent_type"]),
+        description=body.get("description", existing.get("description", "")),
+        auth_type=body.get("auth_type", existing.get("auth_type", "none")),
+        auth_value=body.get("auth_value"),
+        protocol_version=body.get("protocol_version", existing.get("protocol_version")),
+        capabilities=body.get("capabilities"),
+        config=body.get("config"),
+        tags=body.get("tags"),
+        enabled=bool(body.get("enabled", existing.get("enabled", True))),
+    )
+    return web.json_response(_jsonify(row))
+
+
+async def admin_delete_a2a_agent(request: web.Request):
+    agent_id = int(request.match_info["agent_id"])
+    if not memory.delete_a2a_agent(agent_id):
+        return web.json_response({"error": "delete failed"}, status=400)
+    return web.json_response({"deleted": agent_id})
+
+
+async def admin_invoke_a2a_agent(request: web.Request):
+    agent_id = int(request.match_info["agent_id"])
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    agent = a2a_mod.get_agent(agent_id)
+    if agent is None:
+        return web.json_response({"error": "agent not found"}, status=404)
+    if not agent.enabled:
+        return web.json_response({"error": "agent disabled"}, status=400)
+    timeout = body.get("timeout_seconds", 30.0)
+    tenant_id = body.get("tenant_id") or "admin"
+    result = await a2a_mod.invoke_agent(
+        agent=agent,
+        parameters=body.get("parameters", {}),
+        timeout_seconds=float(timeout),
+        tenant_id=str(tenant_id),
+        interaction_type="admin_invoke",
+    )
+    return web.json_response(
+        {
+            "agent_id": agent_id,
+            "success": result.success,
+            "latency_ms": result.latency_ms,
+            "status_code": result.status_code,
+            "error": result.error,
+            "response": result.response,
+        }
+    )
+
+
+async def admin_a2a_agent_metrics(request: web.Request):
+    agent_id = int(request.match_info["agent_id"])
+    return web.json_response(a2a_mod.metrics_summary(agent_id))
+
+
+async def admin_list_a2a_servers(request: web.Request):
+    return web.json_response({"servers": [_jsonify(s) for s in a2a_mod.list_virtual_servers()]})
+
+
+async def admin_create_a2a_server(request: web.Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    if not body.get("name"):
+        return web.json_response({"error": "name required"}, status=400)
+    row = a2a_mod.register_virtual_server(
+        name=body["name"],
+        description=body.get("description", ""),
+        associated_agents=body.get("associated_agents", []),
+        enabled=bool(body.get("enabled", True)),
+    )
+    if row is None:
+        return web.json_response({"error": "create failed"}, status=400)
+    return web.json_response(_jsonify(row))
+
+
+async def admin_delete_a2a_server(request: web.Request):
+    server_id = int(request.match_info["server_id"])
+    if not a2a_mod.delete_virtual_server(server_id):
+        return web.json_response({"error": "delete failed"}, status=400)
+    return web.json_response({"deleted": server_id})
+
+
+# ============================================================
+# ContextForge admin handlers
+# ============================================================
+
+
+async def admin_contextforge_sync(request: web.Request):
+    client = cf_mod.client()
+    if client is None:
+        return web.json_response({"error": "ContextForge client not enabled"}, status=400)
+    results = await client.sync_all()
+    return web.json_response(
+        {
+            sync_type: {
+                "items_synced": r.items_synced,
+                "items_added": r.items_added,
+                "items_updated": r.items_updated,
+                "errors": r.errors,
+                "duration_ms": r.duration_ms,
+            }
+            for sync_type, r in results.items()
+        }
+    )
+
+
+async def admin_contextforge_sync_log(request: web.Request):
+    return web.json_response({"sync_log": [_jsonify(s) for s in memory.list_contextforge_sync_log(limit=100)]})
+
+
+async def admin_contextforge_tools(request: web.Request):
+    return web.json_response({"tools": [_jsonify(t) for t in memory.list_federated_tools()]})
+
+
+# ============================================================
+# MCP discovery admin handler
+# ============================================================
+
+
+async def admin_mcp_discover(request: web.Request):
+    try:
+        body = await request.json() if request.body_exists else {}
+    except Exception:
+        body = {}
+    hosts = body.get("hosts")
+    ports = body.get("ports")
+    auto_register = bool(body.get("auto_register", True))
+    results = await mcp_disc_mod.discover(
+        hosts=hosts, ports=ports, auto_register=auto_register
+    )
+    return web.json_response(
+        {
+            "discovered": [
+                {
+                    "name": r.name,
+                    "source_url": r.source_url,
+                    "server_info": r.server_info,
+                    "capabilities": r.capabilities,
+                    "transport": r.transport,
+                }
+                for r in results
+            ]
+        }
+    )
+
+
+# ============================================================
+# Prompt template admin handlers
+# ============================================================
+
+
+async def admin_list_prompts(request: web.Request):
+    enabled_only = request.query.get("enabled_only", "").lower() in ("1", "true", "yes")
+    category = request.query.get("category")
+    return web.json_response(
+        {"templates": [_jsonify(t) for t in memory.list_prompt_templates(enabled_only=enabled_only, category=category)]}
+    )
+
+
+async def admin_create_prompt(request: web.Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    row = memory.upsert_prompt_template(
+        name=body.get("name", ""),
+        template_text=body.get("template_text", ""),
+        description=body.get("description", ""),
+        variables=body.get("variables"),
+        category=body.get("category", "general"),
+        enabled=bool(body.get("enabled", True)),
+        source=body.get("source", "admin"),
+    )
+    if "error" in row:
+        return web.json_response(row, status=400)
+    return web.json_response(_jsonify(row))
+
+
+async def admin_get_prompt(request: web.Request):
+    template_id = int(request.match_info["template_id"])
+    row = memory.get_prompt_template(template_id)
+    if row is None:
+        return web.json_response({"error": "template not found"}, status=404)
+    return web.json_response(_jsonify(row))
+
+
+async def admin_update_prompt(request: web.Request):
+    template_id = int(request.match_info["template_id"])
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    existing = memory.get_prompt_template(template_id)
+    if existing is None:
+        return web.json_response({"error": "template not found"}, status=404)
+    row = memory.upsert_prompt_template(
+        name=existing["name"],
+        template_text=body.get("template_text", existing["template_text"]),
+        description=body.get("description", existing.get("description", "")),
+        variables=body.get("variables"),
+        category=body.get("category", existing.get("category", "general")),
+        enabled=bool(body.get("enabled", existing.get("enabled", True))),
+    )
+    return web.json_response(_jsonify(row))
+
+
+async def admin_delete_prompt(request: web.Request):
+    template_id = int(request.match_info["template_id"])
+    if not memory.delete_prompt_template(template_id):
+        return web.json_response({"error": "template is builtin or not found"}, status=400)
+    return web.json_response({"deleted": template_id})
+
+
+# ============================================================
+# Webhook admin handlers
+# ============================================================
+
+
+async def admin_list_webhooks(request: web.Request):
+    return web.json_response({"webhooks": [_jsonify(w) for w in memory.list_webhooks()]})
+
+
+async def admin_create_webhook(request: web.Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    if not body.get("name") or not body.get("url"):
+        return web.json_response({"error": "name and url required"}, status=400)
+    row = memory.upsert_webhook(
+        name=body["name"],
+        url=body["url"],
+        events=body.get("events", ["*"]),
+        secret=body.get("secret", ""),
+        enabled=bool(body.get("enabled", True)),
+        description=body.get("description", ""),
+    )
+    if "error" in row:
+        return web.json_response(row, status=400)
+    return web.json_response(_jsonify(row))
+
+
+async def admin_delete_webhook(request: web.Request):
+    webhook_id = int(request.match_info["webhook_id"])
+    if not memory.delete_webhook(webhook_id):
+        return web.json_response({"error": "delete failed"}, status=400)
+    return web.json_response({"deleted": webhook_id})
+
+
+async def admin_webhook_deliveries(request: web.Request):
+    webhook_id_raw = request.query.get("webhook_id")
+    webhook_id = int(webhook_id_raw) if webhook_id_raw else None
+    limit = int(request.query.get("limit", "100"))
+    return web.json_response({"deliveries": [_jsonify(d) for d in memory.list_webhook_deliveries(webhook_id=webhook_id, limit=limit)]})
+
+
+# ============================================================
+# Tool cache admin handlers
+# ============================================================
+
+
+async def admin_cache_stats(request: web.Request):
+    cache = tool_cache_mod.cache()
+    if cache is None:
+        return web.json_response({"error": "tool cache disabled"}, status=400)
+    return web.json_response({"stats": cache.stats(), "snapshot": cache.snapshot(limit=50)})
+
+
+async def admin_cache_invalidate(request: web.Request):
+    cache = tool_cache_mod.cache()
+    if cache is None:
+        return web.json_response({"error": "tool cache disabled"}, status=400)
+    try:
+        body = await request.json() if request.body_exists else {}
+    except Exception:
+        body = {}
+    tool_name = body.get("tool_name")
+    removed = cache.invalidate(tool_name=tool_name)
+    return web.json_response({"invalidated": removed, "tool_name": tool_name})
 
 
 # ============================================================

@@ -71,6 +71,10 @@ nav .right{margin-left:auto;display:flex;align-items:center;gap:8px;padding:8px 
     <div class="tab" data-tab="routing" onclick="showTab('routing')">Routing</div>
     <div class="tab" data-tab="flywheel" onclick="showTab('flywheel')">Flywheel</div>
     <div class="tab" data-tab="security" onclick="showTab('security')">Security</div>
+    <div class="tab" data-tab="plugins" onclick="showTab('plugins')">Plugins</div>
+    <div class="tab" data-tab="a2a" onclick="showTab('a2a')">A2A</div>
+    <div class="tab" data-tab="prompts" onclick="showTab('prompts')">Prompts</div>
+    <div class="tab" data-tab="webhooks" onclick="showTab('webhooks')">Webhooks</div>
     <div class="right">
       <span id="key-status" style="font-size:11px;opacity:.6"></span>
       <button class="btn sm" onclick="promptForKey()">Set Key</button>
@@ -216,6 +220,184 @@ nav .right{margin-left:auto;display:flex;align-items:center;gap:8px;padding:8px 
   </section>
 </div>
 
+<!-- ===== PLUGINS TAB ===== -->
+<div class="tab-content" id="tab-plugins">
+  <section>
+    <h2>Plugin System</h2>
+    <p style="color:var(--dim);font-size:12px;margin-bottom:16px">
+      Drop plugin directories into <code>./plugins/</code> with a <code>manifest.yaml</code> + <code>plugin.py</code>
+      exposing <code>build_router(context)</code>. Hot-reload via <code>POST /admin/plugins/{name}/reload</code>.
+      Inspired by the mcpchad plugin contract, adapted for aiohttp.
+    </p>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:16px;margin-bottom:16px">
+      <div class="card"><div class="title">Total Plugins</div><div style="font-size:28px;font-weight:700;color:var(--accent)" id="pl-total">—</div></div>
+      <div class="card"><div class="title">Loaded</div><div style="font-size:28px;font-weight:700;color:var(--accent2)" id="pl-loaded">—</div></div>
+      <div class="card"><div class="title">Enabled</div><div style="font-size:28px;font-weight:700;color:var(--t2)" id="pl-enabled">—</div></div>
+      <div class="card"><div class="title">Errors</div><div style="font-size:28px;font-weight:700;color:var(--red)" id="pl-errors">—</div></div>
+    </div>
+
+    <div class="card">
+      <h3>Registered Plugins</h3>
+      <table><thead><tr><th>Name</th><th>Version</th><th>Description</th><th>Loaded</th><th>Enabled</th><th>Built-in</th><th>Actions</th></tr></thead>
+      <tbody id="pl-table"></tbody></table>
+    </div>
+  </section>
+</div>
+
+<!-- ===== A2A TAB ===== -->
+<div class="tab-content" id="tab-a2a">
+  <section>
+    <h2>A2A (Agent-to-Agent) Registry</h2>
+    <p style="color:var(--dim);font-size:12px;margin-bottom:16px">
+      Register external AI agents (jsonrpc / openai / anthropic / custom). Inspired by IBM ContextForge's
+      <code>/a2a</code> endpoints + Agent-Tool State Cascade. Virtual servers group agents into named bundles.
+    </p>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:16px;margin-bottom:16px">
+      <div class="card"><div class="title">Agents</div><div style="font-size:28px;font-weight:700;color:var(--accent)" id="a2a-total">—</div></div>
+      <div class="card"><div class="title">Enabled</div><div style="font-size:28px;font-weight:700;color:var(--accent2)" id="a2a-enabled">—</div></div>
+      <div class="card"><div class="title">Virtual Servers</div><div style="font-size:28px;font-weight:700;color:var(--t2)" id="a2a-servers">—</div></div>
+      <div class="card"><div class="title">Metrics</div><div style="font-size:28px;font-weight:700;color:var(--accent)" id="a2a-metrics">—</div></div>
+    </div>
+
+    <div class="card">
+      <h3>Registered Agents</h3>
+      <div style="display:flex;gap:8px;margin-bottom:12px">
+        <input id="a2a-name" placeholder="name" style="width:140px">
+        <input id="a2a-url" placeholder="http://agent.example/run" style="flex:1">
+        <select id="a2a-type"><option value="jsonrpc">jsonrpc</option><option value="openai">openai</option><option value="anthropic">anthropic</option><option value="custom">custom</option></select>
+        <button class="btn primary" onclick="addA2aAgent()">Add</button>
+      </div>
+      <table><thead><tr><th>Name</th><th>Type</th><th>URL</th><th>Auth</th><th>Enabled</th><th>Actions</th></tr></thead>
+      <tbody id="a2a-table"></tbody></table>
+    </div>
+
+    <div class="card">
+      <h3>Virtual Servers</h3>
+      <div style="display:flex;gap:8px;margin-bottom:12px">
+        <input id="a2a-server-name" placeholder="name" style="width:200px">
+        <input id="a2a-server-agents" placeholder="comma-separated agent IDs" style="flex:1">
+        <button class="btn primary" onclick="addA2aServer()">Add</button>
+      </div>
+      <table><thead><tr><th>Name</th><th>Description</th><th>Agents</th><th>Enabled</th><th>Actions</th></tr></thead>
+      <tbody id="a2a-servers-table"></tbody></table>
+    </div>
+
+    <div class="card">
+      <h3>ContextForge Sync</h3>
+      <p style="color:var(--dim);font-size:11px;margin-bottom:8px">
+        IBM ContextForge connector — pulls agents, virtual servers, tools, and prompt templates FROM a running ContextForge instance.
+      </p>
+      <button class="btn" onclick="syncContextForge()">Sync Now</button>
+      <span id="a2a-cf-status" style="margin-left:12px;font-size:12px"></span>
+    </div>
+
+    <div class="card">
+      <h3>MCP Server Discovery</h3>
+      <p style="color:var(--dim);font-size:11px;margin-bottom:8px">
+        Scan candidate hosts/ports for MCP tool servers (Model Context Protocol). Discovered servers can be auto-registered as federated tools.
+      </p>
+      <button class="btn" onclick="discoverMcp()">Discover MCP Servers</button>
+      <span id="a2a-mcp-status" style="margin-left:12px;font-size:12px"></span>
+    </div>
+  </section>
+</div>
+
+<!-- ===== PROMPTS TAB ===== -->
+<div class="tab-content" id="tab-prompts">
+  <section>
+    <h2>Prompt Template Registry</h2>
+    <p style="color:var(--dim);font-size:12px;margin-bottom:16px">
+      DB-backed prompt templates with system-prompt injection. Built-in templates seeded at startup
+      (router_coder, router_reviewer, translator, summarizer, safety_refusal). Use <code>{variable}</code> placeholders.
+    </p>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:16px;margin-bottom:16px">
+      <div class="card"><div class="title">Templates</div><div style="font-size:28px;font-weight:700;color:var(--accent)" id="pr-total">—</div></div>
+      <div class="card"><div class="title">Enabled</div><div style="font-size:28px;font-weight:700;color:var(--accent2)" id="pr-enabled">—</div></div>
+      <div class="card"><div class="title">Built-in</div><div style="font-size:28px;font-weight:700;color:var(--t2)" id="pr-builtin">—</div></div>
+      <div class="card"><div class="title">Categories</div><div style="font-size:28px;font-weight:700;color:var(--accent)" id="pr-categories">—</div></div>
+    </div>
+
+    <div class="card">
+      <h3>Create / Edit Template</h3>
+      <div style="display:grid;grid-template-columns:1fr 1fr 2fr;gap:8px;margin-bottom:8px">
+        <input id="pr-name" placeholder="name">
+        <input id="pr-category" placeholder="category (e.g. code)">
+        <input id="pr-vars" placeholder="variables (comma-separated, e.g. verticals,target_language)">
+      </div>
+      <textarea id="pr-text" placeholder="Template text with {variable} placeholders..." style="width:100%;min-height:80px;font-family:monospace"></textarea>
+      <div style="margin-top:8px">
+        <button class="btn primary" onclick="savePrompt()">Save</button>
+        <button class="btn" onclick="clearPromptForm()">Clear</button>
+        <span id="pr-status" style="margin-left:12px;font-size:12px"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Templates</h3>
+      <table><thead><tr><th>Name</th><th>Category</th><th>Variables</th><th>Version</th><th>Built-in</th><th>Enabled</th><th>Actions</th></tr></thead>
+      <tbody id="pr-table"></tbody></table>
+    </div>
+  </section>
+</div>
+
+<!-- ===== WEBHOOKS TAB ===== -->
+<div class="tab-content" id="tab-webhooks">
+  <section>
+    <h2>Webhook Dispatcher</h2>
+    <p style="color:var(--dim);font-size:12px;margin-bottom:16px">
+      Fan-out events to HTTP endpoints. Each registered webhook subscribes to a list of event types
+      (or <code>*</code> for all events). Delivery is async with retry + exponential backoff. Every attempt
+      is logged into <code>webhook_deliveries</code>. HMAC SHA-256 signature when a secret is set.
+    </p>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:16px;margin-bottom:16px">
+      <div class="card"><div class="title">Webhooks</div><div style="font-size:28px;font-weight:700;color:var(--accent)" id="wh-total">—</div></div>
+      <div class="card"><div class="title">Enabled</div><div style="font-size:28px;font-weight:700;color:var(--accent2)" id="wh-enabled">—</div></div>
+      <div class="card"><div class="title">Deliveries (24h)</div><div style="font-size:28px;font-weight:700;color:var(--t2)" id="wh-deliveries">—</div></div>
+      <div class="card"><div class="title">Tool Cache</div><div id="wh-cache" style="font-size:14px;padding-top:4px">—</div></div>
+    </div>
+
+    <div class="card">
+      <h3>Register Webhook</h3>
+      <div style="display:grid;grid-template-columns:1fr 2fr 1fr;gap:8px;margin-bottom:8px">
+        <input id="wh-name" placeholder="name">
+        <input id="wh-url" placeholder="https://example.com/webhook">
+        <input id="wh-secret" placeholder="shared secret (optional)">
+      </div>
+      <input id="wh-events" placeholder="events: *, or chat.completion,security.alert" style="width:100%;margin-bottom:8px">
+      <button class="btn primary" onclick="addWebhook()">Register</button>
+      <span id="wh-status" style="margin-left:12px;font-size:12px"></span>
+    </div>
+
+    <div class="card">
+      <h3>Registered Webhooks</h3>
+      <table><thead><tr><th>Name</th><th>URL</th><th>Events</th><th>Enabled</th><th>Actions</th></tr></thead>
+      <tbody id="wh-table"></tbody></table>
+    </div>
+
+    <div class="card">
+      <h3>Recent Deliveries</h3>
+      <table><thead><tr><th>Time</th><th>Webhook</th><th>Event</th><th>Status</th><th>Attempts</th><th>Duration</th></tr></thead>
+      <tbody id="wh-deliveries-table"></tbody></table>
+    </div>
+
+    <div class="card">
+      <h3>Tool Cache</h3>
+      <p style="color:var(--dim);font-size:11px;margin-bottom:8px">
+        LRU + TTL cache for tool / plugin responses. Hits/misses tracked here.
+      </p>
+      <div id="wh-cache-detail" style="font-size:13px">—</div>
+      <div style="margin-top:12px">
+        <button class="btn" onclick="invalidateCache()">Invalidate All</button>
+        <button class="btn" onclick="loadWebhooksTab()">Refresh</button>
+      </div>
+    </div>
+  </section>
+</div>
+
 <!-- ===== FLYWHEEL TAB ===== -->
 <div class="tab-content" id="tab-flywheel">
   <section>
@@ -307,6 +489,13 @@ async function fetchJSON(path, opts={}) {
     return await r.json();
   } catch(e) { return null; }
 }
+function flash(elId, msg, isError=false) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  el.style.color = isError ? 'var(--red)' : 'var(--accent)';
+  el.textContent = msg;
+  setTimeout(() => { if (el.textContent === msg) el.textContent = ''; }, 5000);
+}
 async function api(path, method='POST', body=null) {
   const headers = {};
   const token = sessionStorage.getItem('glint_api_key');
@@ -341,6 +530,10 @@ function showTab(name) {
   if (name === 'routing') loadTiers();
   if (name === 'flywheel') loadFlywheel();
   if (name === 'security') loadSecurityTab();
+  if (name === 'plugins') loadPluginsTab();
+  if (name === 'a2a') loadA2aTab();
+  if (name === 'prompts') loadPromptsTab();
+  if (name === 'webhooks') loadWebhooksTab();
 }
 
 // ---- SECURITY TAB ----
@@ -462,6 +655,281 @@ async function syncHostFirewall() {
 function escapeHtml(s) {
   if (s == null) return '';
   return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+}
+
+// ---- PLUGINS TAB ----
+async function loadPluginsTab() {
+  const r = await fetchJSON('/admin/plugins');
+  const plugins = (r && r.plugins) || [];
+  document.getElementById('pl-total').textContent = plugins.length;
+  const loaded = plugins.filter(p => p.loaded).length;
+  const enabled = plugins.filter(p => p.enabled).length;
+  const errors = plugins.filter(p => p.error && !p.loaded).length;
+  document.getElementById('pl-loaded').textContent = loaded;
+  document.getElementById('pl-enabled').textContent = enabled;
+  document.getElementById('pl-errors').textContent = errors;
+  const tbody = document.getElementById('pl-table');
+  tbody.innerHTML = plugins.map(p => `
+    <tr>
+      <td><b>${escapeHtml(p.name)}</b></td>
+      <td>${escapeHtml(p.version || '')}</td>
+      <td>${escapeHtml((p.description || '').slice(0, 80))}</td>
+      <td><span style="color:${p.loaded ? 'var(--accent)' : 'var(--red)'}">${p.loaded ? '✓' : '✗'}</span></td>
+      <td><span style="color:${p.enabled ? 'var(--accent)' : 'var(--dim)'}">${p.enabled ? 'on' : 'off'}</span></td>
+      <td>${p.is_builtin ? 'yes' : 'no'}</td>
+      <td>
+        <button class="btn sm" onclick="reloadPlugin('${escapeHtml(p.name)}')">Reload</button>
+        <button class="btn sm" onclick="togglePlugin('${escapeHtml(p.name)}', ${!p.enabled})">${p.enabled ? 'Disable' : 'Enable'}</button>
+      </td>
+    </tr>
+  `).join('') || '<tr><td colspan="7" style="color:var(--dim);text-align:center;padding:20px">No plugins registered. Drop a plugin directory into ./plugins/ with a manifest.yaml + plugin.py exposing build_router(context).</td></tr>';
+}
+async function reloadPlugin(name) {
+  const r = await fetchJSON(`/admin/plugins/${encodeURIComponent(name)}/reload`, { method: 'POST' });
+  if (r && r.reloaded) { flash('pl-status', `Reloaded ${name}`); loadPluginsTab(); }
+  else flash('pl-status', r && r.error || 'Reload failed', true);
+}
+async function togglePlugin(name, enable) {
+  const path = enable ? 'enable' : 'disable';
+  const r = await fetchJSON(`/admin/plugins/${encodeURIComponent(name)}/${path}`, { method: 'POST' });
+  if (r) loadPluginsTab();
+}
+
+// ---- A2A TAB ----
+async function loadA2aTab() {
+  const [agents, servers, deliveries] = await Promise.all([
+    fetchJSON('/admin/a2a/agents'),
+    fetchJSON('/admin/a2a/servers'),
+    fetchJSON('/admin/webhooks/deliveries?limit=5'),
+  ]);
+  const agentList = (agents && agents.agents) || [];
+  document.getElementById('a2a-total').textContent = agentList.length;
+  document.getElementById('a2a-enabled').textContent = agentList.filter(a => a.enabled).length;
+  const serverList = (servers && servers.servers) || [];
+  document.getElementById('a2a-servers').textContent = serverList.length;
+  document.getElementById('a2a-metrics').textContent = 'live';
+  const tbody = document.getElementById('a2a-table');
+  tbody.innerHTML = agentList.map(a => `
+    <tr>
+      <td><b>${escapeHtml(a.name)}</b></td>
+      <td>${escapeHtml(a.agent_type || '')}</td>
+      <td><code>${escapeHtml((a.endpoint_url || '').slice(0, 60))}</code></td>
+      <td>${escapeHtml(a.auth_type || 'none')}</td>
+      <td><span style="color:${a.enabled ? 'var(--accent)' : 'var(--dim)'}">${a.enabled ? 'on' : 'off'}</span></td>
+      <td>
+        <button class="btn sm" onclick="invokeA2a(${a.id})">Test</button>
+        <button class="btn sm" onclick="toggleA2a(${a.id}, ${!a.enabled})">${a.enabled ? 'Disable' : 'Enable'}</button>
+        <button class="btn sm" onclick="deleteA2a(${a.id})">Del</button>
+      </td>
+    </tr>
+  `).join('') || '<tr><td colspan="6" style="color:var(--dim);text-align:center;padding:20px">No A2A agents registered.</td></tr>';
+  const stbody = document.getElementById('a2a-servers-table');
+  stbody.innerHTML = serverList.map(s => `
+    <tr>
+      <td><b>${escapeHtml(s.name)}</b></td>
+      <td>${escapeHtml((s.description || '').slice(0, 60))}</td>
+      <td>${(s.associated_agents || []).length}</td>
+      <td><span style="color:${s.enabled ? 'var(--accent)' : 'var(--dim)'}">${s.enabled ? 'on' : 'off'}</span></td>
+      <td><button class="btn sm" onclick="deleteA2aServer(${s.id})">Del</button></td>
+    </tr>
+  `).join('') || '<tr><td colspan="5" style="color:var(--dim);text-align:center;padding:20px">No virtual servers.</td></tr>';
+}
+async function addA2aAgent() {
+  const name = document.getElementById('a2a-name').value.trim();
+  const url = document.getElementById('a2a-url').value.trim();
+  const type = document.getElementById('a2a-type').value;
+  if (!name || !url) { flash('a2a-cf-status', 'name and url required', true); return; }
+  const r = await fetchJSON('/admin/a2a/agents', {
+    method: 'POST',
+    body: JSON.stringify({ name, endpoint_url: url, agent_type: type }),
+  });
+  if (r && !r.error) { document.getElementById('a2a-name').value = ''; document.getElementById('a2a-url').value = ''; loadA2aTab(); }
+  else flash('a2a-cf-status', (r && r.error) || 'add failed', true);
+}
+async function toggleA2a(id, enable) {
+  await fetchJSON(`/admin/a2a/agents/${id}`, { method: 'PUT', body: JSON.stringify({ enabled: enable }) });
+  loadA2aTab();
+}
+async function deleteA2a(id) {
+  await fetchJSON(`/admin/a2a/agents/${id}`, { method: 'DELETE' });
+  loadA2aTab();
+}
+async function invokeA2a(id) {
+  const r = await fetchJSON(`/admin/a2a/agents/${id}/invoke`, {
+    method: 'POST',
+    body: JSON.stringify({ parameters: { method: 'message/send', params: { message: { messageId: 'test', role: 'user', parts: [{ type: 'text', text: 'ping' }] } } }, tenant_id: 'dashboard' }),
+  });
+  flash('a2a-cf-status', r && r.success ? 'OK ✓' : 'fail: ' + (r && r.error || 'unknown'), !r || !r.success);
+}
+async function addA2aServer() {
+  const name = document.getElementById('a2a-server-name').value.trim();
+  const agentsRaw = document.getElementById('a2a-server-agents').value.trim();
+  const associated_agents = agentsRaw ? agentsRaw.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n)) : [];
+  if (!name) { flash('a2a-cf-status', 'name required', true); return; }
+  const r = await fetchJSON('/admin/a2a/servers', {
+    method: 'POST',
+    body: JSON.stringify({ name, associated_agents }),
+  });
+  if (r && !r.error) { document.getElementById('a2a-server-name').value = ''; document.getElementById('a2a-server-agents').value = ''; loadA2aTab(); }
+  else flash('a2a-cf-status', (r && r.error) || 'add failed', true);
+}
+async function deleteA2aServer(id) {
+  await fetchJSON(`/admin/a2a/servers/${id}`, { method: 'DELETE' });
+  loadA2aTab();
+}
+async function syncContextForge() {
+  flash('a2a-cf-status', 'syncing...');
+  const r = await fetchJSON('/admin/contextforge/sync', { method: 'POST', body: '{}' });
+  if (r) {
+    const total = Object.values(r).reduce((s, v) => s + (v && v.items_synced || 0), 0);
+    flash('a2a-cf-status', `Synced ${total} items across ${Object.keys(r).length} asset types`);
+  } else flash('a2a-cf-status', 'sync failed', true);
+}
+async function discoverMcp() {
+  flash('a2a-mcp-status', 'discovering...');
+  const r = await fetchJSON('/admin/mcp/discover', { method: 'POST', body: '{}' });
+  if (r && r.discovered) flash('a2a-mcp-status', `Found ${r.discovered.length} MCP servers`);
+  else flash('a2a-mcp-status', 'discovery failed', true);
+}
+
+// ---- PROMPTS TAB ----
+async function loadPromptsTab() {
+  const r = await fetchJSON('/admin/prompts');
+  const templates = (r && r.templates) || [];
+  document.getElementById('pr-total').textContent = templates.length;
+  document.getElementById('pr-enabled').textContent = templates.filter(t => t.enabled).length;
+  document.getElementById('pr-builtin').textContent = templates.filter(t => t.is_builtin).length;
+  const categories = new Set(templates.map(t => t.category || 'general'));
+  document.getElementById('pr-categories').textContent = categories.size;
+  const tbody = document.getElementById('pr-table');
+  tbody.innerHTML = templates.map(t => {
+    let vars = [];
+    try { vars = JSON.parse(t.variables_json || '[]'); } catch (_) {}
+    return `
+      <tr>
+        <td><b>${escapeHtml(t.name)}</b></td>
+        <td>${escapeHtml(t.category || '')}</td>
+        <td>${vars.map(escapeHtml).join(', ')}</td>
+        <td>v${t.version}</td>
+        <td>${t.is_builtin ? 'yes' : 'no'}</td>
+        <td><span style="color:${t.enabled ? 'var(--accent)' : 'var(--dim)'}">${t.enabled ? 'on' : 'off'}</span></td>
+        <td>
+          <button class="btn sm" onclick="editPrompt(${t.id}, ${JSON.stringify(t.name).replace(/"/g, '&quot;')}, ${JSON.stringify(t.category).replace(/"/g, '&quot;')}, ${JSON.stringify((t.template_text || '').replace(/"/g, '&quot;'))}, ${JSON.stringify(vars).replace(/"/g, '&quot;')})">Edit</button>
+          <button class="btn sm" onclick="togglePrompt(${t.id}, ${!t.enabled})">${t.enabled ? 'Disable' : 'Enable'}</button>
+          ${t.is_builtin ? '' : `<button class="btn sm" onclick="deletePrompt(${t.id})">Del</button>`}
+        </td>
+      </tr>
+    `;
+  }).join('') || '<tr><td colspan="7" style="color:var(--dim);text-align:center;padding:20px">No prompt templates.</td></tr>';
+}
+function clearPromptForm() {
+  document.getElementById('pr-name').value = '';
+  document.getElementById('pr-category').value = '';
+  document.getElementById('pr-vars').value = '';
+  document.getElementById('pr-text').value = '';
+}
+function editPrompt(id, name, category, text, vars) {
+  document.getElementById('pr-name').value = name;
+  document.getElementById('pr-category').value = category;
+  document.getElementById('pr-vars').value = vars.join(', ');
+  document.getElementById('pr-text').value = text;
+}
+async function savePrompt() {
+  const name = document.getElementById('pr-name').value.trim();
+  const category = document.getElementById('pr-category').value.trim() || 'general';
+  const varsRaw = document.getElementById('pr-vars').value.trim();
+  const text = document.getElementById('pr-text').value;
+  if (!name || !text) { flash('pr-status', 'name and template_text required', true); return; }
+  const variables = varsRaw ? varsRaw.split(',').map(s => s.trim()).filter(s => s) : [];
+  const r = await fetchJSON('/admin/prompts', {
+    method: 'POST',
+    body: JSON.stringify({ name, category, variables, template_text: text }),
+  });
+  if (r && !r.error) { flash('pr-status', `Saved ${name} (v${r.version || 1})`); clearPromptForm(); loadPromptsTab(); }
+  else flash('pr-status', (r && r.error) || 'save failed', true);
+}
+async function togglePrompt(id, enable) {
+  await fetchJSON(`/admin/prompts/${id}`, { method: 'PUT', body: JSON.stringify({ enabled: enable }) });
+  loadPromptsTab();
+}
+async function deletePrompt(id) {
+  await fetchJSON(`/admin/prompts/${id}`, { method: 'DELETE' });
+  loadPromptsTab();
+}
+
+// ---- WEBHOOKS TAB ----
+async function loadWebhooksTab() {
+  const [wh, deliveries, cache] = await Promise.all([
+    fetchJSON('/admin/webhooks'),
+    fetchJSON('/admin/webhooks/deliveries?limit=20'),
+    fetchJSON('/admin/cache/stats'),
+  ]);
+  const webhooks = (wh && wh.webhooks) || [];
+  document.getElementById('wh-total').textContent = webhooks.length;
+  document.getElementById('wh-enabled').textContent = webhooks.filter(w => w.enabled).length;
+  const dlist = (deliveries && deliveries.deliveries) || [];
+  document.getElementById('wh-deliveries').textContent = dlist.length;
+  if (cache && cache.stats) {
+    const s = cache.stats;
+    document.getElementById('wh-cache').innerHTML = `<span style="color:var(--accent)">${s.hits}</span>h / <span style="color:var(--dim)">${s.misses}</span>m<br><span style="font-size:11px;color:var(--dim)">size ${s.size}/${s.max_size}</span>`;
+    document.getElementById('wh-cache-detail').innerHTML = `
+      <div><b>Hits:</b> ${s.hits} | <b>Misses:</b> ${s.misses} | <b>Sets:</b> ${s.sets}</div>
+      <div><b>Hit rate:</b> ${(s.hit_rate * 100).toFixed(1)}% | <b>Evictions:</b> ${s.evictions} | <b>Expirations:</b> ${s.expirations}</div>
+      <div><b>Size:</b> ${s.size} / ${s.max_size}</div>
+    `;
+  } else {
+    document.getElementById('wh-cache').innerHTML = '<span style="color:var(--dim)">disabled</span>';
+    document.getElementById('wh-cache-detail').innerHTML = '<span style="color:var(--dim)">Tool cache is disabled. Enable it in gateway-config.json: tool_cache.enabled=true.</span>';
+  }
+  const tbody = document.getElementById('wh-table');
+  tbody.innerHTML = webhooks.map(w => {
+    let events = [];
+    try { events = JSON.parse(w.events_json || '[]'); } catch (_) {}
+    return `
+      <tr>
+        <td><b>${escapeHtml(w.name)}</b></td>
+        <td><code>${escapeHtml((w.url || '').slice(0, 60))}</code></td>
+        <td>${events.map(escapeHtml).join(', ')}</td>
+        <td><span style="color:${w.enabled ? 'var(--accent)' : 'var(--dim)'}">${w.enabled ? 'on' : 'off'}</span></td>
+        <td>
+          <button class="btn sm" onclick="deleteWebhook(${w.id})">Del</button>
+        </td>
+      </tr>
+    `;
+  }).join('') || '<tr><td colspan="5" style="color:var(--dim);text-align:center;padding:20px">No webhooks registered.</td></tr>';
+  const dtbody = document.getElementById('wh-deliveries-table');
+  dtbody.innerHTML = dlist.map(d => `
+    <tr>
+      <td>${escapeHtml((d.ts || '').slice(0, 19))}</td>
+      <td>#${d.webhook_id}</td>
+      <td>${escapeHtml(d.event_type || '')}</td>
+      <td>${d.status_code ? `<span style="color:${d.status_code < 400 ? 'var(--accent)' : 'var(--red)'}">${d.status_code}</span>` : '<span style="color:var(--red)">fail</span>'}</td>
+      <td>${d.attempt || 1}</td>
+      <td>${(d.duration_ms || 0).toFixed(0)}ms</td>
+    </tr>
+  `).join('') || '<tr><td colspan="6" style="color:var(--dim);text-align:center;padding:20px">No deliveries yet.</td></tr>';
+}
+async function addWebhook() {
+  const name = document.getElementById('wh-name').value.trim();
+  const url = document.getElementById('wh-url').value.trim();
+  const secret = document.getElementById('wh-secret').value.trim();
+  const eventsRaw = document.getElementById('wh-events').value.trim() || '*';
+  const events = eventsRaw === '*' ? ['*'] : eventsRaw.split(',').map(s => s.trim()).filter(s => s);
+  if (!name || !url) { flash('wh-status', 'name and url required', true); return; }
+  const r = await fetchJSON('/admin/webhooks', {
+    method: 'POST',
+    body: JSON.stringify({ name, url, secret, events }),
+  });
+  if (r && !r.error) { document.getElementById('wh-name').value = ''; document.getElementById('wh-url').value = ''; document.getElementById('wh-secret').value = ''; document.getElementById('wh-events').value = ''; flash('wh-status', `Registered ${name}`); loadWebhooksTab(); }
+  else flash('wh-status', (r && r.error) || 'register failed', true);
+}
+async function deleteWebhook(id) {
+  await fetchJSON(`/admin/webhooks/${id}`, { method: 'DELETE' });
+  loadWebhooksTab();
+}
+async function invalidateCache() {
+  const r = await fetchJSON('/admin/cache/invalidate', { method: 'POST', body: '{}' });
+  if (r) { flash('wh-status', `Invalidated ${r.invalidated} entries`); loadWebhooksTab(); }
 }
 
 // ---- LIVE TAB ----

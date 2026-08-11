@@ -1,0 +1,20 @@
+name: microsoft_learn
+version: 0.1.0
+description: Microsoft Learn integration — pulls documentation as RAG context and can invoke Learn APIs.
+module: plugin.py
+prefix: /integrations/microsoft-learn
+auth:
+  scope: admin
+routes:
+  - path: /integrations/microsoft-learn/search
+    method: POST
+    summary: Search Microsoft Learn docs (read-only)
+  - path: /integrations/microsoft-learn/modules
+    method: GET
+    summary: List available Learn modules (interactive)
+events:
+  - learn.search.started
+  - learn.search.completed
+settings:
+  api_base: https://learn.microsoft.com
+  timeout_seconds: 10

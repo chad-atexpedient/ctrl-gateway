@@ -271,6 +271,155 @@ broken format strings, wrong column names) actually surface.
       enforcer short-circuits to allow). `default_action='block'` is the
       safest default — only configured provider domains work. `host_firewall`
       sub-config controls system-level rules.
+34. **Gateway extensions — plugin system, A2A registry, ContextForge
+    connector, MCP discovery, prompt registry, webhooks, tool cache**:
+    - Nine new tables in `memory.py`: `plugins` (name PK, version,
+      enabled, manifest_json, config_json, status, error, paths, ts),
+      `a2a_agents` (id, name, endpoint_url, agent_type, auth_type,
+      auth_value, protocol_version, capabilities_json, config_json,
+      tags_json, enabled), `a2a_virtual_servers` (id, name, description,
+      associated_agents_json, enabled), `a2a_metrics` (id, agent_id,
+      tenant_id, success, latency_ms, interaction_type, error, ts),
+      `prompt_templates` (id, name, category, content, variables_json,
+      enabled, is_builtin, position), `webhooks` (id, name, url,
+      secret, events_json, enabled), `webhook_deliveries` (id, webhook_id,
+      event_type, payload_json, status_code, attempt_count, next_retry_at,
+      response_body, ts), `contextforge_sync_log` (id, direction, entity_type,
+      entity_id, status, detail, ts), `federated_tools` (id, tool_name PK,
+      source, description, input_schema_json, endpoint_url, enabled, tenant_id).
+      Full CRUD for each: `upsert_*`, `get_*`, `list_*`, `set_*_enabled`,
+      `delete_*` (builtins delete-refused where applicable), `record_*`,
+      `*_summary`. No `tenant_id` scoping yet — see "Known unfinished".
+    - **Plugin system** (`gateway/plugin.py`): `manifest.yaml` +
+      `plugin.py` contract adapted from `mcpchad` (which uses FastAPI's
+      `APIRouter`; here plugins return `web.RouteTableDef`). Routes MUST
+      include their full path (e.g. `@router.post("/integrations/foo/bar")`)
+      — there is no `_prefix_route()` helper; aiohttp can't remove routes
+      from a running app so reload re-imports module code but cannot
+      replace already-registered routes. `PluginContext.emit_event()` uses
+      the module-level `events_mod.emit()` (NOT a nonexistent
+      `EventBus.emit()` — that was the P0 bug). `PluginLoader` starts a
+      background `watch_loop` that re-scans `plugins.root` every
+      `scan_interval_seconds`. Plugin event source: `EventSource.PLUGIN`.
+    - **A2A registry** (`gateway/a2a_registry.py`): `invoke_agent()`
+      supports `jsonrpc`/`openai`/`anthropic`/`custom` payload formats,
+      `build_auth_headers()` (api_key/bearer/none), per-agent metrics.
+      SSRF guard runs BEFORE the HTTP call with `allow_localhost=True,
+      allow_private=True` (admin-configured agents reaching local
+      upstreams is a supported case). `invoke_agent` catches all
+      exceptions, records metrics, and returns an `A2AResult` — it never
+      raises except for programming errors. Event source:
+      `EventSource.A2A`.
+    - **ContextForge connector** (`gateway/contextforge_client.py`):
+      `mode` ∈ {`external`, `embedded`, `both`}. External mode fetches
+      agents/servers/tools/prompts via REST and merges into local
+      registries (`_merge_agents`/`_merge_servers`/`_merge_tools`/
+      `_merge_prompts`). Embedded mode exposes
+      `embedded_register_tool`/`embedded_register_prompt` for in-process
+      use. `sync_loop()` periodically pulls. CLI/admin buttons trigger
+      `sync_all()` on demand. SSRF guard runs before every outbound fetch
+      with `allow_localhost=True, allow_private=True`. Event source:
+      `EventSource.CONTEXTFORGE`.
+    - **MCP discovery** (`gateway/mcp_discovery.py`):
+      `DiscoveredServer` dataclass; `discover()` concurrently probes a
+      list of `hosts × ports` via `_probe_well_known` (`/.well-known/
+      mcp.json`, `/.well-known/agent.json`), `_probe_mcp_endpoint` (POST
+      /mcp initialize), and `_probe_sse_endpoint` (GET /sse looking for
+      `text/event-stream`). `watch_loop()` re-probes on
+      `probe_interval_seconds`. Auto-registers discovered servers as
+      `federated_tools`. SSRF-guarded per target with
+      `allow_localhost=True, allow_private=True`. Event source:
+      `EventSource.MCP`. `discovery.probe_mcp_servers()` wraps it.
+    - **Unified MCP facade** (`POST /mcp`, `gateway/mcp_facade.py`):
+      JSON-RPC 2.0 over HTTP. `initialize` returns protocol version
+      `2024-11-05`, server name `glint-v2-gateway`. `tools/list` returns
+      all enabled `federated_tools` plus every enabled `a2a_agent` exposed
+      as a synthetic `a2a_<name>` tool. `tools/call` retrieves the
+      federated tool definition (input schema) and, for A2A-backed
+      tools, calls `invoke_agent` — **going through the tool cache** when
+      initialized (cache key includes tool name + arguments hash + tenant).
+      `prompts/list` + `prompts/get` read from `prompt_templates`.
+    - **Prompt registry** (`gateway/prompt_registry.py`): DB-backed
+      templates with `category` (code/translation/summarization/default/
+      safety). Five builtins (`router_coder`, `router_reviewer`,
+      `translator`, `summarizer`, `safety_refusal`) seeded via
+      `seed_builtin_templates()` (idempotent, marked `is_builtin=1` —
+      builtins can be disabled but not deleted). `render_template()`
+      substitutes `{var}` placeholders found by `extract_variables()`.
+      `inject_into_messages()` prepends/appends the rendered prompt as a
+      system/user/assistant message (position configurable, with
+      `replace_existing_system=True` to overwrite an existing system
+      message). **Wired into `chat_completions()`**: when
+      `prompts.auto_inject` is true, after memory assembly and before
+      translation mode, the gateway looks up a template by
+      `category_for_vertical(r.vertical)`, renders it with context
+      variables, and prepends it as a system message. Event source:
+      `EventSource.PROMPT`.
+    - **Webhook dispatcher** (`gateway/webhook_dispatcher.py`): async
+      fan-out with HMAC SHA-256 signing (`X-Glint-Signature: sha256=<hex>`),
+      exponential backoff retry (`initial_backoff_seconds` ×
+      `backoff_multiplier` ^ attempt, capped at
+      `delivery_timeout_seconds`), bounded concurrency
+      (`max_concurrent_deliveries`), and per-delivery logging into
+      `webhook_deliveries`. Event-type filtering supports `*` wildcards
+      (`_matches()`). `events.publish()` fans out to
+      `dispatcher.dispatch()` for every published event when the
+      dispatcher is initialized — so emitting an event from anywhere in
+      the gateway also triggers registered webhooks. SSRF guard runs
+      before each delivery with `allow_localhost=True,
+      allow_private=True`. Event source: `EventSource.WEBHOOK`.
+    - **Tool cache** (`gateway/tool_cache.py`): LRU + TTL cache, thread-
+      safe. `ToolCache.get(key)` / `set(key, value, ttl)` /
+      `invalidate(by_tool=...)` / `invalidate_all()` / `stats()` /
+      `snapshot(tenant_id=...)`. Supports per-tool TTL overrides
+      (`per_tool_ttl_seconds`), bypass keys (skips cache for sensitive
+      ops like auth/login), and tenant isolation (keys are namespaced by
+      `tenant_id` when provided). Initialized at startup via
+      `init_cache(conf)` and refreshed by `_apply_runtime_config`.
+      **Currently wired only into the MCP facade's `tools/call` path**;
+      A2A `invoke_agent` does NOT consult the cache directly (the facade
+      wraps it). See "Known unfinished" for direct A2A/plugin wiring.
+    - **SSRF protection** (`gateway/ssrf.py`): `validate_url(url,
+      allow_localhost=False, allow_private=False, allow_link_local=False,
+      allowed_hosts=..., blocked_hosts=...)` raises `SSRFBlockedURL`
+      with a reason string on block. `_is_blocked_ip` checks loopback,
+      private (RFC 1918), link-local (169.254 — cloud metadata),
+      reserved, multicast, and unspecified ranges. **Critical IPv6 quirk
+      worked around**: `::1` is BOTH `is_loopback` AND `is_reserved` —
+      when `allow_localhost=True`, the loopback short-circuit returns
+      `None` (allowed) WITHOUT falling through to the `is_reserved`
+      check; otherwise the IPv6 loopback would always be blocked even
+      when the admin explicitly allowed localhost. `safe_url()` is the
+      non-raising variant. Guard is applied at: A2A `invoke_agent`,
+      ContextForge `_fetch`, MCP `_probe_one`, webhook
+      `_deliver_with_retry` — all call with `allow_localhost=True,
+      allow_private=True` (admin-configured integrations reaching
+      in-cluster upstreams is a supported case).
+    - **Dashboard**: 4 new tabs (`Plugins`, `A2A`, `Prompts`, `Webhooks`)
+      added in `gateway/dashboard/index.html` with full CRUD UIs: plugin
+      list/reload/enable/disable, A2A agent CRUD + invoke + test +
+      virtual server CRUD + ContextForge sync button + MCP discover
+      button, prompt template CRUD + edit + preview, webhook CRUD +
+      deliveries table + tool cache stats/invalidate. `flash()` helper
+      for transient status messages. `showTab()` dispatches the new
+      loaders. All vanilla JS, no external deps.
+    - **Config additions** (`gateway-config.json` top-level keys):
+      `plugins` (enabled, root, scan_interval_seconds, auto_load),
+      `a2a` (enabled, max_agents, default_timeout, max_retries,
+      metrics_enabled), `contextforge` (enabled, mode, external_url,
+      api_key, sync_interval_seconds, auto_sync, timeout_seconds),
+      `mcp_discovery` (enabled, probe_interval_seconds, auto_register,
+      hosts[], ports[]), `prompts` (enabled, auto_inject,
+      default_category), `webhooks` (enabled, max_retries,
+      initial_backoff_seconds, backoff_multiplier,
+      delivery_timeout_seconds, max_concurrent_deliveries),
+      `tool_cache` (enabled, max_entries, default_ttl_seconds,
+      per_tool_ttl_seconds{}, bypass_keys[]).
+    - **Sample plugin** (`gateway/plugins/microsoft_learn/`):
+      `manifest.yaml` + `plugin.py` demonstrating the build_router
+      contract with `/integrations/microsoft-learn/search` (POST) and
+      `/integrations/microsoft-learn/modules` (GET) endpoints, event
+      emission, and `context.get_setting()` for the `api_key` setting.
 
 
 ## Router model v2 — MLP heads, real embedding fine-tune, llm_plan swarm (UNVERIFIED)
@@ -332,3 +481,38 @@ prototype separation or needs re-weighting once real data exists.
   never got documented there — only the resulting rule did (topic prototypes
   forbidden; prototypes encode difficulty profile, not topic). If you know
   the real story, add it to README under structural prototypes.
+- **Gateway extensions — known unfinished / do not assume working**:
+  - `tenant_id` is NOT yet a column on `plugins`, `prompt_templates`,
+    `webhooks`, or `federated_tools` — every tenant currently sees every
+    row in those tables. Add a migration + filter-by-tenant on all
+    list/get/upsert paths before exposing this to multi-tenant deployments.
+    `a2a_agents` has `tenant_id` on metrics but not on the agent records
+    themselves.
+  - The tool cache is only consulted by the `/mcp` facade's `tools/call`
+    handler — A2A `invoke_agent` and plugin route handlers do NOT consult
+    the cache directly. If you want caching at the A2A layer, call
+    `tool_cache.cache.get(key)`/`set(...)` inside `invoke_agent` or wrap it
+    at the facade level (see the facade's existing pattern).
+  - Plugin `reload()` re-imports the module and re-runs `build_router`,
+    but already-registered aiohttp routes persist — aiohttp cannot remove
+    routes from a running `Application.router`. The reload method warns
+    about this and recommends a full gateway restart for route changes.
+    Code/config-only updates (no new routes) work fine via reload.
+  - `Microsoft Learn` sample plugin hits no real endpoint — it returns
+    canned data to demonstrate the contract. Wire it to the real
+    Microsoft Learn API before relying on its output.
+  - ContextForge "embedded mode" registers tools/prompts into local tables
+    but does not expose an in-process MCP server surface for them — they
+    surface only through `/mcp` `tools/list`. An in-process dispatch path
+    (skip the HTTP roundtrip) would be a natural follow-up.
+  - The `/mcp` facade does not yet support `resources/*` or `roots/*`
+    MCP method groups — only `initialize`, `tools/list`, `tools/call`,
+    `prompts/list`, `prompts/get`. Add `resources/list` and `resources/read`
+    when there's a concrete use case.
+  - Webhook delivery does not yet respect a per-webhook `max_retries`
+    override — all webhooks use the global `webhooks.max_retries` from
+    config. Add a `max_retries` column to the `webhooks` table if
+    per-webhook tuning is needed.
+  - MCP discovery's `watch_loop` probes every host:port pair on every
+    tick — no jitter, no result caching. With a large `hosts` list this
+    could be noisy; consider adding jitter + a per-host probe cache.

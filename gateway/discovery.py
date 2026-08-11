@@ -200,3 +200,34 @@ async def test_endpoint(
         return {"ok": False, "error": f"timeout after {TEST_TIMEOUT}s", "latency_ms": round((time.time() - t0) * 1000)}
     except Exception as e:
         return {"ok": False, "error": str(e)[:200], "latency_ms": round((time.time() - t0) * 1000)}
+
+
+async def probe_mcp_servers(
+    hosts: list[str] | None = None,
+    ports: list[int] | None = None,
+) -> list[dict]:
+    """Scan the local network for MCP tool servers (Model Context Protocol).
+
+    Wraps `mcp_discovery.discover()` and returns the discovered servers in
+    the discovery dict shape: {name, source_url, server_info, capabilities,
+    transport, tools}. Errors are caught and never raised.
+    """
+    try:
+        from . import mcp_discovery
+        results = await mcp_discovery.discover(hosts=hosts, ports=ports, auto_register=False)
+    except Exception as e:
+        log.warning("probe_mcp_servers failed: %s", e)
+        return []
+    out = []
+    for server in results:
+        out.append(
+            {
+                "name": server.name,
+                "source_url": server.source_url,
+                "server_info": server.server_info,
+                "capabilities": server.capabilities,
+                "transport": server.transport,
+                "tools": server.tools,
+            }
+        )
+    return out

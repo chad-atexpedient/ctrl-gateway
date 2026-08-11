@@ -303,5 +303,72 @@
     "_doc_separate_domain": "Working memory, observations, reflections live in a separate SQLite/Postgres schema (memory_metadata) so they don't pollute the routing_log table. Backups and retention policies can be tuned independently.",
     "compaction_token_threshold_pct": 75,
     "force_observe_on_close": false
+  },
+
+  "_doc_plugins": "Plugin system. Drops plugin directories into ./plugins/ — each must have a manifest.yaml and a plugin.py exposing build_router(context). Hot-reload via POST /admin/plugins/{name}/reload. admin_scope required to register/delete.",
+  "plugins": {
+    "enabled": true,
+    "root": "./plugins",
+    "scan_interval_seconds": 30,
+    "auto_load": true,
+    "_doc_scan_interval": "Background scan interval — picks up newly added plugin directories without restart."
+  },
+
+  "_doc_a2a": "A2A (Agent-to-Agent) agent registry. Inspired by IBM ContextForge's A2A integration. Agents are external AI services (jsonrpc/openai/anthropic/custom protocols) that can be invoked through the gateway. Virtual servers group agents into named bundles.",
+  "a2a": {
+    "enabled": true,
+    "max_agents": 100,
+    "default_timeout": 30,
+    "max_retries": 3,
+    "metrics_enabled": true,
+    "_doc_max_agents": "Upper bound on registered A2A agents. New registrations past this are refused with an error.",
+    "_doc_metrics": "Per-agent metrics collection (success rate, latency, error count) — visible via /admin/a2a/agents/{id}/metrics."
+  },
+
+  "_doc_contextforge": "IBM ContextForge connector. mode='external' connects to a running ContextForge instance; 'embedded' uses the gateway's own registries; 'both' enables both. Auto-sync periodically pulls agents, virtual servers, tools, and prompt templates from ContextForge into the local registries.",
+  "contextforge": {
+    "enabled": false,
+    "mode": "embedded",
+    "external_url": "",
+    "api_key": "",
+    "sync_interval_seconds": 300,
+    "auto_sync": false,
+    "timeout_seconds": 30,
+    "_doc_mode": "'external' = HTTP client to running ContextForge. 'embedded' = use gateway's local registries. 'both' = use both (external sync + local registration)."
+  },
+
+  "_doc_mcp_discovery": "MCP server auto-discovery. Scans candidate hosts/ports for MCP tool servers (Model Context Protocol). Discovered servers can be auto-registered as federated tools.",
+  "mcp_discovery": {
+    "enabled": false,
+    "probe_interval_seconds": 60,
+    "auto_register": false,
+    "hosts": ["localhost", "127.0.0.1"],
+    "ports": [8000, 8080, 8088, 9000, 9090, 3000, 3333]
+  },
+
+  "_doc_prompts": "Prompt template registry. Built-in templates (router_coder, router_reviewer, translator, summarizer, safety_refusal) are seeded at startup. Use /admin/prompts to add custom templates. auto_inject causes app.py to inject a category-matched template into chat completion messages based on routing vertical.",
+  "prompts": {
+    "enabled": true,
+    "auto_inject": false,
+    "default_category": "general"
+  },
+
+  "_doc_webhooks": "Webhook dispatcher. Each registered webhook subscribes to event types and receives an HTTP POST when matching events fire. Delivery is async with retry + exponential backoff; every attempt is recorded into webhook_deliveries.",
+  "webhooks": {
+    "enabled": true,
+    "max_retries": 3,
+    "initial_backoff_seconds": 1.0,
+    "backoff_multiplier": 2.0,
+    "delivery_timeout_seconds": 10.0,
+    "max_concurrent_deliveries": 16
+  },
+
+  "_doc_tool_cache": "LRU + TTL cache for tool / plugin responses. Keys are deterministic hashes of (tool_name, arguments, tenant_id). Hits/misses are tracked and exposed via /admin/cache/stats.",
+  "tool_cache": {
+    "enabled": false,
+    "max_entries": 1024,
+    "default_ttl_seconds": 300,
+    "per_tool_ttl_seconds": {},
+    "bypass_keys": []
   }
 }

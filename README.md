@@ -571,6 +571,203 @@ python -m gateway.app
 # Integration coverage lives in tests/test_integration.py
 ```
 
+## Gateway extensions (plugins, A2A, ContextForge, MCP discovery, prompts, webhooks, tool cache)
+
+Seven new modules extend the gateway with pluggable integrations, A2A agent
+orchestration, IBM ContextForge federation, MCP server auto-discovery, prompt
+template auto-injection, outbound webhook fan-out, and an in-process tool
+response cache. All are gated on opt-in config sections with safe defaults.
+
+### Plugin system (`gateway/plugin.py` and `gateway/plugins/`)
+
+Plugins live under `gateway/plugins/<name>/` and expose:
+
+- `manifest.yaml` — declares `name`, `version`, `prefix`, `routes`, `events`
+  the plugin emits, and per-plugin `settings`.
+- `plugin.py` — exports `build_router(context: PluginContext) ->
+  web.RouteTableDef` returning aiohttp routes. Routes MUST include their
+  full path in the decorator (e.g. `@router.post("/integrations/foo/bar")`)
+  because aiohttp cannot pre-prefix a `RouteTableDef` the way FastAPI does
+  with `APIRouter(prefix=...)`.
+
+The `PluginLoader` (`gateway/plugin.py`) scans `plugins.root` on startup,
+imports each plugin module, calls `build_router`, and registers the returned
+routes on the gateway app. A background `watch_loop` re-scans every
+`scan_interval_seconds`. `plugin.reload(name)` re-imports the module and
+rebuilds the router, but aiohttp cannot remove already-registered routes
+from a running application — code and config-only updates work via reload,
+but adding or changing routes requires a gateway restart. This is an aiohttp
+limitation, documented in the `reload` method.
+
+A sample plugin is shipped at `gateway/plugins/microsoft_learn/`.
+
+Admin API under `/admin/plugins/*`: list, reload, enable/disable, get
+status. Dashboard has a "Plugins" tab.
+
+### A2A registry (`gateway/a2a_registry.py`)
+
+Register and invoke external "A2A" (Agent-to-Agent) agents. Each agent has an
+`agent_type` (`jsonrpc`/`openai`/`anthropic`/`custom`) and optional
+authentication (`api_key`/`bearer`/`none`). `invoke_agent()` builds the
+appropriate payload, runs an SSRF guard, posts to the agent endpoint, parses
+the response, records per-agent metrics, and returns an `A2AResult`. Errors
+are caught and returned as failed results — never raised.
+
+Virtual servers group multiple agents behind a single logical name. The MCP
+facade (below) exposes every enabled A2A agent as a synthetic
+`a2a_<agent_name>` tool.
+
+Admin API under `/admin/a2a/*`: agents CRUD, virtual servers CRUD,
+invoke/test, metrics summary. Dashboard has an "A2A" tab.
+
+### IBM ContextForge connector (`gateway/contextforge_client.py`)
+
+Connects the gateway to a ContextForge registry/server. Three modes:
+
+- `external` — read-only HTTP client; pulls agents, virtual servers, tools,
+  and prompts from a ContextForge REST endpoint and merges them into local
+  DB tables on a `sync_interval_seconds` cadence and via manual
+  `/admin/contextforge/sync`.
+- `embedded` — register tools and prompts directly into local tables for
+  in-process use; no outbound HTTP.
+- `both` — does both: periodic external pull + in-process registration.
+
+Outbound fetches go through the SSRF guard. Every sync attempt is logged to
+the `contextforge_sync_log` table.
+
+### MCP server discovery (`gateway/mcp_discovery.py`)
+
+Auto-discovers MCP-compatible servers in the local network (or a configured
+host list) by probing, with SSRF validation:
+
+- `/.well-known/mcp.json` and `/.well-known/agent.json`
+- An HTTP `initialize` JSON-RPC probe at `/mcp`
+- An SSE text/event-stream probe at `/sse`
+
+Discovered servers are auto-registered as `federated_tools` when
+`auto_register` is enabled. `watch_loop()` re-probes every
+`probe_interval_seconds`.
+
+`discovery.probe_mcp_servers()` in `gateway/discovery.py` wraps this for the
+existing discovery subsystem.
+
+### Unified MCP facade (`gateway/mcp_facade.py`, `POST /mcp`)
+
+A single JSON-RPC 2.0 endpoint that surfaces the entire federated tool space
+to MCP-compatible clients:
+
+- `initialize` — returns `protocolVersion: 2024-11-05`, server name
+  `glint-v2-gateway`.
+- `tools/list` — returns all enabled `federated_tools` plus every enabled
+  A2A agent as a synthetic `a2a_<name>` tool.
+- `tools/call` — for federated tools, retrieves the registered tool
+  definition and dispatches; for A2A-backed tools, calls `invoke_agent`.
+  Results are cached through `ToolCache` when available.
+- `prompts/list` and `prompts/get` — read from the prompt registry.
+
+`resources/*` and `roots/*` MCP method groups are not yet supported.
+
+### Prompt template registry (`gateway/prompt_registry.py`)
+
+DB-backed prompt templates with `category` (code, translation,
+summarization, default, safety). Five builtins are seeded idempotently at
+startup and cannot be deleted (but can be disabled):
+`router_coder`, `router_reviewer`, `translator`, `summarizer`,
+`safety_refusal`.
+
+When `prompts.auto_inject` is enabled, `chat_completions` looks up an
+enabled template by `category_for_vertical(r.vertical)`, renders it with
+context variables, and prepends it as a system message before any
+translation-mode rewrite. `-render_template()` substitutes `{var}`
+placeholders discovered by `extract_variables()`.
+
+Admin API under `/admin/prompts/*`: CRUD, preview/render a template.
+Dashboard has a "Prompts" tab.
+
+### Webhook dispatcher (`gateway/webhook_dispatcher.py`)
+
+Outbound webhook fan-out:
+
+- HMAC SHA-256 signing (`X-Glint-Signature: sha256=<hex>`).
+- Event-type filtering with `*` wildcards (`_matches()`).
+- Exponential backoff retry with up to `max_retries` attempts.
+- Bounded concurrency (`max_concurrent_deliveries`).
+- Per-delivery logging into `webhook_deliveries`.
+
+Every event published via `events.publish()` is automatically dispatched to
+matching webhooks when the dispatcher is initialized — so plugins, A2A
+invocations, prompts, ContextForge syncs, and MCP discovery all fan out
+without each subsystem needing to call the dispatcher directly. Outbound
+delivery goes through the SSRF guard.
+
+Admin API under `/admin/webhooks/*`: CRUD, deliveries table, manual
+dispatch. Dashboard has a "Webhooks" tab.
+
+### Tool response cache (`gateway/tool_cache.py`)
+
+In-process LRU + TTL cache, thread-safe:
+
+- Per-tool TTL overrides via `per_tool_ttl_seconds` map.
+- `bypass_keys` to skip caching for sensitive operations (e.g. auth/login).
+- Tenant isolation: cache keys are namespaced by `tenant_id` when provided.
+- `snapshot(tenant_id=...)` for admin introspection.
+
+Currently consulted only by the MCP facade's `tools/call` path. A2A
+`invoke_agent` and plugin route handlers do not consult the cache directly
+— see AGENTS.md "Known unfinished" if you want to wire it at additional
+layers.
+
+Admin API under `/admin/cache/*`: stats, snapshot, invalidate by tool name,
+flush all.
+
+### SSRF protection (`gateway/ssrf.py`)
+
+All outbound HTTP from A2A, ContextForge, MCP discovery, and webhook
+delivery passes through `ssrf.validate_url()`. Blocks loopback (127.0.0.0/8,
+::1), private (RFC 1918), link-local (169.254 — cloud metadata), reserved,
+multicast, and unspecified IP ranges unless explicitly allowed.
+
+`allow_localhost=True, allow_private=True` is passed by all call sites —
+admin-configured integrations reaching in-cluster upstreams is a supported
+case. IPv6 quirk: `::1` is both `is_loopback` AND `is_reserved`; when
+`allow_localhost=True` the loopback check short-circuits and returns
+"allowed" without falling through to the `is_reserved` check.
+
+### Configuration reference
+
+Add these top-level sections to `gateway-config.json` to enable each module
+(defaults shown — omit to keep the defaults):
+
+```json
+{
+  "plugins": { "enabled": false, "root": "gateway/plugins",
+               "scan_interval_seconds": 30, "auto_load": true },
+  "a2a":     { "enabled": false, "max_agents": 100,
+               "default_timeout": 30, "max_retries": 3,
+               "metrics_enabled": true },
+  "contextforge": { "enabled": false, "mode": "external",
+                    "external_url": null, "api_key": null,
+                    "sync_interval_seconds": 300, "auto_sync": true,
+                    "timeout_seconds": 15 },
+  "mcp_discovery": { "enabled": false,
+                     "probe_interval_seconds": 600,
+                     "auto_register": true,
+                     "hosts": ["localhost"],
+                     "ports": [8076, 8080, 9000] },
+  "prompts": { "enabled": true, "auto_inject": false,
+               "default_category": "default" },
+  "webhooks": { "enabled": false, "max_retries": 5,
+                "initial_backoff_seconds": 1.0,
+                "backoff_multiplier": 2.0,
+                "delivery_timeout_seconds": 10,
+                "max_concurrent_deliveries": 8 },
+  "tool_cache": { "enabled": true, "max_entries": 1024,
+                  "default_ttl_seconds": 300,
+                  "per_tool_ttl_seconds": {},
+                  "bypass_keys": [] }
+}
+```
+
 ## Migration to multi-instance
 
 ```bash

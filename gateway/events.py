@@ -46,6 +46,12 @@ class EventSource(str, Enum):
     SECURITY = "security"
     SWARM = "swarm"
     TRANSLATION = "translation"
+    PLUGIN = "plugin"
+    A2A = "a2a"
+    WEBHOOK = "webhook"
+    CONTEXTFORGE = "contextforge"
+    MCP = "mcp"
+    PROMPT = "prompt"
     SYSTEM = "system"
 
 
@@ -102,6 +108,20 @@ class EventBus:
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(self._notify(event))
+            # Also fan-out to webhooks (if dispatcher initialized)
+            try:
+                from . import webhook_dispatcher
+                disp = webhook_dispatcher.dispatcher()
+                if disp is not None:
+                    loop.create_task(
+                        disp.dispatch(
+                            event_type=event.type,
+                            payload=event.to_dict(),
+                            tenant_id=event.tenant_id,
+                        )
+                    )
+            except Exception as e:
+                log.debug("webhook dispatch skipped: %s", e)
         except RuntimeError:
             # No running loop; sync callbacks only (snapshot to avoid mutation during iteration)
             for cb in list(self._callbacks):
