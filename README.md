@@ -1,774 +1,534 @@
 # Glint-V2
 
-A semantic gateway / transcoder / router for LLM inference fleets. Routes requests to the **cheapest-sufficient** tier (cost = first gate) with **efficiency as the tiebreaker**, escalates on uncertainty to keep first-attempt correctness near 100%, and **auto-trains** itself from feedback + secondary model review.
+A **semantic LLM gateway** that routes requests to the cheapest-sufficient model,
+auto-discovers new models from all providers, learns from feedback, and manages
+a multi-tenant inference fleet — with a plugin system, A2A agent orchestration,
+MCP facade, and a real-time comparison dashboard.
+
+Glint-V2 sits between your application and your LLM providers (OpenAI, Anthropic,
+Google, Ollama, OpenRouter, Groq, Together, DeepSeek, and 15+ others). It
+classifies every request by vertical + complexity, routes it to the cheapest
+model that can handle it, falls back on failure, and learns from the outcomes
+to improve future routing decisions.
+
+---
 
 ## What this is
 
-- **Gateway**: OpenAI-compatible reverse proxy with health checks, breakers, failover, concurrency control, streaming.
-- **Transcoder**: rewrites payloads per endpoint kind (llama.cpp / Ollama / generic OpenAI), bumps `max_tokens` for thinking tiers, reformats vision content, passes SSE through.
-- **Router**: custom hybrid model — frozen sentence embedding + small classifier heads. ~55 verticals, complexity scoring, code/math/reasoning flags, OOD detection. CPU-only, ~1-7 ms per request.
-- **Policy engine**: deterministic pre-routes (vision, OWUI tasks, medical regex, freshness) → cost-first gate → uncertainty escalation → efficiency tie-break → tier ladder (context overflow, breaker, fallback).
-- **Observability**: SQLite (single-instance) or Postgres (multi-instance). Every routing decision logged with model version + policy version + cost estimate.
-- **Data flywheel**: async reviewer (post-response, never blocks the user) labels every prompt independently; high-agreement samples become training data; auto-retrain with eval gate, atomic hot-swap, auto-rollback on regression.
-- **Multi-tenant**: per-user rate limits, cost budgets, tier access.
-- **Security**: prompt-injection detection, sanitization, training-data trust scoring.
-- **Dashboard**: live SPA at `/dashboard`.
+| Layer | What it does |
+|-------|-------------|
+| **Gateway** | OpenAI-compatible reverse proxy. Health checks, circuit breakers, streaming, concurrency control, per-tenant auth. |
+| **Router** | Custom hybrid model — frozen sentence embedding + MLP classifier heads. 65 verticals, complexity scoring, code/math/reasoning flags, OOD detection. CPU-only, ~1–7 ms per request. |
+| **Policy engine** | Deterministic pre-routes (vision, medical, freshness) → cost-first gate → uncertainty escalation → tier ladder. Budget-aware routing with Wilson confidence bounds. |
+| **Model catalog** | Auto-discovers models from OpenRouter (300+), OpenAI, Anthropic, Ollama. Capability scoring, auto-tier assignment, spidergraph comparison. |
+| **Data flywheel** | Async reviewer labels every prompt; high-agreement samples become training data; auto-retrain with eval gate, atomic hot-swap, auto-rollback on regression. |
+| **Extensions** | Plugin system, A2A agent registry, IBM ContextForge connector, MCP discovery + unified facade, prompt templates, webhooks, tool cache, SSRF protection. |
+| **Security** | Prompt-injection detection (block/alert/log), provider domain allowlist, host firewall, SSRF protection, audit log. |
+| **Multi-tenant** | Per-user API keys, rate limits, token/USD budgets, tier access, plan-based quotas. Tenant scoping on all extension tables. |
+
+---
 
 ## Quick start
 
 ```bash
 # 1. Install
-cd C:\Users\maris\glint-v2
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 
 # 2. Configure
-# Edit gateway-config.json with your endpoints + reviewer model.
-# Edit gateway-policy.json with your thresholds/regexes.
-# Set the reviewer API key (default model is "GPT-5.6 Luna"):
-$env:TEACHER_API_KEY = "sk-..."
-$env:TEACHER_BASE_URL = "https://api.your-provider.example/v1"
+cp gateway-config.json gateway-config.runtime.json  # edit as needed
 
-# 3. Generate seed training data
-python router_model/generate_data.py --out router_model/data/base
-
-# 4. Train the router (heads only; embedding is frozen)
-python router_model/train.py
-python router_model/export_onnx.py
-
-# 5. Run
+# 3. Run
 python -m gateway.app
-# Gateway: http://localhost:8076  Dashboard: http://localhost:8076/dashboard
+
+# 4. Open the dashboard
+#    http://localhost:8076/dashboard
 ```
+
+The gateway starts with a local Ollama endpoint by default. Add cloud providers
+via the dashboard's **Providers** tab or the `/admin/endpoints` API.
+
+---
+
+## Architecture
+
+```
+                          ┌──────────────────────────────────────────────┐
+                          │              Glint-V2 Gateway                 │
+                          │                                              │
+  Client ──POST /v1/chat▶│  Auth → Injection Check → Router → Policy    │
+  Client ──POST /mcp────▶│  MCP Facade (tools/list, tools/call)         │
+                          │                    │                         │
+                          │         ┌─────────┴──────────┐              │
+                          │         ▼                    ▼              │
+                          │   Cost-First Route    Budget-Aware Route    │
+                          │   (tier ladder)       (cascade chain)       │
+                          │         │                    │              │
+                          │    Endpoint Pool ◀── Model Catalog          │
+                          │    (breakers, health)  (discovered models)  │
+                          │         │                                    │
+                          │    Transcoder (OpenAI ↔ Ollama ↔ Anthropic) │
+                          │         │                                    │
+  OpenAI ◀───────────────│─────────┘                                    │
+  Anthropic ◀────────────│───────────────┐                              │
+  Ollama ◀───────────────│──────────┐    │                              │
+  OpenRouter ◀───────────│──────────┼────┘                              │
+                          │          │                                   │
+                          │   Reviewer Worker ──▶ Curated Samples       │
+                          │   Trainer Worker ────▶ Auto-Retrain         │
+                          │   Observer Worker ───▶ Observational Memory │
+                          │                                              │
+                          │   Extensions: Plugins, A2A, Webhooks,       │
+                          │   Prompt Templates, Tool Cache, SSRF         │
+                          └──────────────────────────────────────────────┘
+```
+
+### Request lifecycle
+
+1. **Auth**: per-tenant API key resolution (or `X-User-Id` when auth disabled).
+2. **Injection check**: DB-backed regex profiles scan the prompt. `block`-action
+   profiles return HTTP 400 before routing. `alert`/`log` profiles flag but allow.
+3. **Router**: embedding + MLP heads classify into 65 verticals + complexity 1–5
+   + code/math/reasoning/long_output flags. OOD detection for unknown inputs.
+4. **Policy**: deterministic pre-routes (vision, medical regex, OWUI tasks) →
+   cost-first tier selection OR budget-aware cascade chain → escalation paths
+   (OOD, low confidence, top-2 close).
+5. **Transcoder**: rewrites the payload for the target endpoint kind (OpenAI,
+   Ollama, Anthropic, Gemini). Bumps `max_tokens` for thinking tiers.
+6. **Dispatch**: sends with concurrency control, circuit breaker, retry/fallback
+   ladder. Streaming responses pass through as SSE.
+7. **Reviewer** (async, post-response): independently labels the prompt; high-
+   agreement labels become curated training samples.
+8. **Trainer** (periodic): retrains the router from curated samples, eval-gates
+   the result, hot-swaps the model atomically, auto-rollbacks on regression.
+
+---
+
+## Model catalog + discovery
+
+The gateway auto-discovers available models from all configured providers and
+maintains a searchable, comparable catalog with capability scoring.
+
+### Discovery sources
+
+| Provider | Endpoint | Models | Metadata |
+|----------|----------|--------|----------|
+| **OpenRouter** | `/api/v1/models` | 300+ | Per-token pricing, context length, modality, reasoning, tool support |
+| **OpenAI** | `/v1/models` | ~20 | Model IDs (pricing from presets) |
+| **Anthropic** | `/v1/models` | ~5 | Claude family IDs |
+| **Ollama** | `/api/tags` | varies | Locally installed models with family/quantization |
+| **Any OpenAI-compatible** | `/v1/models` | varies | Groq, Together, DeepSeek, Mistral, xAI, etc. |
+
+### Capability scoring
+
+Each discovered model receives a 0.0–1.0 capability score — a transparent,
+tunable weighted blend:
+
+| Factor | Weight | Logic |
+|--------|--------|-------|
+| Context length | up to 0.30 | Log-scaled, capped at 200K |
+| Supports tools | +0.15 | Boolean bonus |
+| Supports vision | +0.10 | Boolean bonus |
+| Supports reasoning | +0.20 | Boolean bonus |
+| Inverse pricing | up to 0.25 | Cheaper = higher (log-scaled) |
+
+### Auto tier assignment
+
+| Score range | Tier | Description |
+|-------------|------|-------------|
+| ≥ 0.80 | tier4 | Frontier models |
+| 0.65–0.80 | tier3 | Strong models |
+| 0.50–0.65 | tier2 | Mid-range |
+| 0.35–0.50 | tier1 | Budget |
+| < 0.35 | tier0 | Weakest/cheapest |
+
+### Auto-registration
+
+`POST /admin/models/auto-register` creates gateway endpoint entries from
+catalog models and assigns them to tiers — breaking the old 1:1 endpoint:model
+coupling. One OpenRouter API key can register 300+ models into the routing
+system in a single call.
+
+### Spidergraph comparison
+
+The dashboard's **Models** tab shows a radar chart comparing up to 5 models
+across 6 axes: Context, Cost Efficiency, Capability, Observed Success Rate,
+Observed Latency, Feature Breadth. The first three are static (from the
+catalog); the latter two are dynamic (from the gateway's actual traffic data
+when available).
+
+### Admin API
+
+```
+POST /admin/models/sync              — trigger provider sync
+GET  /admin/models/catalog           — list with filters (provider, score, features)
+GET  /admin/models/stats             — summary counts
+GET  /admin/models/comparison        — enriched radar data (catalog + quality)
+POST /admin/models/auto-register     — create endpoints from catalog (dry_run + commit)
+PUT  /admin/models/{id}/tier         — manual tier override
+PUT  /admin/models/{id}/enabled      — enable/disable
+```
+
+### Configuration
+
+```json
+{
+  "model_sync": {
+    "enabled": true,
+    "openrouter_enabled": true,
+    "ollama_enabled": true,
+    "anthropic_enabled": false,
+    "providers": [],
+    "sync_interval_seconds": 21600,
+    "auto_sync": false,
+    "timeout_seconds": 30.0
+  }
+}
+```
+
+---
+
+## Subscription budgets + budget-aware routing
+
+Per-tenant token/USD budgets with Wilson-confidence success probability
+estimation and cascade-chain routing:
+
+- **Plans** (`plan_quotas`): daily token/USD limits + required success
+  probability + allowed model whitelist.
+- **Per-model limits** (`model_token_limits`): daily token/USD caps +
+  per-request max tokens for individual models.
+- **Budget-aware router** (`policy.budget_aware_route`): builds a cascade chain
+  ordered by ascending cost, walking candidates until
+  `cascade_success_probability(chain) >= target_success_probability`. Raises
+  `BudgetError("quality_target_unmet")` → HTTP 429 when no chain meets target.
+- **Quality estimation** (`quality.estimate_success_probability`): Wilson lower
+  bound (95% confidence) of observed success rate, clamped to a conservative
+  0.5 prior when <10 samples exist. A new model with zero history CANNOT claim
+  100% confidence.
+
+```
+POST   /admin/plans                           — create plan
+PUT    /admin/plans/{id}                      — update plan
+POST   /admin/users/{tenant}/subscription     — assign plan
+PUT    /admin/users/{tenant}/budget/tokens    — set daily token budget
+PUT    /admin/users/{tenant}/models/{ep}/limits — per-model limits
+GET    /admin/users/{tenant}/limits           — all limits
+GET    /usage                                 — user-facing usage
+GET    /usage/limits                          — user-facing limits
+```
+
+---
+
+## Security Hub
+
+Three layers of protection, all configurable at runtime:
+
+### Prompt-injection detection
+
+DB-backed regex profiles (`injection_profiles` table) with severity
+(low/medium/high/critical) and action (block/alert/log). Six built-in profiles
+seeded at startup: jailbreak, role_override, context_escape, router_manipulation,
+data_exfiltration, semantic_dos. `block`-action profiles return HTTP 400 before
+routing. Custom profiles via `/admin/security/injection-profiles`.
+
+### Provider domain allowlist
+
+`DomainAllowlistEnforcer` governs which LLM provider domains the gateway may
+talk to. Config + DB-backed rules; tenant-specific overrides; unknown domains
+fall back to `default_action` (default: block). Optional `HostFirewallManager`
+enforces at the OS level (Windows `netsh` / Linux `iptables`).
+
+### SSRF protection
+
+`gateway/ssrf.py` validates all outbound HTTP from A2A, ContextForge, MCP
+discovery, and webhook delivery. Blocks loopback, private (RFC 1918), link-local
+(169.254 — cloud metadata), reserved, and multicast IP ranges unless explicitly
+allowed.
+
+```
+GET  /admin/security/events         — audit log
+GET  /admin/security/events/stats   — 7-day summary
+CRUD /admin/security/injection-profiles
+CRUD /admin/security/provider-allowlist
+POST /admin/security/sync-firewall   — sync host firewall rules
+GET  /admin/security/status          — enforcer + host-fw state
+GET  /admin/security/test            — dry-run a URL
+```
+
+---
+
+## Gateway extensions
+
+### Plugin system (`gateway/plugin.py`)
+
+Plugins live under `gateway/plugins/<name>/` with a `manifest.yaml` + `plugin.py`
+exposing `build_router(context) -> web.RouteTableDef`. The `PluginLoader` scans
+on startup, hot-reloads on file changes, and provides `PluginContext` with
+event emission, settings access, and memory. Sample plugin:
+`gateway/plugins/microsoft_learn/`.
+
+### A2A registry (`gateway/a2a_registry.py`)
+
+Register and invoke external Agent-to-Agent endpoints. Supports `jsonrpc`,
+`openai`, `anthropic`, and `custom` payload formats. Per-agent metrics,
+virtual server grouping, tool-cache integration, SSRF-guarded invocation.
+
+### IBM ContextForge connector (`gateway/contextforge_client.py`)
+
+Three modes: `external` (pull from ContextForge REST), `embedded` (in-process
+registration), `both`. Periodic sync loop. Merges agents, virtual servers,
+tools, and prompts into local registries.
+
+### MCP discovery + facade (`gateway/mcp_discovery.py`, `gateway/mcp_facade.py`)
+
+Auto-discovers MCP servers via `/.well-known/mcp.json`, HTTP initialize probe,
+and SSE endpoint scanning. Unified `POST /mcp` JSON-RPC 2.0 facade exposes
+federated tools + A2A agents + prompt templates to any MCP-compatible client.
+Jittered background probing with per-host last-seen cache.
+
+### Prompt templates (`gateway/prompt_registry.py`)
+
+DB-backed templates with category-based auto-injection. Five builtins (coder,
+reviewer, translator, summarizer, safety_refusal). When `prompts.auto_inject`
+is enabled, the gateway looks up a template by vertical category, renders it
+with context variables, and prepends it as a system message.
+
+### Webhook dispatcher (`gateway/webhook_dispatcher.py`)
+
+Async fan-out with HMAC SHA-256 signing, exponential backoff retry, bounded
+concurrency, and per-delivery logging. Every published event fans out to
+matching webhooks automatically. Per-webhook `max_retries` override. Tenant-
+scoped dispatch.
+
+### Tool cache (`gateway/tool_cache.py`)
+
+LRU + TTL cache with tenant isolation, per-tool TTL overrides, and bypass keys.
+Wired into the MCP facade and A2A `invoke_agent`.
+
+### Tenant scoping
+
+All extension tables (`plugins`, `a2a_agents`, `prompt_templates`, `webhooks`,
+`federated_tools`) carry a `tenant_id` column (default `"__all__"`). List/get
+paths filter by `(tenant_id IN ("__all__", caller_tenant))`. The MCP facade,
+webhook dispatcher, and prompt auto-inject all respect tenant scoping.
+
+---
 
 ## Routing pipeline
 
 ```
-request ──→ parse (vision? tools? stream?)
-         ├─ pre-routes (deterministic, override-only)
-         │   ├─ vision present → vision tier
-         │   ├─ "### Task:" pattern → tier0
-         │   ├─ medical keyword regex → tier_medical
-         │   ├─ freshness + cx≤3 → tier0
-         │   └─ structural prototype match → tier4
-         ├─ router (frozen embedding + heads, ~1-7ms)
-         │   ├─ vertical (top-2 + confidence) + complexity + flags
-         │   ├─ OOD check (max-prob threshold)
-         │   └─ inject scan (security.py) → sanitize, never trust injection
-         ├─ policy (cost-first → escalate → ladder → fail)
-         │   ├─ expected_cost = fixed + in×pin + est_out×pout + retry×(1−fit)
-         │   ├─ fit(t,v) = sigmoid((capability_t,v − min_capability_v) × k)
-         │   ├─ escalate: OOD | low-conf | top-2 close | cost within margin
-         │   ├─ tie-break: speed + health + load
-         │   └─ ladder: context overflow ↑, breaker open ↓, error → fallback
-         ├─ budget-aware routing (when tenant has a plan or any token/model limit)
-         │   ├─ capability × per-model quality profile (Wilson lower bound)
-         │   ├─ remaining tenant/model token budget ≤ estimated tokens?
-         │   ├─ cascade chain ≥ target_success_probability (default 0.99)
-         │   └─ 99th-percentile cost to complete (geometric retry)
-         ├─ transcode (per-endkind adapter: llamacpp / openai / ollama)
-         └─ forward + stream (SSE passthrough)
-                ↓
-            response
-                ↓
-        async reviewer queue (post-response, batches of 10)
-                ↓
-        per-model quality sample recorded (success/failure)
-                ↓
-        cascade P(success) updates → future routing decisions
-                ↓
-        threshold met → auto-retrain heads → eval gate → atomic swap
+Input → Router (embedding + MLP heads)
+          ↓
+      Vertical + Complexity + Flags
+          ↓
+    Policy Engine
+    ├── Pre-routes (vision, medical, OWUI, freshness)
+    ├── Cost-first gate (cheapest-sufficient tier)
+    ├── Budget-aware route (cascade chain, Wilson confidence)
+    ├── Uncertainty escalation (OOD, low confidence, top-2 close)
+    └── Tier ladder (context overflow → breaker → fallback)
+          ↓
+    Endpoint Pool (concurrency, breaker, health)
+          ↓
+    Transcoder (OpenAI ↔ Ollama ↔ Anthropic ↔ Gemini)
+          ↓
+    Upstream Provider
 ```
 
-## Subscription budgets, per-model limits, and budget-aware routing
-
-Tenants can be assigned a **subscription plan** that bundles a daily token budget, a daily USD budget, a target success probability (default 99%), and a whitelist of allowed models. Additionally, admins can set per-model limits (daily tokens, daily USD, max-request-tokens) on top of any plan.
-
-### How the router uses these signals
-
-When a tenant has a plan, a daily token budget, or any per-model limit, the simple cost-first picker is replaced by `policy.budget_aware_route`. That routine:
-
-1. Builds candidate models as usual (capability-fit × cost), filtering out anything that can't fit in the remaining tenant/model token budget or isn't on the plan's allowed-models list.
-2. Estimates each candidate's P(success) from a per-model quality profile — Wilson lower bound (95% confidence) of observed success rate, capped to a conservative prior (0.5) until the model has ≥ 10 samples.
-3. Walks the eligible candidates in ascending-cost order, building a **cascade chain** until the union P("at least one succeeds") ≥ target_success_probability.
-4. Surfaces the 99th-percentile cost-to-complete (geometric retry model) in `routing_log.extra` for auditability.
-5. If no chain reaches the target, returns HTTP 429 `quality_target_unmet` — never silently routes to an inadequate model.
-
-### Admin endpoints
-
-```bash
-# Plans
-POST   /admin/plans                                   # create a plan
-PUT    /admin/plans/{plan_id}                         # update a plan
-GET    /admin/plans                                   # list plans
-
-# Per-tenant subscription
-POST   /admin/users/{tenant_id}/subscription         # assign a plan (body: plan_id)
-DELETE /admin/users/{tenant_id}/subscription         # unbind
-GET    /admin/users/{tenant_id}/subscription         # read binding + quota
-
-# Per-tenant daily token budget + target success probability
-PUT    /admin/users/{tenant_id}/budget/tokens
-       # body: {"daily_token_limit": 100000, "target_success_probability": 0.99}
-
-# Per-model limits
-PUT    /admin/users/{tenant_id}/models/{endpoint}/limits
-       # body: {"daily_token_limit": 50000, "daily_usd_limit": 5.0, "max_request_tokens": 4096}
-GET    /admin/users/{tenant_id}/models/{endpoint}/limits
-GET    /admin/users/{tenant_id}/limits                # all limits at once
-
-# Quality samples (recorded by the reviewer)
-GET    /admin/models/quality
-POST   /admin/models/quality
-       # body: {"endpoint_name": "tier1", "vertical": "programming", "complexity": 3, "success": true}
-```
-
-### User-facing endpoints
-
-```bash
-GET /usage          # today's spend + tokens
-GET /usage/limits    # the tenant's daily limits + remaining tokens
-```
-
-### Plan JSON example
-
-```json
-{
-  "plans": {
-    "free": {
-      "daily_token_limit": 100000,
-      "daily_usd_limit": 1.0,
-      "required_success_probability": 0.99,
-      "allowed_models": ["ollama_local"]
-    },
-    "pro": {
-      "daily_token_limit": 1000000,
-      "daily_usd_limit": 25.0,
-      "required_success_probability": 0.99,
-      "allowed_models": ["tier1_model", "tier2_model", "frontier"],
-      "model_limits": {
-        "frontier": {
-          "daily_token_limit": 250000,
-          "daily_usd_limit": 20.0,
-          "max_request_tokens": 128000
-        }
-      }
-    }
-  }
-}
-```
-
-### Closed-loop quality calibration
-
-`quality.record_quality_sample(endpoint, vertical, complexity, success)` is called by the reviewer worker after every labelled decision. Once a model accumulates ≥ 10 samples on a `(vertical, complexity)` bucket, its Wilson lower bound replaces the prior of 0.5. Over time, the cascade chain naturally shortens to the cheapest-fit model whose profile still meets the tenant's target.
-
-
-## Security Hub (firewall + prompt-injection prevention)
-
-Built-in security at the gateway/router layer — no MCP or external tools needed. Three concerns, one API surface (`/admin/security/*`) and one dashboard tab (`Security`).
-
-### Provider firewall — block non-configured domains
-
-Two layers, both shipped:
-
-1. **In-process firewall** (`gateway/firewall.py` → `DomainAllowlistEnforcer`). Every outbound HTTP request from the gateway is checked against an admin-curated allowlist before being sent. `default_action: "block"` (the safe default) means anything not on the allowlist gets a 403 with `error.code = firewall_blocked`. The allowlist is seeded from each `endpoints[*].base_url` at config load, so by default the gateway can ONLY talk to providers you have explicitly configured.
-2. **Host-level firewall** (`HostFirewallManager`). Optional, off by default. On Windows, `netsh advfirewall firewall add rule dir=out action=block remoteip=<ip>`. On Linux, `iptables -A OUTPUT -d <ip> -j DROP`. Both are idempotent on rule name, fail gracefully when the gateway lacks admin/root, and re-sync on config hot-reload.
-
-```jsonc
-"security": {
-  "provider_allowlist": {
-    "enabled": true,
-    "default_action": "block",          // "block" or "allow"
-    "global_patterns": [                // tenant_id="*"
-      "api.openai.com", "*.anthropic.com", "api.groq.com"
-    ],
-    "tenant_overrides": {
-      "alice": {"patterns": ["evil.com"], "action": "block"}
-    },
-    "host_firewall": {
-      "enabled": false,                 // off by default; needs admin/root
-      "platform": "auto",               // windows | linux | macos | auto
-      "persist_on_shutdown": false      // false = clear rules on graceful shutdown
-    }
-  }
-}
-```
-
-Loopback (`localhost`, `127.0.0.1`) always bypasses the check — your local ollama and the test mock endpoints keep working even when the firewall is fully armed. The firewall check runs before the breaker so blocked requests don't trip the breaker counter.
-
-### Prompt-injection prevention — block + alert
-
-Six built-in profiles seeded at startup (`security.DEFAULT_INJECTION_PROFILES`); each profile carries a `severity` (low|medium|high|critical) and an `action` (block|alert|log). The highest-severity match wins.
-
-| Profile | Severity | Action |
-|---|---|---|
-| `jailbreak` | critical | block |
-| `router_manipulation` | critical | block |
-| `role_override` | high | block |
-| `context_escape` | high | block |
-| `semantic_dos` | high | block |
-| `data_exfiltration` | medium | alert |
-
-`action=block` returns HTTP 400 with `error.code = injection_blocked` BEFORE any routing decision — the prompt never reaches the model. `action=alert` logs to `security_events` and continues routing. All matches also write to `flagged_inputs` for backwards-compat with the legacy audit trail. **Routing is never altered by injection signals** (invariant #1 still holds).
-
-You can add custom profiles at runtime without code changes:
-
-```bash
-curl -X POST http://localhost:8076/admin/security/injection-profiles \
-  -H "X-User-Id: admin" \
-  -d '{"name":"my_rules","regexes":["(?i)leak the system prompt"],"severity":"high","action":"block"}'
-
-curl -X PUT http://localhost:8076/admin/security/injection-profiles/7 \
-  -d '{"enabled": false}'
-
-curl -X DELETE http://localhost:8076/admin/security/injection-profiles/7
-```
-
-Built-in profiles can't be deleted (toggle `enabled=false` instead).
-
-### Admin API (`/admin/security/*`)
-
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` | `/admin/security/events` | Audit log (filterable by `tenant_id`, `event_type`, `severity`, `since`, `limit`) |
-| `GET` | `/admin/security/events/stats` | Aggregated counts by type/severity, daily timeline, top patterns |
-| `GET` | `/admin/security/injection-profiles` | List profiles (`?enabled_only=true` filter) |
-| `POST` | `/admin/security/injection-profiles` | Create profile (admin scope) |
-| `PUT` | `/admin/security/injection-profiles/{id}` | Toggle/update profile |
-| `DELETE` | `/admin/security/injection-profiles/{id}` | Delete (refuses built-ins) |
-| `GET` | `/admin/security/provider-allowlist` | List rules (`?tenant_id=...`) |
-| `POST` | `/admin/security/provider-allowlist` | Add rule (tenant_id, pattern, action) |
-| `DELETE` | `/admin/security/provider-allowlist/{tenant_id}/{pattern}` | Remove rule |
-| `POST` | `/admin/security/sync-firewall` | Manually trigger host-firewall sync |
-| `GET` | `/admin/security/status` | Combined in-process + host-firewall state |
-| `POST` | `/admin/security/test` | Dry-run: check a URL against the enforcer |
-
-All endpoints require `admin` scope. CRUD operations on injection profiles and provider allowlist update the in-memory enforcer immediately — no config reload required.
-
-### Dashboard
-
-A new **Security** tab in `/dashboard` shows:
-- 7-day event counts (total, critical+high, in-process blocks, profile count)
-- Firewall status (in-process + host-fw rule counts, in-sync flag, last error)
-- Provider allowlist CRUD UI
-- Injection profile list with one-click toggle
-- Manual host-firewall sync button
-- 20 most recent security events (filterable per-tenant)
-
+---
 
 ## Observational memory (Mastra pattern)
 
-The gateway is the chokepoint for every chat completion, which means it can implement the three-tier memory + observational memory pattern at the routing layer — no per-app memory work needed.
+Per-tenant working memory (`memory_observational.py`) maintains conversation
+context across requests. Features include thread-scoped token counting,
+automatic compaction when approaching context limits, and resource-level
+metadata. Assembled into the message array before routing.
 
-**Three tiers** (`gateway/memory_observational.py`):
+---
 
-  - **L1 — Recency** (`last_messages: 20`): last N messages in the thread. Free, deterministic, always present.
-  - **L2 — Working memory** (per-resource profile): durable per-user document the model rewrites via tool calls. Re-read into context every turn.
-  - **L3 — Semantic recall** (optional, off by default): vector search over all past messages, `top_k: 3` with message range for context. Costs an embedding per stored message.
+## Configuration reference
 
-**Observational memory** (`gateway/observer_worker.py`): a three-agent loop mirroring Mastra's OM:
+Top-level keys in `gateway-config.json`:
 
-  - **Actor** — the chat completion that flows through the gateway. Never sees raw history past the recency window; sees observations + reflection + recency tail instead.
-  - **Observer** — async background worker. Compresses raw unobserved messages into structured observations when token count crosses `message_tokens` (default 12K). Uses a small fast model (tier0 by default).
-  - **Reflector** — async background worker. Condenses observations into a single reflection when observations cross `observation_tokens` (default 20K). Same model tier.
+| Key | Description |
+|-----|-------------|
+| `mode` | `"single"` (SQLite) or `"multi"` (Postgres) |
+| `db_url` | SQLAlchemy connection string |
+| `endpoints` | Provider endpoint definitions |
+| `tiers` | Tier ladder with capability scores |
+| `tenants` | Per-user tier access, budgets, rate limits |
+| `reviewer` | Async reviewer model config |
+| `trainer` | Auto-retrain schedule + thresholds |
+| `embedding` | Router embedding model (ONNX path, checksum) |
+| `routing` | Router thresholds (confidence, OOD, top-2 margin) |
+| `security` | Injection profiles, provider allowlist, host firewall |
+| `auth` | Per-tenant API keys + public paths |
+| `http` | CORS, max body size, health poll interval |
+| `memory` | Observational memory config |
+| `model_sync` | Provider discovery engine config |
+| `plugins` | Plugin loader config |
+| `a2a` | A2A registry config |
+| `contextforge` | ContextForge connector config |
+| `mcp_discovery` | MCP server discovery config |
+| `prompts` | Prompt template auto-inject config |
+| `webhooks` | Webhook dispatcher config |
+| `tool_cache` | LRU + TTL cache config |
 
-Both Observer and Reflector run **asynchronously, never blocking the hot path**. Buffered accumulation means the actor only ever sees a synchronous read of `observations + recency tail`, never a sync compression call.
+---
 
-**Compaction & redirect** (`gateway/policy.py`):
+## API reference
 
-When the assembled memory context exceeds a tier's `max_context` × `compaction_token_threshold_pct` (default 75%), the gateway **redirects** to a higher tier with larger context window. Cost-first arithmetic still applies — we escalate only when no cheaper tier fits. This is the "semantically redirect and compact" pattern: the compacted view stays valid across handoffs.
+### Public endpoints
 
-**Resource vs thread scoping** mirrors Mastra's defaults: `resource_id = tenant_id` (stable per user), `thread_id = session_id` (per chat). Working memory is resource-scoped (survives across chats); observations are thread-scoped by default.
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/v1/chat/completions` | OpenAI-compatible chat (stream + non-stream) |
+| GET | `/v1/models` | List available models (tier-scoped) |
+| GET | `/health` | Liveness probe |
+| GET | `/ready` | Readiness probe (router loaded, endpoints healthy) |
+| POST | `/mcp` | MCP JSON-RPC 2.0 facade |
+| GET | `/dashboard` | Dashboard SPA |
 
-**Event emitter** (`gateway/events.py`): OWUI thinking-indicator pattern adapted. Every state change emits a typed event (routing, memory, observer, reflector, trainer, reviewer, breaker, security) that UI platforms can subscribe to via SSE at `/events`. The dashboard's "Live Event Stream" section (section 11) shows the full flow — observe the "Classifying request..." status emit, the routing decision, the memory context load, and the eventual "Done" — all streaming live.
+### User-facing
 
-```python
-# Subscribe in your UI:
-from gateway import events
-events.emit_status(
-    events.EventSource.OBSERVER,
-    "Compressing 50 messages in thread abc123...",
-    done=False,
-    tenant_id="user-1",
-    session_id="abc123",
-)
-```
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/usage` | Today's token/cost usage |
+| GET | `/usage/limits` | Budget + rate limit status |
+| GET | `/trace` | Recent routing decisions |
+| GET | `/accuracy` | Router accuracy stats |
+| GET | `/cost` | Cost breakdown |
+| GET | `/memory` | Working memory state |
+| GET | `/events/recent` | Recent events |
 
-**Manual triggers**:
+### Admin (requires `admin` scope)
 
-```
-POST /memory/observe  {thread_id, resource_id}   # force compression pass
-POST /memory/reflect  {thread_id, resource_id}   # force consolidation
-GET   /memory/context ?resource_id=X&thread_id=Y # preview assembled context
-GET   /memory/working/{resource_id}              # read durable profile
-POST  /memory/working/{resource_id} {"content": "..."}  # rewrite profile
-GET   /memory/observations/{resource_id}/{thread_id}    # read observations + reflection
-```
+| Method | Path | Description |
+|--------|------|-------------|
+| CRUD | `/admin/endpoints` | Provider endpoints |
+| CRUD | `/admin/tiers` | Tier definitions + endpoint assignments |
+| CRUD | `/admin/users/{tenant}/*` | Tenant budgets, limits, plans |
+| CRUD | `/admin/keys` | API key generation + revocation |
+| POST | `/admin/models/sync` | Trigger model catalog sync |
+| GET | `/admin/models/catalog` | Browse discovered models |
+| GET | `/admin/models/comparison` | Enriched spidergraph data |
+| POST | `/admin/models/auto-register` | Create endpoints from catalog |
+| CRUD | `/admin/plugins` | Plugin management |
+| CRUD | `/admin/a2a/agents` | A2A agent registry |
+| CRUD | `/admin/prompts` | Prompt templates |
+| CRUD | `/admin/webhooks` | Webhook subscribers |
+| GET | `/admin/cache/stats` | Tool cache stats |
+| CRUD | `/admin/security/*` | Security profiles + allowlist + events |
 
-This is what makes the gateway a **memory-aware router**: not just "send to the cheapest tier", but "send to the cheapest tier that has the context this conversation needs, with the relevant history already compressed into it."
+---
 
-## Reviewer model selection
+## Authentication
 
-The reviewer is the **secondary model** that independently labels every prompt for the data flywheel. It is the most important model in the system — its labels become training data, so its quality caps your router's quality.
+Per-tenant API keys with hashed storage (`sha256:<digest>`). Keys are shown once
+on generation. When `auth.enabled` is false, `X-User-Id` header identifies
+tenants (trusted reverse proxy mode).
 
-### Default
+```bash
+# Generate a key
+python -c "import secrets; print(secrets.token_urlsafe(32))"
 
-The default is **GPT-5.6 Luna**, the placeholder we ship with for getting started. It's a generic cloud LLM picked because it has reasonable agreement with most routing decisions at moderate cost. Swap it as soon as you have access to a better model.
-
-### Swap the reviewer model
-
-Edit `gateway-config.json` → `reviewer.model`:
-
-```json
-{
-  "reviewer": {
-    "endpoint": "https://api.your-provider.example/v1",
-    "model": "your-preferred-model-id",
-    "api_key_env": "TEACHER_API_KEY",
-    ...
+# Add to gateway-config.json
+"auth": {
+  "enabled": true,
+  "keys": {
+    "<generated-key>": {"tenant_id": "acme", "scope": ["admin"]}
   }
 }
 ```
 
-Then `POST /reload` — no restart needed.
-
-### What to look for in a reviewer model
-
-The reviewer is called on every routing decision. It does a structured labeling task (JSON output with vertical, complexity, and four flags). The best reviewer models for this job share these traits:
-
-| Trait | Why it matters | Priority |
-|-------|---------------|----------|
-| **Strong instruction-following / JSON-mode** | Must return valid JSON every time; invalid output = discarded + flagged | Critical |
-| **Good calibration** | Should output confidence implicitly via its labels; we use agreement with the router, not the model's own confidence | High |
-| **Decent classification ability** | Needs to assign one of ~55 verticals correctly; doesn't need to be a coding genius, but should recognize domains | High |
-| **Long context support** | Some prompts have large attached code/data; reviewer should be able to see the full thing | Medium |
-| **Cost per million tokens** | Called on every prompt — this is your biggest operational expense | Critical |
-| **Latency** | Runs async, but latency caps throughput of the curation pipeline | Low |
-| **Refuses correctly** | When asked to follow an injection, should refuse and still label (the reviewer system prompt explicitly tells it to label only, not follow user instructions) | High |
-
-### Recommended reviewer models
-
-Pick based on your cost ceiling and quality bar:
-
-**Top tier (best quality, accept the cost):**
-- **GPT-5-class or Claude-4-class API models** — best label agreement, lowest disagreement rate, lowest poison risk
-- Use these if you have a meaningful budget for the flywheel
-
-**Strong mid-tier (good balance):**
-- **GPT-4-class / Claude-3.5-class** — solid labels, reasonable cost, widely available
-- The default for most production deployments
-
-**Budget tier (works, more disagreement to filter):**
-- **GPT-4o-mini / Claude-3-haiku / Llama-3.1-70B via cheap API** — significantly cheaper, but expect higher disagreement rates; you'll need more curated samples to hit the same eval gate
-- Good for getting started when budget is tight
-
-**Self-hosted option (free, but you pay in latency and ops):**
-- **Qwen3.5-9B / Qwen3.5-4B from your own fleet** — point the reviewer at one of your gateway endpoints
-- Free at inference time; costs ~50-200ms per review; conflicts with live traffic if the box is busy
-- Good for full-data-sovereignty deployments
-
-**Avoid for this role:**
-- Tiny instruct models (<3B) — too high disagreement rate, noisy labels
-- Models without JSON-mode / function-calling — too many invalid outputs to be useful
-- Models with strict content filters that refuse medical/clinical text — reviewer needs to label medical prompts correctly
-
-### Context window constraints
-
-The reviewer receives the full prompt text plus the system prompt and JSON schema. The prompt size depends on your traffic:
-
-| Typical prompt size | Min context window |
-|---------------------|-------------------|
-| Short chat (<2K tokens) | 4K |
-| Code generation (<8K tokens) | 16K |
-| Long docs / RAG (<50K tokens) | 64K |
-| Multi-file code analysis (<200K tokens) | 200K+ |
-
-The reviewer gracefully degrades if a prompt exceeds its context: it labels with `truncated: true` and the system downweights those samples in training.
-
-### Cost expectation
-
-Rough budget planning (assumes 10K requests/day, avg prompt 500 tokens):
-
-| Reviewer tier | Cost / 1M input tokens | Monthly cost (approx) |
-|---------------|-----------------------|------------------------|
-| Budget (mini model) | $0.15 | $25 |
-| Mid-tier (4o-mini / 3.5-haiku) | $3 | $450 |
-| Top tier (GPT-5 / Claude-4) | $15 | $2,250 |
-
-Cap these with `reviewer.caps` in `gateway-config.json` — see config schema.
-
-### Switching reviewer model in flight
-
-1. Edit `gateway-config.json` → `reviewer.model`
-2. `POST /reload` (or wait for the next config poll)
-3. New routing decisions are reviewed by the new model
-4. Old curated samples (labeled by the old reviewer) are tagged with `reviewer_model` in the pool — you can filter them out via the training mix ratio if you want a clean break
-
-## Configuration reference
-
-See `gateway-config.json` for full schema with comments. Key sections:
-- `mode`: `single` (SQLite) or `multi` (Postgres)
-- `tenants`: default + per-user overrides
-- `endpoints`: list of `{name, kind, base_url, pricing, speed_tps, max_context, concurrency, breaker_config}`
-- `tiers`: list of `{name, endpoints, max_context, capability_per_vertical, max_tokens_bump}`
-- `reviewer`: `{endpoint, model, api_key_env, batch_size, caps}`
-- `trainer`: `{trigger_threshold, target_accuracy, eval_gate_per_vertical, mix_ratio_base_curated, drift_alarm_threshold, embedding_finetune_manual_only}`
-
-See `gateway-policy.json` for the rule layer:
-- `overrides`: first-match-wins list
-- `escalation`: confidence threshold, top-2 epsilon, cost margin
-- `freshness_regex`, `medical_keyword_regex`, `owui_task_regex`, `injection_regex`
-- `ood_threshold`: max probability below which we flag unknown verticals
-
-## Endpoints
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| POST | `/v1/chat/completions` | Main OpenAI-compatible proxy |
-| GET | `/v1/models` | List models (single "gateway" with capabilities) |
-| GET | `/stats` | Live: requests, errors, health, load, tier distribution |
-| GET | `/config` | Current tier/endpoint configuration |
-| POST | `/reload` | Hot-reload config + policy + prototypes + embedding + taxonomy |
-| GET | `/trace` | Routing decision history (`?limit=N&session=X&vertical=Y`) |
-| POST | `/feedback` | Mark routing decision correct/wrong |
-| GET | `/accuracy` | Accuracy report from feedback |
-| GET | `/export` | Export routing log as training data |
-| GET | `/memory` | Session stats, popular queries |
-| GET | `/verticals` | Per-vertical distribution + accuracy |
-| GET | `/cost` | Per-tier cost / 1K requests, spend caps |
-| GET | `/review-stats` | Reviewer queue depth, spend, agreement rate |
-| GET | `/registry` | Router model versions + scores + rollback pointers |
-| POST | `/retrain` | Manually trigger retraining (optional `--confirm-drift`, `--allow-embedding-finetune`) |
-| GET | `/docs/model-card/{version}` | Auto-generated model card |
-| GET | `/admin/users` | List/create/update tenants |
-| GET | `/admin/users/{id}/budget` | Set daily budget |
-| GET | `/admin/users/{id}/stats` | Per-tenant usage |
-| GET | `/admin/flags` | Suspicious inputs + injected prompts |
-| GET | `/health` | LB probe (multi-instance mode) |
-| GET | `/ready` | Readiness: 200 only when DB reachable AND ≥1 endpoint not breaker-open |
-| GET | `/metrics` | Prometheus text format: request counts, latency, failures, breaker state, queue depth |
-| GET | `/dashboard` | Live SPA dashboard |
-
-## Authentication (per-tenant API keys)
-
-When `auth.enabled` is true in `gateway-config.json`, every request resolves its
-tenant from `Authorization: Bearer <key>`:
-
-```json
-"auth": {
-  "enabled": true,
-  "keys": {
-    "sha256:...": {"tenant_id": "alice", "scope": ["user"], "prefix": "glint-xxxx"}
-  },
-  "admin_paths": ["/admin", "/retrain", "/reload", "/config", "/export", "/registry", "/metrics"],
-  "public_paths": ["/", "/health", "/ready", "/dashboard"],
-  "allow_unauthenticated_user": false
-}
-```
-
-- Auth **fails closed**: with `enabled: true`, every non-public path requires a
-  valid key. The legacy `X-User-Id` header fallback only applies when
-  `allow_unauthenticated_user: true` (trusted reverse proxy deployments).
-- Admin paths require a key with `admin` scope (401 otherwise).
-- Chat/other paths map the key to its `tenant_id` (rate limits, budgets, and
-  all telemetry reads are keyed on it — `/trace`, `/accuracy`, `/cost`,
-  `/review-stats`, and `/memory/*` are ownership-scoped).
-- Keys are stored **hashed** (`sha256:<digest>`); the raw key is shown once at
-  creation. Generate via the dashboard Keys tab, `POST /admin/keys`, or
-  `GLINT_ADMIN_API_KEY` env (see docker-compose).
-- All tenant-facing read endpoints are ownership-scoped; `/metrics` is admin.
-
-Production hardening: body size cap (`http.max_body_bytes`), optional CORS
-(`http.cors_origins`), security headers on every response, `/config` redacts
-keys, SIGTERM/SIGINT graceful drain, JSON-line logging
-(`logging.structured_json`).
-
-## Model routing (OpenAI-compatible)
-
-- `model: "gateway"` (default) → semantic routing (router + cost-first).
-- `model: <endpoint-name-or-model-alias>` → direct routing to that provider;
-  unknown models return an OpenAI-style `model_not_found` error (404).
-- `GET /v1/models` lists `gateway` plus every endpoint the tenant can access.
-- Errors on `/v1/chat/completions` use the OpenAI error envelope
-  (`{"error": {"message", "type", "param", "code"}}`).
-
-## Multi-instance (docker-compose)
-
-Requires env: `POSTGRES_PASSWORD`, `GLINT_DB_URL`, `GLINT_ADMIN_API_KEY`.
-Gateways run non-root, expose only the internal port, health-checked, and are
-load-balanced through the nginx `lb` service. Runtime overlay mutations
-(`/admin/*`) are disabled in `multi` mode — ship config via image/volume.
-
-## Integration tests
-
-`tests/test_integration.py` boots the real gateway against in-process mock
-upstreams (`tests/mock_endpoints.py`) and verifies full-pipeline contracts:
-routing→forward→log, SSE streaming, the retry/fallback ladder, the
-review→curate flywheel, auth enforcement, and JSON-safe traces.
-
-```bash
-python -m unittest tests.test_integration   # integration
-python -m unittest discover -s tests        # everything (unit + integration)
-```
-
-CI (`.github/workflows/ci.yml`) runs ruff, mypy, and the full suite on every push.
+---
 
 ## Project layout
 
 ```
 glint-v2/
-├─ gateway/                aiohttp server
-│  ├─ app.py               routes
-│  ├─ router.py            embedding + heads, atomic swap
-│  ├─ policy.py            pre-routes, cost-first, escalation
-│  ├─ transcoder.py        per-endkind adapters
-│  ├─ endpoints.py         llamacpp/openai/ollama adapters, semaphores
-│  ├─ circuit.py           per-endpoint breakers
-│  ├─ ood.py               out-of-distribution detector
-│  ├─ tenant.py            rate/budget enforcement
-│  ├─ security.py          injection detection, sanitization
-│  ├─ reviewer.py          async queue, batching, caps
-│  ├─ trainer_worker.py    auto-retrain, eval gate, hot-swap, rollback
-│  ├─ memory.py            SQLAlchemy core, all tables
-│  ├─ config.py            hot reload, mode-aware
-│  └─ dashboard/           live SPA
-├─ router_model/
-│  ├─ taxonomy.yaml        ~55 verticals
-│  ├─ prototypes.json      structural-only seed
-│  ├─ generate_data.py     synthetic seed
-│  ├─ train.py             heads training (frozen embedding)
-│  ├─ eval.py              base + live eval
-│  ├─ export_onnx.py       ONNX inference artifact
-│  ├─ embed_finetune.py    contrastive, manual-gated
-│  ├─ registry.json        checkpoint versions, scores
-│  ├─ MODEL_CARD.md        auto-generated per checkpoint
-│  └─ data/                base/, curated/, live-eval/, flagged/
-├─ tests/                  pytest unit tests
-├─ gateway-config.json
-├─ gateway-policy.json
-├─ docker-compose.yml      Postgres for multi-instance mode
-└─ requirements.txt
+├── gateway/
+│   ├── app.py                    — aiohttp app, all routes, init/cleanup
+│   ├── policy.py                 — routing decisions (cost-first, budget-aware)
+│   ├── router.py                 — embedding + MLP heads inference (numpy)
+│   ├── endpoints.py              — endpoint pool, clients, breakers
+│   ├── transcoder.py             — payload rewriting per provider kind
+│   ├── memory.py                 — SQLAlchemy schema + helpers (30+ tables)
+│   ├── memory_observational.py   — working memory (Mastra pattern)
+│   ├── config.py                 — config loading + validation
+│   ├── auth.py                   — per-tenant API key auth
+│   ├── tenant.py                 — tenant state + usage tracking
+│   ├── admin.py                  — overlay manager (live config CRUD)
+│   ├── events.py                 — event bus (pub/sub + webhooks)
+│   ├── discovery.py              — local endpoint probing
+│   ├── model_sync.py             — provider model discovery engine
+│   ├── ssrf.py                   — SSRF protection
+│   ├── firewall.py               — domain allowlist + host firewall
+│   ├── security.py               — injection detection
+│   ├── plugin.py                 — plugin loader
+│   ├── a2a_registry.py           — A2A agent lifecycle
+│   ├── contextforge_client.py    — IBM ContextForge connector
+│   ├── mcp_discovery.py          — MCP server auto-discovery
+│   ├── mcp_facade.py             — unified MCP JSON-RPC endpoint
+│   ├── prompt_registry.py        — prompt template registry
+│   ├── webhook_dispatcher.py     — webhook fan-out with HMAC + retry
+│   ├── tool_cache.py             — LRU + TTL cache
+│   ├── reviewer.py               — async post-response labeler
+│   ├── trainer_worker.py         — auto-retrain pipeline
+│   ├── observer_worker.py        — observational memory worker
+│   ├── swarm.py                  — multi-step task decomposition
+│   ├── ood.py                    — out-of-distribution detection
+│   ├── quality.py                — Wilson confidence success estimation
+│   ├── metrics.py                — Prometheus metrics
+│   ├── provider_presets.json     — 22 provider connection templates
+│   ├── dashboard/
+│   │   └── index.html            — SPA dashboard (10 tabs)
+│   └── plugins/
+│       └── microsoft_learn/      — sample plugin
+├── router_model/
+│   ├── train.py                  — PyTorch MLP training (trunk + heads)
+│   ├── eval.py                   — evaluation (numpy mirror)
+│   ├── embed_finetune.py         — contrastive embedding fine-tune
+│   ├── generate_data.py          — synthetic training data
+│   ├── taxonomy.yaml             — 65 vertical definitions
+│   └── prototypes.json           — structural prototype centroids
+├── tests/
+│   ├── test_unit.py              — unit tests
+│   ├── test_memory.py            — memory + events
+│   ├── test_review_fixes.py      — regression tests
+│   ├── test_integration.py       — end-to-end with mock upstreams
+│   ├── test_security.py          — security hub tests
+│   ├── test_budgets.py           — budget-aware routing tests
+│   ├── test_plugins.py           — extension module tests
+│   └── test_model_catalog.py     — model discovery + catalog tests
+├── gateway-config.json           — main config
+├── gateway-policy.json           — routing policy config
+├── AGENTS.md                     — agent working notes + invariants
+└── requirements.txt
 ```
 
-## Verification
+---
 
-Run unit tests:
-```bash
-pytest tests/            # or: python -m unittest discover -s tests
-```
+## Testing
 
-Lint + type check (CI does this):
 ```bash
+# Unit + integration + extension tests
+python -m unittest discover -s tests
+
+# Or with pytest
+python -m pytest tests/ -v
+
+# Lint + type check
 ruff check gateway tests router_model
 mypy gateway
 ```
 
-Run with mock endpoints (scripted prices/latency/errors/breaker states):
-```bash
-python tests/mock_endpoints.py &
-python -m gateway.app
-# Integration coverage lives in tests/test_integration.py
-```
+Test suite: **313+ tests** covering routing policy, budget enforcement, security
+profiles, plugin system, A2A registry, model catalog, tenant scoping, and
+end-to-end integration with mock upstreams.
 
-## Gateway extensions (plugins, A2A, ContextForge, MCP discovery, prompts, webhooks, tool cache)
+---
 
-Seven new modules extend the gateway with pluggable integrations, A2A agent
-orchestration, IBM ContextForge federation, MCP server auto-discovery, prompt
-template auto-injection, outbound webhook fan-out, and an in-process tool
-response cache. All are gated on opt-in config sections with safe defaults.
-
-### Plugin system (`gateway/plugin.py` and `gateway/plugins/`)
-
-Plugins live under `gateway/plugins/<name>/` and expose:
-
-- `manifest.yaml` — declares `name`, `version`, `prefix`, `routes`, `events`
-  the plugin emits, and per-plugin `settings`.
-- `plugin.py` — exports `build_router(context: PluginContext) ->
-  web.RouteTableDef` returning aiohttp routes. Routes MUST include their
-  full path in the decorator (e.g. `@router.post("/integrations/foo/bar")`)
-  because aiohttp cannot pre-prefix a `RouteTableDef` the way FastAPI does
-  with `APIRouter(prefix=...)`.
-
-The `PluginLoader` (`gateway/plugin.py`) scans `plugins.root` on startup,
-imports each plugin module, calls `build_router`, and registers the returned
-routes on the gateway app. A background `watch_loop` re-scans every
-`scan_interval_seconds`. `plugin.reload(name)` re-imports the module and
-rebuilds the router, but aiohttp cannot remove already-registered routes
-from a running application — code and config-only updates work via reload,
-but adding or changing routes requires a gateway restart. This is an aiohttp
-limitation, documented in the `reload` method.
-
-A sample plugin is shipped at `gateway/plugins/microsoft_learn/`.
-
-Admin API under `/admin/plugins/*`: list, reload, enable/disable, get
-status. Dashboard has a "Plugins" tab.
-
-### A2A registry (`gateway/a2a_registry.py`)
-
-Register and invoke external "A2A" (Agent-to-Agent) agents. Each agent has an
-`agent_type` (`jsonrpc`/`openai`/`anthropic`/`custom`) and optional
-authentication (`api_key`/`bearer`/`none`). `invoke_agent()` builds the
-appropriate payload, runs an SSRF guard, posts to the agent endpoint, parses
-the response, records per-agent metrics, and returns an `A2AResult`. Errors
-are caught and returned as failed results — never raised.
-
-Virtual servers group multiple agents behind a single logical name. The MCP
-facade (below) exposes every enabled A2A agent as a synthetic
-`a2a_<agent_name>` tool.
-
-Admin API under `/admin/a2a/*`: agents CRUD, virtual servers CRUD,
-invoke/test, metrics summary. Dashboard has an "A2A" tab.
-
-### IBM ContextForge connector (`gateway/contextforge_client.py`)
-
-Connects the gateway to a ContextForge registry/server. Three modes:
-
-- `external` — read-only HTTP client; pulls agents, virtual servers, tools,
-  and prompts from a ContextForge REST endpoint and merges them into local
-  DB tables on a `sync_interval_seconds` cadence and via manual
-  `/admin/contextforge/sync`.
-- `embedded` — register tools and prompts directly into local tables for
-  in-process use; no outbound HTTP.
-- `both` — does both: periodic external pull + in-process registration.
-
-Outbound fetches go through the SSRF guard. Every sync attempt is logged to
-the `contextforge_sync_log` table.
-
-### MCP server discovery (`gateway/mcp_discovery.py`)
-
-Auto-discovers MCP-compatible servers in the local network (or a configured
-host list) by probing, with SSRF validation:
-
-- `/.well-known/mcp.json` and `/.well-known/agent.json`
-- An HTTP `initialize` JSON-RPC probe at `/mcp`
-- An SSE text/event-stream probe at `/sse`
-
-Discovered servers are auto-registered as `federated_tools` when
-`auto_register` is enabled. `watch_loop()` re-probes every
-`probe_interval_seconds`.
-
-`discovery.probe_mcp_servers()` in `gateway/discovery.py` wraps this for the
-existing discovery subsystem.
-
-### Unified MCP facade (`gateway/mcp_facade.py`, `POST /mcp`)
-
-A single JSON-RPC 2.0 endpoint that surfaces the entire federated tool space
-to MCP-compatible clients:
-
-- `initialize` — returns `protocolVersion: 2024-11-05`, server name
-  `glint-v2-gateway`.
-- `tools/list` — returns all enabled `federated_tools` plus every enabled
-  A2A agent as a synthetic `a2a_<name>` tool.
-- `tools/call` — for federated tools, retrieves the registered tool
-  definition and dispatches; for A2A-backed tools, calls `invoke_agent`.
-  Results are cached through `ToolCache` when available.
-- `prompts/list` and `prompts/get` — read from the prompt registry.
-
-`resources/*` and `roots/*` MCP method groups are not yet supported.
-
-### Prompt template registry (`gateway/prompt_registry.py`)
-
-DB-backed prompt templates with `category` (code, translation,
-summarization, default, safety). Five builtins are seeded idempotently at
-startup and cannot be deleted (but can be disabled):
-`router_coder`, `router_reviewer`, `translator`, `summarizer`,
-`safety_refusal`.
-
-When `prompts.auto_inject` is enabled, `chat_completions` looks up an
-enabled template by `category_for_vertical(r.vertical)`, renders it with
-context variables, and prepends it as a system message before any
-translation-mode rewrite. `-render_template()` substitutes `{var}`
-placeholders discovered by `extract_variables()`.
-
-Admin API under `/admin/prompts/*`: CRUD, preview/render a template.
-Dashboard has a "Prompts" tab.
-
-### Webhook dispatcher (`gateway/webhook_dispatcher.py`)
-
-Outbound webhook fan-out:
-
-- HMAC SHA-256 signing (`X-Glint-Signature: sha256=<hex>`).
-- Event-type filtering with `*` wildcards (`_matches()`).
-- Exponential backoff retry with up to `max_retries` attempts.
-- Bounded concurrency (`max_concurrent_deliveries`).
-- Per-delivery logging into `webhook_deliveries`.
-
-Every event published via `events.publish()` is automatically dispatched to
-matching webhooks when the dispatcher is initialized — so plugins, A2A
-invocations, prompts, ContextForge syncs, and MCP discovery all fan out
-without each subsystem needing to call the dispatcher directly. Outbound
-delivery goes through the SSRF guard.
-
-Admin API under `/admin/webhooks/*`: CRUD, deliveries table, manual
-dispatch. Dashboard has a "Webhooks" tab.
-
-### Tool response cache (`gateway/tool_cache.py`)
-
-In-process LRU + TTL cache, thread-safe:
-
-- Per-tool TTL overrides via `per_tool_ttl_seconds` map.
-- `bypass_keys` to skip caching for sensitive operations (e.g. auth/login).
-- Tenant isolation: cache keys are namespaced by `tenant_id` when provided.
-- `snapshot(tenant_id=...)` for admin introspection.
-
-Currently consulted only by the MCP facade's `tools/call` path. A2A
-`invoke_agent` and plugin route handlers do not consult the cache directly
-— see AGENTS.md "Known unfinished" if you want to wire it at additional
-layers.
-
-Admin API under `/admin/cache/*`: stats, snapshot, invalidate by tool name,
-flush all.
-
-### SSRF protection (`gateway/ssrf.py`)
-
-All outbound HTTP from A2A, ContextForge, MCP discovery, and webhook
-delivery passes through `ssrf.validate_url()`. Blocks loopback (127.0.0.0/8,
-::1), private (RFC 1918), link-local (169.254 — cloud metadata), reserved,
-multicast, and unspecified IP ranges unless explicitly allowed.
-
-`allow_localhost=True, allow_private=True` is passed by all call sites —
-admin-configured integrations reaching in-cluster upstreams is a supported
-case. IPv6 quirk: `::1` is both `is_loopback` AND `is_reserved`; when
-`allow_localhost=True` the loopback check short-circuits and returns
-"allowed" without falling through to the `is_reserved` check.
-
-### Configuration reference
-
-Add these top-level sections to `gateway-config.json` to enable each module
-(defaults shown — omit to keep the defaults):
-
-```json
-{
-  "plugins": { "enabled": false, "root": "gateway/plugins",
-               "scan_interval_seconds": 30, "auto_load": true },
-  "a2a":     { "enabled": false, "max_agents": 100,
-               "default_timeout": 30, "max_retries": 3,
-               "metrics_enabled": true },
-  "contextforge": { "enabled": false, "mode": "external",
-                    "external_url": null, "api_key": null,
-                    "sync_interval_seconds": 300, "auto_sync": true,
-                    "timeout_seconds": 15 },
-  "mcp_discovery": { "enabled": false,
-                     "probe_interval_seconds": 600,
-                     "auto_register": true,
-                     "hosts": ["localhost"],
-                     "ports": [8076, 8080, 9000] },
-  "prompts": { "enabled": true, "auto_inject": false,
-               "default_category": "default" },
-  "webhooks": { "enabled": false, "max_retries": 5,
-                "initial_backoff_seconds": 1.0,
-                "backoff_multiplier": 2.0,
-                "delivery_timeout_seconds": 10,
-                "max_concurrent_deliveries": 8 },
-  "tool_cache": { "enabled": true, "max_entries": 1024,
-                  "default_ttl_seconds": 300,
-                  "per_tool_ttl_seconds": {},
-                  "bypass_keys": [] }
-}
-```
-
-## Migration to multi-instance
+## Multi-instance
 
 ```bash
 # 1. Start Postgres
@@ -784,3 +544,37 @@ python -m gateway.memory migrate --from sqlite:///glint-v2.db --to postgresql+ps
 # 4. Run multiple gateway instances behind LB
 docker compose up --scale gateway=3
 ```
+
+---
+
+## Dashboard
+
+The dashboard at `/dashboard` has 11 tabs:
+
+| Tab | Description |
+|-----|-------------|
+| **Live** | Real-time stats: decisions, model count, endpoint health, cost, trace |
+| **Providers** | Add/edit/delete provider endpoints + tier assignments |
+| **Keys** | API key generation + revocation |
+| **Routing** | Tier ladder visualization + capability per vertical |
+| **Models** | Model catalog table + sync + auto-register + spidergraph radar |
+| **Flywheel** | Curated samples, training pipeline, router version, confusion graph |
+| **Security** | Injection events, profiles, allowlist, firewall status |
+| **Plugins** | Plugin management + reload + enable/disable |
+| **A2A** | Agent registry + virtual servers + ContextForge sync + MCP discover |
+| **Prompts** | Template CRUD + preview + auto-inject config |
+| **Webhooks** | Webhook CRUD + delivery log + tool cache stats |
+
+Pure vanilla JS — no external dependencies, no build step.
+
+---
+
+## Verification
+
+```bash
+ruff check gateway tests router_model
+mypy gateway
+python -m unittest discover -s tests
+```
+
+All three must pass before any change is trusted.
