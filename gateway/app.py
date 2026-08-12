@@ -58,6 +58,7 @@ from . import mcp_discovery as mcp_disc_mod
 from . import mcp_facade as mcp_facade_mod
 from . import memory_observational as om
 from . import metrics as metrics_mod
+from . import model_sync as model_sync_mod
 from . import ood as ood_mod
 from . import plugin as plugin_mod
 from . import policy as policy_mod
@@ -78,6 +79,7 @@ TOOL_CACHE: tool_cache_mod.ToolCache | None = None
 WEBHOOK_DISPATCHER: webhook_mod.WebhookDispatcher | None = None
 CONTEXTFORGE_CLIENT: cf_mod.ContextForgeClient | None = None
 MCP_DISCOVERY_TASK: asyncio.Task | None = None
+MODEL_SYNC_ENGINE: model_sync_mod.ModelSyncEngine | None = None
 
 
 async def init_app(conf_path: str = "./gateway-config.json") -> web.Application:
@@ -274,6 +276,32 @@ async def init_app(conf_path: str = "./gateway-config.json") -> web.Application:
     else:
         CONTEXTFORGE_CLIENT = None
 
+    # Model sync engine (auto-discover models from OpenRouter, OpenAI, etc.)
+    ms_config = conf.config.get("model_sync", {}) or {}
+    if ms_config.get("enabled", True):
+        try:
+            # Build the list of OpenAI-compatible providers from presets + config.
+            compat_providers = ms_config.get("providers", []) or []
+            MODEL_SYNC_ENGINE = model_sync_mod.init_sync_engine(
+                openrouter_enabled=bool(ms_config.get("openrouter_enabled", True)),
+                openai_base_url=ms_config.get("openai_base_url"),
+                openai_api_key_env=ms_config.get("openai_api_key_env", "OPENAI_API_KEY"),
+                anthropic_api_key_env=ms_config.get("anthropic_api_key_env", "ANTHROPIC_API_KEY"),
+                anthropic_enabled=bool(ms_config.get("anthropic_enabled", False)),
+                ollama_base_url=ms_config.get("ollama_base_url", "http://localhost:11434"),
+                ollama_enabled=bool(ms_config.get("ollama_enabled", True)),
+                openai_compatible_providers=compat_providers,
+                sync_interval_seconds=int(ms_config.get("sync_interval_seconds", model_sync_mod.DEFAULT_SYNC_INTERVAL_SECONDS)),
+                auto_sync=bool(ms_config.get("auto_sync", False)),
+                timeout_seconds=float(ms_config.get("timeout_seconds", 30.0)),
+            )
+            if MODEL_SYNC_ENGINE.auto_sync:
+                MODEL_SYNC_ENGINE.start_sync_loop()
+        except Exception as e:
+            log.warning("Model sync engine init failed: %s", e)
+    else:
+        MODEL_SYNC_ENGINE = None
+
     # Set current config for policy atom-eval
     policy_mod.set_current_config(conf)
 
@@ -426,6 +454,12 @@ async def init_app(conf_path: str = "./gateway-config.json") -> web.Application:
     # Tool cache
     app.router.add_get("/admin/cache/stats", admin_cache_stats)
     app.router.add_post("/admin/cache/invalidate", admin_cache_invalidate)
+    # Model catalog + sync
+    app.router.add_post("/admin/models/sync", admin_models_sync)
+    app.router.add_get("/admin/models/catalog", admin_models_catalog)
+    app.router.add_get("/admin/models/stats", admin_models_stats)
+    app.router.add_put("/admin/models/{model_id}/tier", admin_models_set_tier)
+    app.router.add_put("/admin/models/{model_id}/enabled", admin_models_set_enabled)
     # MCP facade — unified JSON-RPC endpoint for tools/list, tools/call, prompts/list
     app.router.add_post("/mcp", mcp_facade_mod.handle_mcp_rpc)
     app.router.add_get("/admin/provider-presets", get_provider_presets)
@@ -691,6 +725,10 @@ async def _cleanup_resources(app: web.Application):
             await webhook_dispatcher.close()
         except Exception as e:
             log.warning("webhook dispatcher close failed: %s", e)
+    # Stop model sync loop
+    ms_engine = model_sync_mod.engine()
+    if ms_engine is not None:
+        ms_engine.stop_sync_loop()
     await asyncio.to_thread(memory.close_engine)
 
 
@@ -3624,6 +3662,105 @@ async def admin_cache_invalidate(request: web.Request):
     tool_name = body.get("tool_name")
     removed = cache.invalidate(tool_name=tool_name)
     return web.json_response({"invalidated": removed, "tool_name": tool_name})
+
+
+# ============================================================
+# Model catalog + sync admin handlers
+# ============================================================
+
+
+async def admin_models_sync(request: web.Request):
+    """Trigger a model catalog sync from all enabled providers."""
+    try:
+        body = await request.json() if request.body_exists else {}
+    except Exception:
+        body = {}
+    # Allow overriding provider selection from the request body.
+    eng = model_sync_mod.engine()
+    if eng is None:
+        return web.json_response(
+            {"error": "model sync engine not initialized (enable model_sync in config)"},
+            status=400,
+        )
+    # Optionally override which providers to sync.
+    if body.get("providers"):
+        wanted = set(body["providers"])
+        summaries: list[dict] = []
+        if "openrouter" in wanted:
+            s = await eng.sync_openrouter()
+            summaries.append(s.to_dict())
+        if "openai" in wanted:
+            s = await eng.sync_openai()
+            summaries.append(s.to_dict())
+        if "anthropic" in wanted:
+            s = await eng.sync_anthropic()
+            summaries.append(s.to_dict())
+        if "ollama" in wanted:
+            s = await eng.sync_ollama()
+            summaries.append(s.to_dict())
+        return web.json_response({"results": summaries})
+    # Full sync
+    results = await eng.sync_all()
+    return web.json_response({"results": [r.to_dict() for r in results]})
+
+
+async def admin_models_catalog(request: web.Request):
+    """List model catalog entries with optional filters."""
+    provider = request.query.get("provider")
+    enabled_only = request.query.get("enabled_only", "").lower() in ("1", "true", "yes")
+    min_score = request.query.get("min_capability_score")
+    supports_tools = request.query.get("supports_tools", "").lower() in ("1", "true", "yes") or None
+    supports_vision = request.query.get("supports_vision", "").lower() in ("1", "true", "yes") or None
+    supports_reasoning = request.query.get("supports_reasoning", "").lower() in ("1", "true", "yes") or None
+    min_ctx = request.query.get("min_context_length")
+    limit = int(request.query.get("limit", "500"))
+    entries = memory.list_model_catalog(
+        provider=provider,
+        enabled_only=enabled_only,
+        min_capability_score=float(min_score) if min_score else None,
+        supports_tools=supports_tools if isinstance(supports_tools, bool) else None,
+        supports_vision=supports_vision if isinstance(supports_vision, bool) else None,
+        supports_reasoning=supports_reasoning if isinstance(supports_reasoning, bool) else None,
+        min_context_length=int(min_ctx) if min_ctx else None,
+        limit=limit,
+    )
+    return web.json_response({"models": [_jsonify(e) for e in entries], "count": len(entries)})
+
+
+async def admin_models_stats(request: web.Request):
+    """Return summary stats for the model catalog."""
+    stats = memory.model_catalog_stats()
+    return web.json_response(stats)
+
+
+async def admin_models_set_tier(request: web.Request):
+    """Manually set the tier assignment for a model."""
+    model_id = request.match_info["model_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    tier = body.get("tier")
+    provider = body.get("provider", "openrouter")
+    ok = memory.set_model_catalog_tier(model_id, provider, tier)
+    if not ok:
+        return web.json_response({"error": "model not found"}, status=404)
+    return web.json_response({"model_id": model_id, "provider": provider, "tier": tier})
+
+
+async def admin_models_set_enabled(request: web.Request):
+    """Enable/disable a model in the catalog."""
+    model_id = request.match_info["model_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    enabled = bool(body.get("enabled", True))
+    provider = body.get("provider", "openrouter")
+    ok = memory.set_model_catalog_enabled(model_id, provider, enabled)
+    if not ok:
+        return web.json_response({"error": "model not found"}, status=404)
+    return web.json_response({"model_id": model_id, "provider": provider, "enabled": enabled})
 
 
 # ============================================================

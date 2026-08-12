@@ -370,5 +370,21 @@
     "default_ttl_seconds": 300,
     "per_tool_ttl_seconds": {},
     "bypass_keys": []
+  },
+
+  "_doc_model_sync": "Auto-discovers available models from all providers (OpenRouter aggregates 300+ models with pricing/metadata, plus OpenAI /v1/models, Anthropic /v1/models, Ollama /api/tags). Populates the model_catalog table. Each model gets a capability_score (0-1) and auto-tier assignment. POST /admin/models/sync triggers a manual sync. auto_sync=true starts a background loop (every sync_interval_seconds). providers[] is a list of extra OpenAI-compatible providers: [{name, base_url, api_key_env}].",
+  "model_sync": {
+    "enabled": true,
+    "openrouter_enabled": true,
+    "openai_base_url": null,
+    "openai_api_key_env": "OPENAI_API_KEY",
+    "anthropic_enabled": false,
+    "anthropic_api_key_env": "ANTHROPIC_API_KEY",
+    "ollama_enabled": true,
+    "ollama_base_url": "http://localhost:11434",
+    "providers": [],
+    "sync_interval_seconds": 21600,
+    "auto_sync": false,
+    "timeout_seconds": 30.0
   }
 }

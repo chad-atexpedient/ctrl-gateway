@@ -33,6 +33,7 @@ Tables:
   webhook_deliveries — delivery log (success/failure/response)
   contextforge_sync_log — ContextForge connector sync history
   federated_tools  — tools federated from external sources (ContextForge, etc.)
+  model_catalog    — auto-discovered models from all providers (OpenRouter, OpenAI, etc.)
 """
 from __future__ import annotations
 
@@ -573,6 +574,43 @@ federated_tools = Table(
     Column("tenant_id", String(64), default="__all__", index=True),
     Column("last_synced", DateTime),
     Column("created_at", DateTime, default=lambda: datetime.now(UTC)),
+)
+
+
+model_catalog = Table(
+    "model_catalog",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    # Composite uniqueness: the same model_id can appear from multiple
+    # providers (e.g. "gpt-4o" from OpenAI direct AND from OpenRouter).
+    Column("model_id", String(128), index=True),  # e.g. "openai/gpt-4o"
+    Column("provider", String(64), index=True),    # "openrouter", "openai", "anthropic", "ollama"
+    Column("display_name", String(256)),
+    Column("description", Text),
+    Column("context_length", Integer),              # max tokens in+out
+    Column("max_completion_tokens", Integer),
+    Column("modality", String(64)),                 # "text->text", "text->image", etc.
+    Column("input_modalities_json", Text),          # JSON: ["text", "image"]
+    Column("output_modalities_json", Text),         # JSON: ["text"]
+    # Pricing in USD per 1K tokens (normalized from per-token where needed).
+    Column("pricing_prompt_per_1k", Float),
+    Column("pricing_completion_per_1k", Float),
+    Column("pricing_cached_per_1k", Float),         # cached input token price
+    Column("supports_tools", Boolean),
+    Column("supports_reasoning", Boolean),
+    Column("supports_vision", Boolean),
+    Column("supported_parameters_json", Text),       # JSON array from provider API
+    # Computed capability score (0.0–1.0) used for tier auto-assignment
+    # and spidergraph visualization. Computed by model_sync._capability_score.
+    Column("capability_score", Float),
+    # Auto-assigned tier name (tier0–tier4) or NULL if not yet assigned.
+    Column("tier_assignment", String(32)),
+    # Full raw JSON from the provider's API response — preserved for
+    # forward compatibility when providers add new fields.
+    Column("raw_metadata", Text),
+    Column("enabled", Boolean, default=True),
+    Column("discovered_at", DateTime, default=lambda: datetime.now(UTC)),
+    Column("last_synced", DateTime, default=lambda: datetime.now(UTC), index=True),
 )
 
 
@@ -3602,3 +3640,259 @@ def delete_federated_tool(name: str) -> bool:
     except Exception as e:
         log.warning("delete_federated_tool failed: %s", e)
         return False
+
+
+# =====================================================================
+# Model catalog — auto-discovered models from all providers
+# =====================================================================
+
+
+def upsert_model_catalog_entry(
+    model_id: str,
+    provider: str,
+    display_name: str = "",
+    description: str = "",
+    context_length: int | None = None,
+    max_completion_tokens: int | None = None,
+    modality: str = "text->text",
+    input_modalities: list[str] | None = None,
+    output_modalities: list[str] | None = None,
+    pricing_prompt_per_1k: float | None = None,
+    pricing_completion_per_1k: float | None = None,
+    pricing_cached_per_1k: float | None = None,
+    supports_tools: bool = False,
+    supports_reasoning: bool = False,
+    supports_vision: bool = False,
+    supported_parameters: list[str] | None = None,
+    capability_score: float | None = None,
+    tier_assignment: str | None = None,
+    raw_metadata: dict | None = None,
+    enabled: bool = True,
+) -> dict:
+    """Insert or update a model catalog entry. Keyed on (model_id, provider)."""
+    now = datetime.now(UTC)
+    try:
+        with begin() as conn:
+            existing = conn.execute(
+                select(model_catalog).where(
+                    (model_catalog.c.model_id == model_id)
+                    & (model_catalog.c.provider == provider)
+                )
+            ).mappings().first()
+            values = dict(
+                display_name=display_name,
+                description=description,
+                context_length=context_length,
+                max_completion_tokens=max_completion_tokens,
+                modality=modality,
+                input_modalities_json=json.dumps(input_modalities or ["text"]),
+                output_modalities_json=json.dumps(output_modalities or ["text"]),
+                pricing_prompt_per_1k=pricing_prompt_per_1k,
+                pricing_completion_per_1k=pricing_completion_per_1k,
+                pricing_cached_per_1k=pricing_cached_per_1k,
+                supports_tools=supports_tools,
+                supports_reasoning=supports_reasoning,
+                supports_vision=supports_vision,
+                supported_parameters_json=json.dumps(supported_parameters or []),
+                capability_score=capability_score,
+                tier_assignment=tier_assignment,
+                raw_metadata=json.dumps(raw_metadata or {}),
+                enabled=enabled,
+                last_synced=now,
+            )
+            if existing:
+                conn.execute(
+                    update(model_catalog)
+                    .where(
+                        (model_catalog.c.model_id == model_id)
+                        & (model_catalog.c.provider == provider)
+                    )
+                    .values(**values)
+                )
+            else:
+                conn.execute(
+                    insert(model_catalog).values(
+                        model_id=model_id,
+                        provider=provider,
+                        discovered_at=now,
+                        **values,
+                    )
+                )
+        row = get_model_catalog_entry(model_id, provider)
+        return row or {}
+    except Exception as e:
+        log.warning("upsert_model_catalog_entry failed: %s", e)
+        return {"error": str(e)}
+
+
+def get_model_catalog_entry(
+    model_id: str, provider: str
+) -> dict | None:
+    try:
+        with begin() as conn:
+            row = conn.execute(
+                select(model_catalog).where(
+                    (model_catalog.c.model_id == model_id)
+                    & (model_catalog.c.provider == provider)
+                )
+            ).mappings().first()
+            return dict(row) if row else None
+    except Exception as e:
+        log.warning("get_model_catalog_entry failed: %s", e)
+        return None
+
+
+def list_model_catalog(
+    provider: str | None = None,
+    enabled_only: bool = False,
+    min_capability_score: float | None = None,
+    supports_tools: bool | None = None,
+    supports_vision: bool | None = None,
+    supports_reasoning: bool | None = None,
+    min_context_length: int | None = None,
+    limit: int = 500,
+) -> list[dict]:
+    """List model catalog entries with optional filters."""
+    try:
+        with begin() as conn:
+            stmt = select(model_catalog)
+            if provider:
+                stmt = stmt.where(model_catalog.c.provider == provider)
+            if enabled_only:
+                stmt = stmt.where(model_catalog.c.enabled.is_(True))
+            if min_capability_score is not None:
+                stmt = stmt.where(model_catalog.c.capability_score >= min_capability_score)
+            if supports_tools is not None:
+                stmt = stmt.where(model_catalog.c.supports_tools.is_(supports_tools))
+            if supports_vision is not None:
+                stmt = stmt.where(model_catalog.c.supports_vision.is_(supports_vision))
+            if supports_reasoning is not None:
+                stmt = stmt.where(model_catalog.c.supports_reasoning.is_(supports_reasoning))
+            if min_context_length is not None:
+                stmt = stmt.where(model_catalog.c.context_length >= min_context_length)
+            stmt = stmt.order_by(
+                model_catalog.c.capability_score.desc().nullslast(),
+                model_catalog.c.model_id.asc(),
+            ).limit(limit)
+            return [dict(r) for r in conn.execute(stmt).mappings().all()]
+    except Exception as e:
+        log.warning("list_model_catalog failed: %s", e)
+        return []
+
+
+def list_model_catalog_by_provider() -> dict[str, list[dict]]:
+    """Group catalog entries by provider. Returns {provider: [entries]}."""
+    entries = list_model_catalog()
+    grouped: dict[str, list[dict]] = {}
+    for e in entries:
+        p = e.get("provider", "unknown")
+        grouped.setdefault(p, []).append(e)
+    return grouped
+
+
+def set_model_catalog_enabled(
+    model_id: str, provider: str, enabled: bool
+) -> bool:
+    try:
+        with begin() as conn:
+            result = conn.execute(
+                update(model_catalog)
+                .where(
+                    (model_catalog.c.model_id == model_id)
+                    & (model_catalog.c.provider == provider)
+                )
+                .values(enabled=enabled)
+            )
+        return bool(result.rowcount and result.rowcount > 0)
+    except Exception as e:
+        log.warning("set_model_catalog_enabled failed: %s", e)
+        return False
+
+
+def set_model_catalog_tier(
+    model_id: str, provider: str, tier: str | None
+) -> bool:
+    try:
+        with begin() as conn:
+            result = conn.execute(
+                update(model_catalog)
+                .where(
+                    (model_catalog.c.model_id == model_id)
+                    & (model_catalog.c.provider == provider)
+                )
+                .values(tier_assignment=tier)
+            )
+        return bool(result.rowcount and result.rowcount > 0)
+    except Exception as e:
+        log.warning("set_model_catalog_tier failed: %s", e)
+        return False
+
+
+def delete_model_catalog_entry(model_id: str, provider: str) -> bool:
+    try:
+        with begin() as conn:
+            conn.execute(
+                delete(model_catalog).where(
+                    (model_catalog.c.model_id == model_id)
+                    & (model_catalog.c.provider == provider)
+                )
+            )
+            return True
+    except Exception as e:
+        log.warning("delete_model_catalog_entry failed: %s", e)
+        return False
+
+
+def model_catalog_stats() -> dict:
+    """Summary stats for the model catalog."""
+    try:
+        with begin() as conn:
+            total = conn.execute(
+                select(func.count()).select_from(model_catalog)
+            ).scalar() or 0
+            enabled = conn.execute(
+                select(func.count()).select_from(model_catalog).where(
+                    model_catalog.c.enabled.is_(True)
+                )
+            ).scalar() or 0
+            by_provider_raw = conn.execute(
+                select(
+                    model_catalog.c.provider,
+                    func.count(),
+                ).group_by(model_catalog.c.provider)
+            ).all()
+            by_provider = {row[0]: row[1] for row in by_provider_raw}
+            avg_context = conn.execute(
+                select(func.avg(model_catalog.c.context_length))
+            ).scalar()
+            avg_cost = conn.execute(
+                select(func.avg(model_catalog.c.pricing_prompt_per_1k))
+            ).scalar()
+            with_tools = conn.execute(
+                select(func.count()).select_from(model_catalog).where(
+                    model_catalog.c.supports_tools.is_(True)
+                )
+            ).scalar() or 0
+            with_vision = conn.execute(
+                select(func.count()).select_from(model_catalog).where(
+                    model_catalog.c.supports_vision.is_(True)
+                )
+            ).scalar() or 0
+            with_reasoning = conn.execute(
+                select(func.count()).select_from(model_catalog).where(
+                    model_catalog.c.supports_reasoning.is_(True)
+                )
+            ).scalar() or 0
+            return {
+                "total": total,
+                "enabled": enabled,
+                "by_provider": by_provider,
+                "avg_context_length": round(avg_context) if avg_context else 0,
+                "avg_prompt_cost_per_1k": round(float(avg_cost), 6) if avg_cost else 0.0,
+                "supports_tools": with_tools,
+                "supports_vision": with_vision,
+                "supports_reasoning": with_reasoning,
+            }
+    except Exception as e:
+        log.warning("model_catalog_stats failed: %s", e)
+        return {}
