@@ -26,6 +26,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import re
 import time
 import uuid
@@ -460,6 +461,8 @@ async def init_app(conf_path: str = "./gateway-config.json") -> web.Application:
     app.router.add_get("/admin/models/stats", admin_models_stats)
     app.router.add_put("/admin/models/{model_id}/tier", admin_models_set_tier)
     app.router.add_put("/admin/models/{model_id}/enabled", admin_models_set_enabled)
+    app.router.add_post("/admin/models/auto-register", admin_models_auto_register)
+    app.router.add_get("/admin/models/comparison", admin_models_comparison)
     # MCP facade — unified JSON-RPC endpoint for tools/list, tools/call, prompts/list
     app.router.add_post("/mcp", mcp_facade_mod.handle_mcp_rpc)
     app.router.add_get("/admin/provider-presets", get_provider_presets)
@@ -3761,6 +3764,191 @@ async def admin_models_set_enabled(request: web.Request):
     if not ok:
         return web.json_response({"error": "model not found"}, status=404)
     return web.json_response({"model_id": model_id, "provider": provider, "enabled": enabled})
+
+
+async def admin_models_auto_register(request: web.Request):
+    """Auto-create endpoint entries from model_catalog and assign to tiers.
+
+    Body (all optional):
+        min_score: float — minimum capability score (default 0.0)
+        provider: str — filter to one provider
+        supports_tools: bool
+        supports_vision: bool
+        supports_reasoning: bool
+        min_context_length: int
+        limit: int — max endpoints to create (default 50)
+        dry_run: bool — if true, return the plan without creating (default true)
+    """
+    try:
+        body = await request.json() if request.body_exists else {}
+    except Exception:
+        body = {}
+    dry_run = bool(body.get("dry_run", True))
+    min_score = float(body.get("min_score", 0.0))
+    provider = body.get("provider")
+    limit = int(body.get("limit", 50))
+    entries = await asyncio.to_thread(
+        model_sync_mod.filter_catalog_for_registration,
+        min_score, provider,
+        body.get("supports_tools"),
+        body.get("supports_vision"),
+        body.get("supports_reasoning"),
+        body.get("min_context_length"),
+        limit,
+    )
+    conf = request.app["conf_mgr"].current()
+    existing_names = {e["name"] for e in conf.config.get("endpoints", [])}
+    plan = model_sync_mod.build_registration_plan(entries, existing_names)
+    if dry_run:
+        return web.json_response({
+            "dry_run": True,
+            "would_create": len(plan["to_create"]),
+            "already_exist": len(plan["already_exists"]),
+            "no_template": len(plan["no_template"]),
+            "plan": [
+                {
+                    "name": item["endpoint_config"]["name"],
+                    "model_alias": item["endpoint_config"]["model_alias"],
+                    "kind": item["endpoint_config"]["kind"],
+                    "base_url": item["endpoint_config"]["base_url"],
+                    "tier": item["tier"],
+                    "capability_score": item["catalog_entry"].get("capability_score"),
+                }
+                for item in plan["to_create"]
+            ],
+        })
+    # Commit: create endpoints + assign to tiers
+    mgr: admin_mod.OverlayManager = request.app["overlay_manager"]
+    created: list[dict] = []
+    errors: list[str] = []
+    for item in plan["to_create"]:
+        ep_cfg = dict(item["endpoint_config"])
+        # Strip internal keys before saving
+        ep_cfg.pop("_catalog_provider", None)
+        ep_cfg.pop("_catalog_model_id", None)
+        ep_cfg.pop("_capability_score", None)
+        try:
+            mgr.add_endpoint(ep_cfg)
+            # Assign to tier
+            tier_name = item["tier"]
+            try:
+                mgr.assign_endpoint_to_tier(tier_name, ep_cfg["name"])
+            except Exception:
+                pass  # tier may not exist — non-fatal
+            created.append({
+                "name": ep_cfg["name"],
+                "model_alias": ep_cfg["model_alias"],
+                "tier": tier_name,
+            })
+        except ValueError as e:
+            errors.append(f"{ep_cfg['name']}: {e}")
+        except Exception as e:
+            errors.append(f"{ep_cfg['name']}: {e}")
+    if created:
+        await _apply_runtime_config(request.app, request.app["conf_mgr"].current())
+    return web.json_response({
+        "dry_run": False,
+        "created": len(created),
+        "already_exist": len(plan["already_exists"]),
+        "errors": errors,
+        "endpoints": created,
+    })
+
+
+async def admin_models_comparison(request: web.Request):
+    """Enriched model comparison for the spidergraph.
+
+    Query: ?models=openai/gpt-4o:openrouter,anthropic/claude-3.5:anthropic
+           (comma-separated model_id:provider pairs)
+
+    Returns normalized 0-1 scores per axis for each model, combining:
+    - Static catalog data (context, pricing, features, capability_score)
+    - Dynamic gateway data (observed success rate, latency from
+      model_quality_profiles, keyed by the endpoint name the catalog
+      model would have if auto-registered)
+
+    Axes: context, cost_efficiency, capability, success_rate,
+          latency_score, feature_breadth
+    """
+    models_param = request.query.get("models", "")
+    if not models_param:
+        return web.json_response({"error": "models parameter required"}, status=400)
+    pairs: list[tuple[str, str]] = []
+    for pair in models_param.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if ":" in pair:
+            mid, prov = pair.rsplit(":", 1)
+        else:
+            mid, prov = pair, "openrouter"
+        pairs.append((mid, prov))
+    results: list[dict] = []
+    for model_id, provider in pairs:
+        entry = memory.get_model_catalog_entry(model_id, provider)
+        if not entry:
+            results.append({
+                "model_id": model_id, "provider": provider,
+                "error": "not in catalog",
+            })
+            continue
+        # Static dimensions from catalog
+        ctx = entry.get("context_length") or 0
+        prompt_p = entry.get("pricing_prompt_per_1k")
+        completion_p = entry.get("pricing_completion_per_1k")
+        avg_cost = None
+        if prompt_p is not None and completion_p is not None:
+            avg_cost = (float(prompt_p) + float(completion_p)) / 2.0
+        features = (
+            int(bool(entry.get("supports_tools"))) +
+            int(bool(entry.get("supports_vision"))) +
+            int(bool(entry.get("supports_reasoning")))
+        ) / 3.0
+        # Dynamic dimensions from aggregate quality (if this model has
+        # been registered as an endpoint and has observed traffic).
+        ep_name = model_sync_mod.endpoint_name_for(model_id, provider)
+        quality = await asyncio.to_thread(memory.get_aggregate_quality, ep_name)
+        success_rate = None
+        latency_score = None
+        if quality:
+            sr = quality.get("success_rate")
+            if sr is not None:
+                success_rate = float(sr)
+            lat = quality.get("avg_latency_ms")
+            if lat is not None and float(lat) > 0:
+                # Inverse latency: 500ms = 0.5, 5000ms = 0.1 (log-scaled)
+                latency_score = max(0.0, 1.0 - math.log10(float(lat) / 100.0 + 1) / 2.0)
+        # Normalize static axes to 0-1
+        context_norm = min(ctx / 200000.0, 1.0) if ctx > 0 else 0.0
+        cost_eff = 0.5
+        if avg_cost is not None:
+            if avg_cost <= 0:
+                cost_eff = 1.0
+            else:
+                cost_eff = max(0.0, 1.0 - math.log10(avg_cost * 1000 + 1) / 3.0)
+        cap = entry.get("capability_score") or 0.0
+        results.append({
+            "model_id": model_id,
+            "provider": provider,
+            "display_name": entry.get("display_name", model_id),
+            "endpoint_name": ep_name,
+            "axes": {
+                "context": round(context_norm, 3),
+                "cost_efficiency": round(cost_eff, 3),
+                "capability": round(float(cap), 3),
+                "success_rate": round(success_rate, 3) if success_rate is not None else None,
+                "latency_score": round(latency_score, 3) if latency_score is not None else None,
+                "feature_breadth": round(features, 3),
+            },
+            "has_observed_data": success_rate is not None or latency_score is not None,
+            "tier": entry.get("tier_assignment"),
+            "context_length": ctx,
+            "pricing": {
+                "prompt_per_1k": float(prompt_p) if prompt_p is not None else None,
+                "completion_per_1k": float(completion_p) if completion_p is not None else None,
+            },
+        })
+    return web.json_response({"models": results})
 
 
 # ============================================================

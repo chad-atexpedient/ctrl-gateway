@@ -623,3 +623,197 @@ async def sync_all() -> list[SyncSummary]:
     if eng is None:
         return []
     return await eng.sync_all()
+
+
+# =====================================================================
+# Phase 2: Catalog → Endpoint auto-registration
+# =====================================================================
+
+# Provider templates define how a catalog entry maps to an endpoint config.
+# The catalog stores model metadata; the template provides the transport
+# details (kind, base_url, auth). This is what breaks the 1:1
+# endpoint:model coupling: one provider template + N catalog entries =
+# N auto-created endpoints sharing the same transport.
+PROVIDER_TEMPLATES: dict[str, dict] = {
+    "openrouter": {
+        "kind": "openai",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY",
+    },
+    "openai": {
+        "kind": "openai",
+        "base_url": "https://api.openai.com/v1",
+        "api_key_env": "OPENAI_API_KEY",
+    },
+    "anthropic": {
+        "kind": "anthropic",
+        "base_url": "https://api.anthropic.com",
+        "api_key_env": "ANTHROPIC_API_KEY",
+    },
+    "google": {
+        "kind": "gemini",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+        "api_key_env": "GOOGLE_API_KEY",
+    },
+    "groq": {
+        "kind": "openai",
+        "base_url": "https://api.groq.com/openai/v1",
+        "api_key_env": "GROQ_API_KEY",
+    },
+    "together": {
+        "kind": "openai",
+        "base_url": "https://api.together.xyz/v1",
+        "api_key_env": "TOGETHER_API_KEY",
+    },
+    "deepseek": {
+        "kind": "openai",
+        "base_url": "https://api.deepseek.com/v1",
+        "api_key_env": "DEEPSEEK_API_KEY",
+    },
+    "mistral": {
+        "kind": "openai",
+        "base_url": "https://api.mistral.ai/v1",
+        "api_key_env": "MISTRAL_API_KEY",
+    },
+    "ollama": {
+        "kind": "ollama",
+        "base_url": "http://localhost:11434",
+        "api_key_env": "",
+    },
+    "xai": {
+        "kind": "openai",
+        "base_url": "https://api.x.ai/v1",
+        "api_key_env": "XAI_API_KEY",
+    },
+}
+
+
+def endpoint_name_for(model_id: str, provider: str) -> str:
+    """Generate a unique, deterministic endpoint name from a catalog entry.
+
+    Convention: sanitize the model_id to lowercase alphanumerics + hyphens.
+    e.g. "openai/gpt-4o" from openrouter → "openai_gpt-4o"
+         "llama3:8b" from ollama → "llama3-8b"
+    """
+    safe = model_id.replace("/", "_").replace(":", "-").replace(".", "-")
+    return safe.lower()[:64]
+
+
+def catalog_to_endpoint_config(entry: dict) -> dict | None:
+    """Convert a model_catalog row to a gateway endpoint config dict.
+
+    Returns None if the provider is not in PROVIDER_TEMPLATES (unknown
+    transport). The returned dict is suitable for OverlayManager.add_endpoint.
+    """
+    provider = entry.get("provider", "")
+    template = PROVIDER_TEMPLATES.get(provider)
+    if template is None:
+        return None
+    prompt_price = entry.get("pricing_prompt_per_1k")
+    completion_price = entry.get("pricing_completion_per_1k")
+    return {
+        "name": endpoint_name_for(entry["model_id"], provider),
+        "kind": template["kind"],
+        "base_url": template["base_url"],
+        "api_key_env": template["api_key_env"],
+        "model_alias": entry["model_id"],
+        "max_context": entry.get("context_length") or 32768,
+        "concurrency": 4,
+        "pricing": {
+            "in_per_1k_tokens": float(prompt_price) if prompt_price is not None else 0.0,
+            "out_per_1k_tokens": float(completion_price) if completion_price is not None else 0.0,
+            "fixed_per_request": 0.0,
+        },
+        "breaker": {
+            "failure_threshold": 3,
+            "open_duration_seconds": 60,
+            "half_open_max_probes": 1,
+        },
+        "health_probe": "/health",
+        # Custom fields for traceability
+        "_catalog_provider": provider,
+        "_catalog_model_id": entry["model_id"],
+        "_capability_score": entry.get("capability_score"),
+    }
+
+
+def filter_catalog_for_registration(
+    min_score: float = 0.0,
+    provider: str | None = None,
+    supports_tools: bool | None = None,
+    supports_vision: bool | None = None,
+    supports_reasoning: bool | None = None,
+    min_context_length: int | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    """Read the catalog and return entries suitable for endpoint registration.
+
+    Filters out entries whose provider is not in PROVIDER_TEMPLATES (can't
+    create an endpoint without a transport template).
+    """
+    entries = memory.list_model_catalog(
+        provider=provider,
+        enabled_only=True,
+        min_capability_score=min_score if min_score > 0 else None,
+        supports_tools=supports_tools,
+        supports_vision=supports_vision,
+        supports_reasoning=supports_reasoning,
+        min_context_length=min_context_length,
+        limit=limit,
+    )
+    return [
+        e for e in entries
+        if e.get("provider") in PROVIDER_TEMPLATES
+    ]
+
+
+def build_registration_plan(
+    entries: list[dict],
+    existing_endpoint_names: set[str],
+) -> dict:
+    """Given catalog entries + existing endpoint names, return a registration
+    plan with what would be created vs. skipped.
+
+    Returns:
+        {
+            "to_create": [{endpoint_config, catalog_entry, tier}],
+            "already_exists": [{name, model_id, provider}],
+            "no_template": [{model_id, provider}],
+        }
+    """
+    to_create: list[dict] = []
+    already: list[dict] = []
+    no_template: list[dict] = []
+    for entry in entries:
+        cfg = catalog_to_endpoint_config(entry)
+        if cfg is None:
+            no_template.append({
+                "model_id": entry["model_id"],
+                "provider": entry.get("provider", ""),
+            })
+            continue
+        ep_name = cfg["name"]
+        if ep_name in existing_endpoint_names:
+            already.append({
+                "name": ep_name,
+                "model_id": entry["model_id"],
+                "provider": entry.get("provider", ""),
+            })
+            continue
+        to_create.append({
+            "endpoint_config": cfg,
+            "catalog_entry": {
+                "model_id": entry["model_id"],
+                "provider": entry.get("provider", ""),
+                "display_name": entry.get("display_name", entry["model_id"]),
+                "capability_score": entry.get("capability_score"),
+            },
+            "tier": entry.get("tier_assignment") or _tier_from_capability(
+                entry.get("capability_score") or 0.0
+            ),
+        })
+    return {
+        "to_create": to_create,
+        "already_exists": already,
+        "no_template": no_template,
+    }

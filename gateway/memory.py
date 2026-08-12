@@ -1641,6 +1641,37 @@ def get_quality_profile(
     return d
 
 
+def get_aggregate_quality(endpoint_name: str) -> dict | None:
+    """Aggregate quality stats for an endpoint across all verticals.
+
+    Returns {endpoint_name, total_requests, success_rate, avg_samples} or None.
+    Used by the model comparison / spidergraph API to surface observed
+    performance without requiring a specific vertical/complexity filter.
+    """
+    with engine().connect() as conn:
+        rows = conn.execute(
+            select(
+                func.sum(model_quality_profiles.c.success_count).label("total_success"),
+                func.sum(model_quality_profiles.c.total_count).label("total_requests"),
+                func.sum(model_quality_profiles.c.calibration_samples).label("total_samples"),
+                func.count().label("num_buckets"),
+            ).where(
+                model_quality_profiles.c.endpoint_name == endpoint_name
+            )
+        ).first()
+    if not rows or rows.total_requests is None or int(rows.total_requests) == 0:
+        return None
+    total_req = int(rows.total_requests)
+    total_succ = int(rows.total_success or 0)
+    return {
+        "endpoint_name": endpoint_name,
+        "total_requests": total_req,
+        "success_rate": round(total_succ / total_req, 4) if total_req > 0 else 0.0,
+        "calibration_samples": int(rows.total_samples or 0),
+        "num_buckets": int(rows.num_buckets or 0),
+    }
+
+
 def reserve_usage(
     tenant_id: str,
     *,

@@ -476,5 +476,160 @@ class InitEngineTests(unittest.TestCase):
         self.assertIs(model_sync.engine(), eng)
 
 
+# ============================================================================
+# Phase 2: Catalog → Endpoint auto-registration
+# ============================================================================
+
+
+class AutoRegisterTests(unittest.TestCase):
+
+    def setUp(self):
+        memory.close_engine()
+        memory._engine = None  # type: ignore[attr-defined]
+        tmpdir = tempfile.mkdtemp()
+        self.tmpdir = tmpdir
+        memory.init_engine(f"sqlite:///{tmpdir}/test.db")
+
+    def tearDown(self):
+        memory.close_engine()
+        memory._engine = None  # type: ignore[attr-defined]
+
+    def test_endpoint_name_generation(self):
+        self.assertEqual(
+            model_sync.endpoint_name_for("openai/gpt-4o", "openrouter"),
+            "openai_gpt-4o",
+        )
+        self.assertEqual(
+            model_sync.endpoint_name_for("llama3:8b", "ollama"),
+            "llama3-8b",
+        )
+
+    def test_catalog_to_endpoint_config_openrouter(self):
+        entry = {
+            "model_id": "openai/gpt-4o",
+            "provider": "openrouter",
+            "display_name": "GPT-4o",
+            "context_length": 128000,
+            "pricing_prompt_per_1k": 0.005,
+            "pricing_completion_per_1k": 0.015,
+            "capability_score": 0.85,
+            "tier_assignment": "tier4",
+        }
+        cfg = model_sync.catalog_to_endpoint_config(entry)
+        self.assertIsNotNone(cfg)
+        self.assertEqual(cfg["name"], "openai_gpt-4o")
+        self.assertEqual(cfg["kind"], "openai")
+        self.assertEqual(cfg["base_url"], "https://openrouter.ai/api/v1")
+        self.assertEqual(cfg["api_key_env"], "OPENROUTER_API_KEY")
+        self.assertEqual(cfg["model_alias"], "openai/gpt-4o")
+        self.assertEqual(cfg["max_context"], 128000)
+        self.assertAlmostEqual(cfg["pricing"]["in_per_1k_tokens"], 0.005)
+        self.assertAlmostEqual(cfg["pricing"]["out_per_1k_tokens"], 0.015)
+
+    def test_catalog_to_endpoint_config_ollama(self):
+        entry = {
+            "model_id": "llama3:8b",
+            "provider": "ollama",
+            "context_length": 8192,
+            "pricing_prompt_per_1k": 0.0,
+            "pricing_completion_per_1k": 0.0,
+        }
+        cfg = model_sync.catalog_to_endpoint_config(entry)
+        self.assertIsNotNone(cfg)
+        self.assertEqual(cfg["kind"], "ollama")
+        self.assertEqual(cfg["base_url"], "http://localhost:11434")
+        self.assertEqual(cfg["api_key_env"], "")
+
+    def test_catalog_to_endpoint_config_unknown_provider(self):
+        cfg = model_sync.catalog_to_endpoint_config({
+            "model_id": "x", "provider": "unknown_provider",
+        })
+        self.assertIsNone(cfg)
+
+    def test_build_registration_plan(self):
+        # Seed catalog
+        memory.upsert_model_catalog_entry(
+            model_id="openai/gpt-4o", provider="openrouter",
+            context_length=128000, capability_score=0.85,
+            supports_tools=True, tier_assignment="tier4",
+            pricing_prompt_per_1k=0.005, pricing_completion_per_1k=0.015,
+        )
+        memory.upsert_model_catalog_entry(
+            model_id="meta/llama-3.1-8b", provider="openrouter",
+            context_length=128000, capability_score=0.45,
+            tier_assignment="tier1",
+            pricing_prompt_per_1k=0.0, pricing_completion_per_1k=0.0,
+        )
+        entries = model_sync.filter_catalog_for_registration(min_score=0.0)
+        self.assertEqual(len(entries), 2)
+        # No existing endpoints
+        plan = model_sync.build_registration_plan(entries, set())
+        self.assertEqual(len(plan["to_create"]), 2)
+        self.assertEqual(len(plan["already_exists"]), 0)
+        # With existing endpoint
+        plan = model_sync.build_registration_plan(
+            entries, {"openai_gpt-4o"}
+        )
+        self.assertEqual(len(plan["to_create"]), 1)
+        self.assertEqual(len(plan["already_exists"]), 1)
+        self.assertEqual(plan["already_exists"][0]["name"], "openai_gpt-4o")
+
+    def test_filter_by_min_score(self):
+        memory.upsert_model_catalog_entry(
+            model_id="strong", provider="openrouter",
+            capability_score=0.80,
+        )
+        memory.upsert_model_catalog_entry(
+            model_id="weak", provider="openrouter",
+            capability_score=0.30,
+        )
+        entries = model_sync.filter_catalog_for_registration(min_score=0.5)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["model_id"], "strong")
+
+
+# ============================================================================
+# Phase 3: Aggregate quality (for spidergraph enrichment)
+# ============================================================================
+
+
+class AggregateQualityTests(unittest.TestCase):
+
+    def setUp(self):
+        memory.close_engine()
+        memory._engine = None  # type: ignore[attr-defined]
+        tmpdir = tempfile.mkdtemp()
+        self.tmpdir = tmpdir
+        memory.init_engine(f"sqlite:///{tmpdir}/test.db")
+
+    def tearDown(self):
+        memory.close_engine()
+        memory._engine = None  # type: ignore[attr-defined]
+
+    def test_aggregate_quality_empty(self):
+        result = memory.get_aggregate_quality("nonexistent_endpoint")
+        self.assertIsNone(result)
+
+    def test_aggregate_quality_with_data(self):
+        # Record some quality samples
+        memory.record_quality_sample(
+            endpoint_name="test_ep", vertical="code",
+            complexity=2, success=True,
+        )
+        memory.record_quality_sample(
+            endpoint_name="test_ep", vertical="code",
+            complexity=2, success=False,
+        )
+        memory.record_quality_sample(
+            endpoint_name="test_ep", vertical="math",
+            complexity=2, success=True,
+        )
+        result = memory.get_aggregate_quality("test_ep")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["endpoint_name"], "test_ep")
+        self.assertEqual(result["total_requests"], 3)
+        self.assertAlmostEqual(result["success_rate"], 2/3, places=2)
+
+
 if __name__ == "__main__":
     unittest.main()

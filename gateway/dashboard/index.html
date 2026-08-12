@@ -412,6 +412,8 @@ nav .right{margin-left:auto;display:flex;align-items:center;gap:8px;padding:8px 
     </div>
     <div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
       <button class="btn" onclick="syncModels()">Sync Now</button>
+      <button class="btn" onclick="autoRegisterModels()" style="background:var(--accent)">Auto-Register</button>
+      <span id="mc-ar-status" style="font-size:12px;color:var(--dim)"></span>
       <select id="mc-provider-filter" onchange="loadModelsCatalog()" style="padding:6px 12px;background:var(--bg2);color:var(--t2);border:1px solid var(--border);border-radius:4px">
         <option value="">All Providers</option>
       </select>
@@ -1101,11 +1103,42 @@ async function syncModels() {
 }
 
 function renderRadar() {
+  const selected = Array.from(_mcSelected);
+  if (selected.length === 0) {
+    document.getElementById('mc-radar').innerHTML = '<text x="250" y="200" fill="var(--dim)" font-size="14" text-anchor="middle">Select models from the table to compare</text>';
+    document.getElementById('mc-radar-legend').innerHTML = '';
+    return;
+  }
+  // Build the models query param: model_id:provider
+  const modelsParam = selected.map(s => s.replace('|', ':')).join(',');
+  fetchJSON('/admin/models/comparison?models=' + encodeURIComponent(modelsParam))
+    .then(data => {
+      if (!data || !data.models) return;
+      _drawRadar(data.models);
+    });
+}
+
+function _drawRadar(models) {
   const svg = document.getElementById('mc-radar');
   if (!svg) return;
   const w = 500, h = 400, cx = 250, cy = 200, R = 140;
-  const axes = ['Context', 'Cost Eff.', 'Tools', 'Vision', 'Reasoning', 'Score'];
-  const n = axes.length;
+  const axisDefs = [
+    {key: 'context', label: 'Context'},
+    {key: 'cost_efficiency', label: 'Cost Eff.'},
+    {key: 'capability', label: 'Capability'},
+    {key: 'success_rate', label: 'Success'},
+    {key: 'latency_score', label: 'Latency'},
+    {key: 'feature_breadth', label: 'Features'},
+  ];
+  // Filter out axes that are null for ALL models (e.g. no observed data)
+  const activeAxes = axisDefs.filter(a => {
+    return models.some(m => m.axes && m.axes[a.key] != null);
+  });
+  const n = activeAxes.length;
+  if (n < 3) {
+    svg.innerHTML = '<text x="250" y="200" fill="var(--dim)" font-size="14" text-anchor="middle">Not enough data dimensions</text>';
+    return;
+  }
   const colors = ['#58a6ff', '#f0883e', '#3fb950', '#f85149', '#a371f7'];
   let html = '';
   // Grid rings
@@ -1114,7 +1147,7 @@ function renderRadar() {
     let pts = '';
     for (let i = 0; i < n; i++) {
       const a = -Math.PI/2 + i * 2*Math.PI/n;
-      pts += (cx + rad*Math.cos(a)) + ',' + (cy + rad*Math.sin(a)) + ' ';
+      pts += (cx + rad*Math.cos(a)).toFixed(1) + ',' + (cy + rad*Math.sin(a)).toFixed(1) + ' ';
     }
     html += `<polygon points="${pts}" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="1"/>`;
   }
@@ -1122,55 +1155,80 @@ function renderRadar() {
   for (let i = 0; i < n; i++) {
     const a = -Math.PI/2 + i * 2*Math.PI/n;
     const x2 = cx + R*Math.cos(a), y2 = cy + R*Math.sin(a);
-    html += `<line x1="${cx}" y1="${cy}" x2="${x2}" y2="${y2}" stroke="rgba(255,255,255,0.1)" stroke-width="1"/>`;
-    const lx = cx + (R+20)*Math.cos(a), ly = cy + (R+20)*Math.sin(a);
-    html += `<text x="${lx}" y="${ly}" fill="var(--dim)" font-size="11" text-anchor="middle" dy="4">${axes[i]}</text>`;
+    html += `<line x1="${cx}" y1="${cy}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}" stroke="rgba(255,255,255,0.1)" stroke-width="1"/>`;
+    const lx = cx + (R+25)*Math.cos(a), ly = cy + (R+25)*Math.sin(a);
+    const hasData = models.every(m => m.axes && m.axes[activeAxes[i].key] != null);
+    const labelColor = hasData ? 'var(--t2)' : 'var(--dim)';
+    html += `<text x="${lx.toFixed(1)}" y="${ly.toFixed(1)}" fill="${labelColor}" font-size="11" text-anchor="middle" dy="4">${activeAxes[i].label}</text>`;
   }
-  // Plot selected models
-  const tbody = document.getElementById('mc-table-body');
+  // Plot models
   const legendEl = document.getElementById('mc-radar-legend');
   legendEl.innerHTML = '';
-  let ci = 0;
-  document.querySelectorAll('#mc-table-body input[type=checkbox]').forEach(cb => {
-    if (!cb.checked) return;
-    const tr = cb.closest('tr');
-    const cells = tr.querySelectorAll('td');
-    // Extract values from cells: context, in-price, out-price, score, features
-    const ctxStr = cells[3].textContent.replace('K','').replace('—','0');
-    const ctxVal = parseFloat(ctxStr) || 0;
-    const inPrice = parseFloat(cells[4].textContent.replace('$','')) || 0;
-    const outPrice = parseFloat(cells[5].textContent.replace('$','')) || 0;
-    const scoreVal = parseFloat(cells[6].textContent) || 0;
-    const featStr = cells[8].innerHTML;
-    const hasTools = featStr.includes('🔧');
-    const hasVision = featStr.includes('👁');
-    const hasReasoning = featStr.includes('🧠');
-    // Normalize to 0-1 for radar
-    const vals = [
-      Math.min(ctxVal / 200, 1),              // context: 200K = max
-      Math.max(0, 1 - (inPrice + outPrice) * 50), // cost efficiency: cheaper=higher
-      hasTools ? 1 : 0,
-      hasVision ? 1 : 0,
-      hasReasoning ? 1 : 0,
-      scoreVal,
-    ];
-    const color = colors[ci % colors.length];
-    ci++;
+  models.forEach((m, idx) => {
+    if (m.error) return;
+    const color = colors[idx % colors.length];
     let pts = '';
     for (let i = 0; i < n; i++) {
+      const val = (m.axes && m.axes[activeAxes[i].key] != null) ? m.axes[activeAxes[i].key] : 0;
       const a = -Math.PI/2 + i * 2*Math.PI/n;
-      const rad = R * vals[i];
-      pts += (cx + rad*Math.cos(a)) + ',' + (cy + rad*Math.sin(a)) + ' ';
+      const rad = R * val;
+      pts += (cx + rad*Math.cos(a)).toFixed(1) + ',' + (cy + rad*Math.sin(a)).toFixed(1) + ' ';
     }
-    html += `<polygon points="${pts}" fill="${color}" fill-opacity="0.15" stroke="${color}" stroke-width="2"/>`;
+    const opacity = m.has_observed_data ? 0.2 : 0.10;
+    html += `<polygon points="${pts}" fill="${color}" fill-opacity="${opacity}" stroke="${color}" stroke-width="2"/>`;
+    // Circle at each data point
+    for (let i = 0; i < n; i++) {
+      const val = (m.axes && m.axes[activeAxes[i].key] != null) ? m.axes[activeAxes[i].key] : 0;
+      const a = -Math.PI/2 + i * 2*Math.PI/n;
+      const rad = R * val;
+      html += `<circle cx="${(cx + rad*Math.cos(a)).toFixed(1)}" cy="${(cy + rad*Math.sin(a)).toFixed(1)}" r="3" fill="${color}"/>`;
+    }
     // Legend
-    const name = cb.dataset.name;
+    const observed = m.has_observed_data ? ' <span style="color:var(--accent);font-size:10px">● observed</span>' : '';
     const legend = document.createElement('div');
     legend.style.cssText = 'display:flex;align-items:center;gap:4px;font-size:12px';
-    legend.innerHTML = `<span style="width:12px;height:12px;background:${color};border-radius:2px"></span>${name}`;
+    legend.innerHTML = `<span style="width:12px;height:12px;background:${color};border-radius:2px"></span>${m.display_name}${observed}`;
     legendEl.appendChild(legend);
   });
   svg.innerHTML = html;
+}
+
+async function autoRegisterModels() {
+  const minScore = document.getElementById('mc-min-score')?.value || '0.0';
+  const provider = document.getElementById('mc-provider-filter')?.value || '';
+  document.getElementById('mc-ar-status').textContent = 'Planning…';
+  // Dry run first
+  const body = {dry_run: true, min_score: parseFloat(minScore), limit: 50};
+  if (provider) body.provider = provider;
+  const plan = await fetchJSON('/admin/models/auto-register', {
+    method: 'POST', body: JSON.stringify(body)
+  });
+  if (!plan || plan.error) {
+    document.getElementById('mc-ar-status').textContent = 'Error: ' + (plan?.error || 'unknown');
+    return;
+  }
+  if (plan.would_create === 0) {
+    document.getElementById('mc-ar-status').textContent = `Nothing to create (${plan.already_exist} already exist)`;
+    return;
+  }
+  const msg = `Will create ${plan.would_create} endpoints (${plan.already_exist} already exist). Proceed?`;
+  if (!confirm(msg)) {
+    document.getElementById('mc-ar-status').textContent = 'Cancelled';
+    return;
+  }
+  // Commit
+  body.dry_run = false;
+  document.getElementById('mc-ar-status').textContent = 'Creating…';
+  const result = await fetchJSON('/admin/models/auto-register', {
+    method: 'POST', body: JSON.stringify(body)
+  });
+  if (result && !result.error) {
+    const errs = result.errors ? result.errors.length : 0;
+    document.getElementById('mc-ar-status').textContent = `Created ${result.created} endpoints${errs ? ', ' + errs + ' errors' : ''}`;
+    toast(`Auto-registered ${result.created} endpoints into tiers`);
+  } else {
+    document.getElementById('mc-ar-status').textContent = 'Failed';
+  }
 }
 
 // ---- LIVE TAB ----
