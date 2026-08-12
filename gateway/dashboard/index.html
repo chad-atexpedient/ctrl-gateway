@@ -75,6 +75,7 @@ nav .right{margin-left:auto;display:flex;align-items:center;gap:8px;padding:8px 
     <div class="tab" data-tab="a2a" onclick="showTab('a2a')">A2A</div>
     <div class="tab" data-tab="prompts" onclick="showTab('prompts')">Prompts</div>
     <div class="tab" data-tab="webhooks" onclick="showTab('webhooks')">Webhooks</div>
+    <div class="tab" data-tab="models" onclick="showTab('models')">Models</div>
     <div class="right">
       <span id="key-status" style="font-size:11px;opacity:.6"></span>
       <button class="btn sm" onclick="promptForKey()">Set Key</button>
@@ -398,6 +399,59 @@ nav .right{margin-left:auto;display:flex;align-items:center;gap:8px;padding:8px 
   </section>
 </div>
 
+<!-- ===== MODELS TAB ===== -->
+<div class="tab-content" id="tab-models">
+  <section>
+    <h2>Model Catalog</h2>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr;gap:12px;margin-bottom:16px">
+      <div class="card"><div class="title">Total Models</div><div style="font-size:28px;font-weight:700;color:var(--accent)" id="mc-total">—</div></div>
+      <div class="card"><div class="title">Providers</div><div style="font-size:28px;font-weight:700;color:var(--accent2)" id="mc-providers">—</div></div>
+      <div class="card"><div class="title">Avg Context</div><div style="font-size:20px;font-weight:700;color:var(--t2)" id="mc-ctx">—</div></div>
+      <div class="card"><div class="title">Tool-Capable</div><div style="font-size:20px;font-weight:700;color:var(--t2)" id="mc-tools">—</div></div>
+      <div class="card"><div class="title">Vision-Capable</div><div style="font-size:20px;font-weight:700;color:var(--t2)" id="mc-vision">—</div></div>
+    </div>
+    <div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <button class="btn" onclick="syncModels()">Sync Now</button>
+      <select id="mc-provider-filter" onchange="loadModelsCatalog()" style="padding:6px 12px;background:var(--bg2);color:var(--t2);border:1px solid var(--border);border-radius:4px">
+        <option value="">All Providers</option>
+      </select>
+      <label style="font-size:12px;color:var(--dim)"><input type="checkbox" id="mc-tools-only" onchange="loadModelsCatalog()"> Tools only</label>
+      <label style="font-size:12px;color:var(--dim)"><input type="checkbox" id="mc-vision-only" onchange="loadModelsCatalog()"> Vision only</label>
+      <label style="font-size:12px;color:var(--dim)">Min score: <input type="number" id="mc-min-score" placeholder="0.0" step="0.1" min="0" max="1" style="width:50px;padding:4px;background:var(--bg2);color:var(--t2);border:1px solid var(--border);border-radius:4px" onchange="loadModelsCatalog()"></label>
+      <span id="mc-sync-status" style="font-size:12px;color:var(--dim)"></span>
+    </div>
+
+    <!-- Spidergraph / Radar Chart -->
+    <div class="card" style="margin-bottom:16px">
+      <div class="title">Capability Comparison (select up to 5)</div>
+      <div id="mc-radar-container" style="position:relative;width:100%;height:400px">
+        <svg id="mc-radar" width="100%" height="400" viewBox="0 0 500 400"></svg>
+      </div>
+      <div id="mc-radar-legend" style="display:flex;gap:12px;flex-wrap:wrap;margin-top:8px"></div>
+    </div>
+
+    <div class="card">
+      <table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead>
+          <tr style="text-align:left;border-bottom:2px solid var(--border)">
+            <th style="padding:6px"><input type="checkbox" id="mc-select-all" onchange="toggleSelectAllModels()"></th>
+            <th style="padding:6px">Model</th>
+            <th style="padding:6px">Provider</th>
+            <th style="padding:6px">Context</th>
+            <th style="padding:6px">In $/1K</th>
+            <th style="padding:6px">Out $/1K</th>
+            <th style="padding:6px">Score</th>
+            <th style="padding:6px">Tier</th>
+            <th style="padding:6px">Features</th>
+            <th style="padding:6px">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="mc-table-body"></tbody>
+      </table>
+    </div>
+  </section>
+</div>
+
 <!-- ===== FLYWHEEL TAB ===== -->
 <div class="tab-content" id="tab-flywheel">
   <section>
@@ -534,6 +588,7 @@ function showTab(name) {
   if (name === 'a2a') loadA2aTab();
   if (name === 'prompts') loadPromptsTab();
   if (name === 'webhooks') loadWebhooksTab();
+  if (name === 'models') loadModelsTab();
 }
 
 // ---- SECURITY TAB ----
@@ -930,6 +985,192 @@ async function deleteWebhook(id) {
 async function invalidateCache() {
   const r = await fetchJSON('/admin/cache/invalidate', { method: 'POST', body: '{}' });
   if (r) { flash('wh-status', `Invalidated ${r.invalidated} entries`); loadWebhooksTab(); }
+}
+
+// ---- MODELS TAB ----
+let _mcSelected = new Set(); // model ids selected for radar comparison
+
+async function loadModelsTab() {
+  await loadModelsStats();
+  await loadModelsCatalog();
+}
+
+async function loadModelsStats() {
+  const s = await fetchJSON('/admin/models/stats');
+  if (!s) return;
+  document.getElementById('mc-total').textContent = s.total || 0;
+  document.getElementById('mc-providers').textContent = s.by_provider ? Object.keys(s.by_provider).length : 0;
+  document.getElementById('mc-ctx').textContent = s.avg_context_length ? (s.avg_context_length/1000).toFixed(0)+'K' : '—';
+  document.getElementById('mc-tools').textContent = s.supports_tools || 0;
+  document.getElementById('mc-vision').textContent = s.supports_vision || 0;
+  // Populate provider filter
+  const sel = document.getElementById('mc-provider-filter');
+  if (sel && s.by_provider) {
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">All Providers</option>';
+    for (const [p, cnt] of Object.entries(s.by_provider)) {
+      const opt = document.createElement('option');
+      opt.value = p; opt.textContent = p + ' (' + cnt + ')';
+      sel.appendChild(opt);
+    }
+    sel.value = cur;
+  }
+}
+
+async function loadModelsCatalog() {
+  const provider = document.getElementById('mc-provider-filter')?.value || '';
+  const toolsOnly = document.getElementById('mc-tools-only')?.checked;
+  const visionOnly = document.getElementById('mc-vision-only')?.checked;
+  const minScore = document.getElementById('mc-min-score')?.value;
+  let url = '/admin/models/catalog?limit=500';
+  if (provider) url += '&provider=' + encodeURIComponent(provider);
+  if (toolsOnly) url += '&supports_tools=true';
+  if (visionOnly) url += '&supports_vision=true';
+  if (minScore) url += '&min_capability_score=' + minScore;
+  const data = await fetchJSON(url);
+  if (!data) return;
+  const tbody = document.getElementById('mc-table-body');
+  tbody.innerHTML = '';
+  for (const m of (data.models || [])) {
+    const tr = document.createElement('tr');
+    tr.style.borderBottom = '1px solid var(--border)';
+    const mid = m.model_id + '|' + m.provider;
+    const checked = _mcSelected.has(mid) ? 'checked' : '';
+    const feats = [];
+    if (m.supports_tools) feats.push('<span style="color:var(--accent)">🔧</span>');
+    if (m.supports_vision) feats.push('<span style="color:var(--accent2)">👁</span>');
+    if (m.supports_reasoning) feats.push('<span style="color:#e8a835)">🧠</span>');
+    const score = m.capability_score != null ? parseFloat(m.capability_score).toFixed(2) : '—';
+    const scoreColor = score >= 0.65 ? 'var(--accent)' : score >= 0.45 ? 'var(--t2)' : 'var(--dim)';
+    const inPrice = m.pricing_prompt_per_1k != null ? '$' + parseFloat(m.pricing_prompt_per_1k).toFixed(4) : '—';
+    const outPrice = m.pricing_completion_per_1k != null ? '$' + parseFloat(m.pricing_completion_per_1k).toFixed(4) : '—';
+    const ctx = m.context_length ? (m.context_length/1000).toFixed(0)+'K' : '—';
+    tr.innerHTML = `
+      <td style="padding:4px"><input type="checkbox" data-mid="${mid}" data-name="${(m.display_name||m.model_id).replace(/"/g,'&quot;')}" ${checked} onchange="toggleModelSelect(this)"></td>
+      <td style="padding:4px;font-weight:600">${m.display_name || m.model_id}</td>
+      <td style="padding:4px"><span class="badge">${m.provider}</span></td>
+      <td style="padding:4px">${ctx}</td>
+      <td style="padding:4px;color:var(--dim)">${inPrice}</td>
+      <td style="padding:4px;color:var(--dim)">${outPrice}</td>
+      <td style="padding:4px;font-weight:700;color:${scoreColor}">${score}</td>
+      <td style="padding:4px"><span class="badge" style="background:var(--accent)">${m.tier_assignment || '—'}</span></td>
+      <td style="padding:4px">${feats.join(' ')}</td>
+      <td style="padding:4px">
+        <button class="btn sm" onclick="toggleModelEnabled('${m.model_id}','${m.provider}',${!m.enabled})">${m.enabled ? 'Disable' : 'Enable'}</button>
+      </td>`;
+    tbody.appendChild(tr);
+  }
+}
+
+function toggleModelSelect(checkbox) {
+  const mid = checkbox.dataset.mid;
+  const name = checkbox.dataset.name;
+  if (checkbox.checked) {
+    if (_mcSelected.size >= 5) { checkbox.checked = false; toast('Max 5 models for comparison'); return; }
+    _mcSelected.add(mid);
+  } else {
+    _mcSelected.delete(mid);
+  }
+  renderRadar();
+}
+
+function toggleSelectAllModels() {
+  // Not implementing full select-all for radar (max 5); just visual
+}
+
+async function toggleModelEnabled(modelId, provider, enable) {
+  const r = await fetchJSON('/admin/models/' + encodeURIComponent(modelId) + '/enabled', {
+    method: 'PUT', body: JSON.stringify({ provider, enabled: enable })
+  });
+  if (r) loadModelsCatalog();
+}
+
+async function syncModels() {
+  document.getElementById('mc-sync-status').textContent = 'Syncing…';
+  const r = await fetchJSON('/admin/models/sync', { method: 'POST', body: '{}' });
+  if (r && r.results) {
+    let total = 0, errors = 0;
+    for (const s of r.results) { total += s.added || 0; errors += (s.errors||[]).length; }
+    document.getElementById('mc-sync-status').textContent = `Synced ${total} models, ${errors} errors`;
+    toast(`Synced ${total} models from ${r.results.length} providers`);
+    loadModelsStats();
+    loadModelsCatalog();
+  } else {
+    document.getElementById('mc-sync-status').textContent = 'Sync failed';
+  }
+}
+
+function renderRadar() {
+  const svg = document.getElementById('mc-radar');
+  if (!svg) return;
+  const w = 500, h = 400, cx = 250, cy = 200, R = 140;
+  const axes = ['Context', 'Cost Eff.', 'Tools', 'Vision', 'Reasoning', 'Score'];
+  const n = axes.length;
+  const colors = ['#58a6ff', '#f0883e', '#3fb950', '#f85149', '#a371f7'];
+  let html = '';
+  // Grid rings
+  for (let r = 1; r <= 4; r++) {
+    const rad = R * r / 4;
+    let pts = '';
+    for (let i = 0; i < n; i++) {
+      const a = -Math.PI/2 + i * 2*Math.PI/n;
+      pts += (cx + rad*Math.cos(a)) + ',' + (cy + rad*Math.sin(a)) + ' ';
+    }
+    html += `<polygon points="${pts}" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="1"/>`;
+  }
+  // Axis lines + labels
+  for (let i = 0; i < n; i++) {
+    const a = -Math.PI/2 + i * 2*Math.PI/n;
+    const x2 = cx + R*Math.cos(a), y2 = cy + R*Math.sin(a);
+    html += `<line x1="${cx}" y1="${cy}" x2="${x2}" y2="${y2}" stroke="rgba(255,255,255,0.1)" stroke-width="1"/>`;
+    const lx = cx + (R+20)*Math.cos(a), ly = cy + (R+20)*Math.sin(a);
+    html += `<text x="${lx}" y="${ly}" fill="var(--dim)" font-size="11" text-anchor="middle" dy="4">${axes[i]}</text>`;
+  }
+  // Plot selected models
+  const tbody = document.getElementById('mc-table-body');
+  const legendEl = document.getElementById('mc-radar-legend');
+  legendEl.innerHTML = '';
+  let ci = 0;
+  document.querySelectorAll('#mc-table-body input[type=checkbox]').forEach(cb => {
+    if (!cb.checked) return;
+    const tr = cb.closest('tr');
+    const cells = tr.querySelectorAll('td');
+    // Extract values from cells: context, in-price, out-price, score, features
+    const ctxStr = cells[3].textContent.replace('K','').replace('—','0');
+    const ctxVal = parseFloat(ctxStr) || 0;
+    const inPrice = parseFloat(cells[4].textContent.replace('$','')) || 0;
+    const outPrice = parseFloat(cells[5].textContent.replace('$','')) || 0;
+    const scoreVal = parseFloat(cells[6].textContent) || 0;
+    const featStr = cells[8].innerHTML;
+    const hasTools = featStr.includes('🔧');
+    const hasVision = featStr.includes('👁');
+    const hasReasoning = featStr.includes('🧠');
+    // Normalize to 0-1 for radar
+    const vals = [
+      Math.min(ctxVal / 200, 1),              // context: 200K = max
+      Math.max(0, 1 - (inPrice + outPrice) * 50), // cost efficiency: cheaper=higher
+      hasTools ? 1 : 0,
+      hasVision ? 1 : 0,
+      hasReasoning ? 1 : 0,
+      scoreVal,
+    ];
+    const color = colors[ci % colors.length];
+    ci++;
+    let pts = '';
+    for (let i = 0; i < n; i++) {
+      const a = -Math.PI/2 + i * 2*Math.PI/n;
+      const rad = R * vals[i];
+      pts += (cx + rad*Math.cos(a)) + ',' + (cy + rad*Math.sin(a)) + ' ';
+    }
+    html += `<polygon points="${pts}" fill="${color}" fill-opacity="0.15" stroke="${color}" stroke-width="2"/>`;
+    // Legend
+    const name = cb.dataset.name;
+    const legend = document.createElement('div');
+    legend.style.cssText = 'display:flex;align-items:center;gap:4px;font-size:12px';
+    legend.innerHTML = `<span style="width:12px;height:12px;background:${color};border-radius:2px"></span>${name}`;
+    legendEl.appendChild(legend);
+  });
+  svg.innerHTML = html;
 }
 
 // ---- LIVE TAB ----
