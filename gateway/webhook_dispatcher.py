@@ -44,6 +44,13 @@ class WebhookRecord:
     secret: str
     enabled: bool
     description: str
+    # Per-webhook override of the dispatcher's max_retries. None means use
+    # the dispatcher default (set in init_dispatcher from gateway-config).
+    max_retries: int | None = None
+    # tenant_id scopes which events this webhook receives. "__all__" = every
+    # event regardless of origin; any other value = only events whose
+    # tenant_id matches.
+    tenant_id: str = "__all__"
 
 
 def _row_to_webhook(row: dict) -> WebhookRecord:
@@ -61,11 +68,15 @@ def _row_to_webhook(row: dict) -> WebhookRecord:
         secret=row.get("secret", "") or "",
         enabled=bool(row.get("enabled", True)),
         description=row.get("description", ""),
+        max_retries=row.get("max_retries"),
+        tenant_id=row.get("tenant_id") or "__all__",
     )
 
 
-def list_webhooks(enabled_only: bool = False) -> list[WebhookRecord]:
-    rows = memory.list_webhooks(enabled_only=enabled_only)
+def list_webhooks(
+    enabled_only: bool = False, tenant_id: str | None = None
+) -> list[WebhookRecord]:
+    rows = memory.list_webhooks(enabled_only=enabled_only, tenant_id=tenant_id)
     return [_row_to_webhook(r) for r in rows]
 
 
@@ -74,8 +85,10 @@ def get_webhook(webhook_id: int) -> WebhookRecord | None:
     return _row_to_webhook(row) if row else None
 
 
-def get_webhook_by_name(name: str) -> WebhookRecord | None:
-    row = memory.get_webhook_by_name(name)
+def get_webhook_by_name(
+    name: str, tenant_id: str | None = None
+) -> WebhookRecord | None:
+    row = memory.get_webhook_by_name(name, tenant_id=tenant_id)
     return _row_to_webhook(row) if row else None
 
 
@@ -86,6 +99,8 @@ def upsert_webhook(
     secret: str = "",
     enabled: bool = True,
     description: str = "",
+    max_retries: int | None = None,
+    tenant_id: str = "__all__",
 ) -> WebhookRecord | None:
     row = memory.upsert_webhook(
         name=name,
@@ -94,10 +109,12 @@ def upsert_webhook(
         secret=secret,
         enabled=enabled,
         description=description,
+        max_retries=max_retries,
+        tenant_id=tenant_id,
     )
     if "error" in row:
         return None
-    return get_webhook_by_name(name)
+    return get_webhook_by_name(name, tenant_id=tenant_id)
 
 
 def delete_webhook(webhook_id: int) -> bool:
@@ -170,10 +187,24 @@ class WebhookDispatcher:
         tenant_id: str | None = None,
     ) -> list[int]:
         """Fan out `payload` to every matching webhook. Returns list of
-        delivery record IDs."""
-        matching = [
-            w for w in list_webhooks(enabled_only=True) if _matches(w, event_type)
-        ]
+        delivery record IDs.
+
+        Tenant filtering: a webhook with tenant_id="__all__" always matches.
+        A webhook with a specific tenant_id only matches when the event's
+        tenant_id equals the webhook's tenant_id. If tenant_id is None
+        (event without a tenant context), only "__all__" webhooks match.
+        """
+        all_hooks = list_webhooks(enabled_only=True)
+        matching: list[WebhookRecord] = []
+        for w in all_hooks:
+            if not _matches(w, event_type):
+                continue
+            # Tenant scope check
+            if w.tenant_id == "__all__":
+                matching.append(w)
+            elif tenant_id is not None and w.tenant_id == tenant_id:
+                matching.append(w)
+            # else: webhook is for a different tenant — skip
         if not matching:
             return []
         body_str = json.dumps(payload, default=str, ensure_ascii=False)
@@ -202,6 +233,12 @@ class WebhookDispatcher:
         body_str: str,
         tenant_id: str | None,
     ) -> int:
+        # Per-webhook override takes precedence over dispatcher default.
+        effective_retries = webhook.max_retries
+        if effective_retries is None:
+            effective_retries = self.max_retries
+        if effective_retries < 1:
+            effective_retries = 1
         session = await self._get_session()
         backoff = self.initial_backoff_seconds
         last_delivery_id = 0
@@ -224,7 +261,7 @@ class WebhookDispatcher:
                 duration_ms=0.0,
             )
             return last_delivery_id
-        for attempt in range(1, self.max_retries + 1):
+        for attempt in range(1, effective_retries + 1):
             headers = {
                 "Content-Type": "application/json",
                 "X-Glint-Event-Type": event_type,
@@ -273,13 +310,13 @@ class WebhookDispatcher:
                     attempt=attempt,
                     duration_ms=duration_ms,
                 )
-            if attempt < self.max_retries:
+            if attempt < effective_retries:
                 await asyncio.sleep(backoff)
                 backoff *= self.backoff_multiplier
         log.warning(
             "webhook %s delivery failed after %d attempts: %s",
             webhook.name,
-            self.max_retries,
+            effective_retries,
             last_error,
         )
         return last_delivery_id

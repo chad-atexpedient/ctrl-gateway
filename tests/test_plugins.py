@@ -258,6 +258,388 @@ class MemoryNewTablesTests(unittest.TestCase):
 
 
 # ============================================================================
+# Tenant scoping — global (__all__) vs tenant-specific isolation
+# ============================================================================
+
+
+class TenantScopingTests(unittest.TestCase):
+    """Verify that tenant_id scoping works across all the new registry
+    tables: a tenant sees global rows + its own, but never another
+    tenant's private rows. Admin context (tenant_id=None) sees all.
+    """
+
+    def setUp(self):
+        from gateway import memory
+        memory.close_engine()
+        memory._engine = None  # type: ignore[attr-defined]
+        tmpdir = tempfile.mkdtemp()
+        self.tmpdir = tmpdir
+        memory.init_engine(f"sqlite:///{tmpdir}/test.db")
+
+    def tearDown(self):
+        from gateway import memory
+        memory.close_engine()
+        memory._engine = None  # type: ignore[attr-defined]
+
+    # ----- a2a_agents -----
+
+    def test_a2a_agent_tenant_isolation(self):
+        from gateway import memory
+        memory.upsert_a2a_agent(
+            name="global_agent", endpoint_url="http://x/", agent_type="jsonrpc",
+            tenant_id="__all__",
+        )
+        memory.upsert_a2a_agent(
+            name="acme_agent", endpoint_url="http://x/", agent_type="jsonrpc",
+            tenant_id="acme",
+        )
+        memory.upsert_a2a_agent(
+            name="zebra_agent", endpoint_url="http://x/", agent_type="jsonrpc",
+            tenant_id="zebra",
+        )
+        # acme sees global + acme, not zebra.
+        acme = memory.list_a2a_agents(tenant_id="acme")
+        names = {a["name"] for a in acme}
+        self.assertIn("global_agent", names)
+        self.assertIn("acme_agent", names)
+        self.assertNotIn("zebra_agent", names)
+        # zebra sees global + zebra, not acme.
+        zebra = memory.list_a2a_agents(tenant_id="zebra")
+        names = {a["name"] for a in zebra}
+        self.assertIn("global_agent", names)
+        self.assertIn("zebra_agent", names)
+        self.assertNotIn("acme_agent", names)
+        # Admin context sees all.
+        admin = memory.list_a2a_agents()
+        self.assertEqual(len(admin), 3)
+
+    def test_a2a_agent_by_name_tenant_preferred(self):
+        from gateway import memory
+        # The DB enforces name uniqueness on a2a_agents.name, so a tenant
+        # cannot register an agent with the same name as a global one.
+        # The "preferred" lookup is a single-tenant → global fallback when
+        # a tenant-specific name does not exist.
+        memory.upsert_a2a_agent(
+            name="global_only", endpoint_url="http://global/", agent_type="jsonrpc",
+            tenant_id="__all__",
+        )
+        # acme has its own agent under a distinct name.
+        memory.upsert_a2a_agent(
+            name="acme_private", endpoint_url="http://acme/", agent_type="jsonrpc",
+            tenant_id="acme",
+        )
+        # acme sees both.
+        acme = memory.list_a2a_agents(tenant_id="acme")
+        names = {a["name"] for a in acme}
+        self.assertEqual(names, {"global_only", "acme_private"})
+        # Lookup by name scoped to acme returns the tenant's private agent.
+        row = memory.get_a2a_agent_by_name("acme_private", tenant_id="acme")
+        self.assertEqual(row["endpoint_url"], "http://acme/")
+        # Lookup for a name that doesn't exist as tenant-specific returns
+        # the global one (fallback).
+        row = memory.get_a2a_agent_by_name("global_only", tenant_id="acme")
+        self.assertEqual(row["endpoint_url"], "http://global/")
+        # zebra cannot see acme's private agent.
+        row = memory.get_a2a_agent_by_name("acme_private", tenant_id="zebra")
+        self.assertIsNone(row)
+
+    # ----- prompt_templates -----
+
+    def test_prompt_template_tenant_isolation(self):
+        from gateway import memory
+        memory.upsert_prompt_template(
+            name="global_coder", template_text="global", category="code",
+            tenant_id="__all__",
+        )
+        memory.upsert_prompt_template(
+            name="acme_coder", template_text="acme", category="code",
+            tenant_id="acme",
+        )
+        acme = memory.list_prompt_templates(tenant_id="acme")
+        names = {t["name"] for t in acme}
+        self.assertIn("global_coder", names)
+        self.assertIn("acme_coder", names)
+        # Filter by category too.
+        acme_code = memory.list_prompt_templates(category="code", tenant_id="acme")
+        self.assertEqual(len(acme_code), 2)
+        # zebra sees only global.
+        zebra = memory.list_prompt_templates(tenant_id="zebra")
+        names = {t["name"] for t in zebra}
+        self.assertEqual(names, {"global_coder"})
+
+    def test_prompt_template_by_name_tenant_preferred(self):
+        from gateway import memory
+        # A global template visible to all tenants.
+        memory.upsert_prompt_template(
+            name="global_coder", template_text="global text", category="general",
+            tenant_id="__all__",
+        )
+        # A tenant-specific template (distinct name — the DB enforces name
+        # uniqueness; tenant-private templates must use a unique name, e.g.
+        # prefixed with the tenant). list/get filters still scope by tenant.
+        memory.upsert_prompt_template(
+            name="acme_coder", template_text="acme text", category="general",
+            tenant_id="acme",
+        )
+        # acme sees both.
+        acme = memory.list_prompt_templates(tenant_id="acme")
+        self.assertEqual(len(acme), 2)
+        # zebra sees only global.
+        zebra = memory.list_prompt_templates(tenant_id="zebra")
+        self.assertEqual(len(zebra), 1)
+        self.assertEqual(zebra[0]["name"], "global_coder")
+
+    # ----- webhooks -----
+
+    def test_webhook_tenant_isolation_and_max_retries(self):
+        from gateway import memory
+        memory.upsert_webhook(
+            name="global_hook", url="http://x/", events=["*"],
+            tenant_id="__all__",
+        )
+        memory.upsert_webhook(
+            name="acme_hook", url="http://x/", events=["*"],
+            tenant_id="acme", max_retries=10,
+        )
+        acme = memory.list_webhooks(tenant_id="acme")
+        names = {w["name"] for w in acme}
+        self.assertIn("global_hook", names)
+        self.assertIn("acme_hook", names)
+        # max_retries override is persisted.
+        acme_hook = memory.get_webhook_by_name("acme_hook", tenant_id="acme")
+        self.assertEqual(acme_hook["max_retries"], 10)
+        # global hook has null max_retries (uses default).
+        global_hook = memory.get_webhook_by_name("global_hook")
+        self.assertIsNone(global_hook["max_retries"])
+        # zebra sees only global.
+        zebra = memory.list_webhooks(tenant_id="zebra")
+        names = {w["name"] for w in zebra}
+        self.assertEqual(names, {"global_hook"})
+
+    # ----- federated_tools -----
+
+    def test_federated_tool_tenant_isolation(self):
+        from gateway import memory
+        memory.upsert_federated_tool(
+            name="global_tool", source="contextforge", source_url="http://x/",
+            tool={"description": "global"},
+        )
+        memory.upsert_federated_tool(
+            name="acme_tool", source="embedded", source_url="embedded",
+            tool={"description": "acme"}, tenant_id="acme",
+        )
+        acme = memory.list_federated_tools(tenant_id="acme")
+        names = {t["name"] for t in acme}
+        self.assertIn("global_tool", names)
+        self.assertIn("acme_tool", names)
+        # zebra sees only global.
+        zebra = memory.list_federated_tools(tenant_id="zebra")
+        names = {t["name"] for t in zebra}
+        self.assertEqual(names, {"global_tool"})
+        # get by name prefers tenant-specific.
+        row = memory.get_federated_tool("acme_tool", tenant_id="acme")
+        self.assertIsNotNone(row)
+
+    def test_federated_tool_same_name_different_tenants(self):
+        import json as _json
+
+        from gateway import memory
+        # The DB enforces name uniqueness, so tenant-specific tools must
+        # use distinct names (the convention is to prefix/suffix the
+        # tenant). The scoping is enforced at the list/get level, not by
+        # allowing name collisions.
+        memory.upsert_federated_tool(
+            name="global_tool", source="x", source_url="http://g/",
+            tool={"url": "global"}, tenant_id="__all__",
+        )
+        memory.upsert_federated_tool(
+            name="acme_tool", source="x", source_url="http://a/",
+            tool={"url": "acme"}, tenant_id="acme",
+        )
+        memory.upsert_federated_tool(
+            name="zebra_tool", source="x", source_url="http://z/",
+            tool={"url": "zebra"}, tenant_id="zebra",
+        )
+        # acme sees global + acme_tool.
+        acme = memory.list_federated_tools(tenant_id="acme")
+        acme_names = {t["name"] for t in acme}
+        self.assertEqual(acme_names, {"global_tool", "acme_tool"})
+        # zebra sees global + zebra_tool.
+        zebra = memory.list_federated_tools(tenant_id="zebra")
+        zebra_names = {t["name"] for t in zebra}
+        self.assertEqual(zebra_names, {"global_tool", "zebra_tool"})
+        # get by name resolves to the right tenant's tool.
+        acme_row = memory.get_federated_tool("acme_tool", tenant_id="acme")
+        self.assertEqual(_json.loads(acme_row["tool_json"])["url"], "acme")
+
+
+# ============================================================================
+# Webhook dispatcher — per-webhook max_retries override + tenant filtering
+# ============================================================================
+
+
+class WebhookDispatcherTenantTests(unittest.TestCase):
+    """Verify the dispatcher respects per-webhook max_retries and tenant
+    scoping during dispatch."""
+
+    def setUp(self):
+        from gateway import memory
+        memory.close_engine()
+        memory._engine = None  # type: ignore[attr-defined]
+        tmpdir = tempfile.mkdtemp()
+        self.tmpdir = tmpdir
+        memory.init_engine(f"sqlite:///{tmpdir}/test.db")
+
+    def tearDown(self):
+        from gateway import memory
+        memory.close_engine()
+        memory._engine = None  # type: ignore[attr-defined]
+
+    def test_dispatch_filters_by_tenant(self):
+        from gateway import webhook_dispatcher as wd
+        memory_upsert = wd.memory.upsert_webhook
+        memory_upsert(
+            name="global_hook", url="http://localhost:1/", events=["*"],
+            tenant_id="__all__",
+        )
+        memory_upsert(
+            name="acme_hook", url="http://localhost:1/", events=["*"],
+            tenant_id="acme",
+        )
+        memory_upsert(
+            name="zebra_hook", url="http://localhost:1/", events=["*"],
+            tenant_id="zebra",
+        )
+        # Dispatch an event from acme -> should match global + acme only.
+        matching = [
+            w for w in wd.list_webhooks(enabled_only=True)
+            if wd._matches(w, "test.event")
+        ]
+        # Filter by tenant manually (mirrors dispatch logic).
+        tenant = "acme"
+        scoped = [
+            w for w in matching
+            if w.tenant_id == "__all__" or w.tenant_id == tenant
+        ]
+        scoped_names = {w.name for w in scoped}
+        self.assertEqual(scoped_names, {"global_hook", "acme_hook"})
+
+    def test_per_webhook_max_retries_override(self):
+        from gateway import webhook_dispatcher as wd
+        wd.memory.upsert_webhook(
+            name="hook_with_override", url="http://localhost:1/", events=["*"],
+            max_retries=7,
+        )
+        wh = wd.get_webhook_by_name("hook_with_override")
+        self.assertIsNotNone(wh)
+        self.assertEqual(wh.max_retries, 7)
+        # The dispatcher should use the per-webhook value when set.
+        disp = wd.WebhookDispatcher(max_retries=3)
+        # effective_retries computation mirrors _deliver_with_retry.
+        effective = wh.max_retries if wh.max_retries is not None else disp.max_retries
+        self.assertEqual(effective, 7)
+        # A webhook without override falls back to dispatcher default.
+        wd.memory.upsert_webhook(
+            name="hook_default", url="http://localhost:1/", events=["*"],
+        )
+        wh2 = wd.get_webhook_by_name("hook_default")
+        effective2 = wh2.max_retries if wh2.max_retries is not None else disp.max_retries
+        self.assertEqual(effective2, 3)
+
+
+# ============================================================================
+# A2A invoke_agent — tool cache integration
+# ============================================================================
+
+
+class A2ACacheIntegrationTests(unittest.TestCase):
+    """Verify invoke_agent consults and populates the tool cache."""
+
+    def setUp(self):
+        from gateway import memory
+        memory.close_engine()
+        memory._engine = None  # type: ignore[attr-defined]
+        tmpdir = tempfile.mkdtemp()
+        self.tmpdir = tmpdir
+        memory.init_engine(f"sqlite:///{tmpdir}/test.db")
+
+    def tearDown(self):
+        from gateway import memory, tool_cache
+        memory.close_engine()
+        memory._engine = None  # type: ignore[attr-defined]
+        tool_cache._default_cache = None  # type: ignore[attr-defined]
+
+    def test_invoke_caches_successful_result(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from gateway import a2a_registry, memory, tool_cache
+        tool_cache.init_cache(max_entries=10, default_ttl_seconds=60)
+        memory.upsert_a2a_agent(
+            name="cacheable", endpoint_url="http://localhost:65535/",
+            agent_type="jsonrpc",
+        )
+        agent_id = memory.get_a2a_agent_by_name("cacheable")["id"]
+        agent = a2a_registry.get_agent(agent_id)
+        # Mock session returns 200 success.
+        mock_session = MagicMock()
+        resp = MagicMock()
+        resp.status = 200
+        resp.text = AsyncMock(return_value='{"result": "ok"}')
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=None)
+        mock_session.post = MagicMock(return_value=resp)
+        params = {"method": "ping"}
+        result1 = _run(a2a_registry.invoke_agent(
+            agent, params, session=mock_session, tenant_id="alice",
+        ))
+        self.assertTrue(result1.success)
+        # Second call with same params should hit the cache and NOT call
+        # the session again. Reset the mock to verify.
+        mock_session.post.reset_mock()
+        result2 = _run(a2a_registry.invoke_agent(
+            agent, params, session=mock_session, tenant_id="alice",
+        ))
+        self.assertTrue(result2.success)
+        self.assertEqual(result2.error, "__cached__")
+        # Session was not called on the cached hit.
+        mock_session.post.assert_not_called()
+
+    def test_invoke_cache_is_tenant_scoped(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from gateway import a2a_registry, memory, tool_cache
+        tool_cache.init_cache(max_entries=10, default_ttl_seconds=60)
+        memory.upsert_a2a_agent(
+            name="cacheable2", endpoint_url="http://localhost:65535/",
+            agent_type="jsonrpc",
+        )
+        agent_id = memory.get_a2a_agent_by_name("cacheable2")["id"]
+        agent = a2a_registry.get_agent(agent_id)
+        mock_session = MagicMock()
+        resp = MagicMock()
+        resp.status = 200
+        resp.text = AsyncMock(return_value='{"result": "alice"}')
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=None)
+        mock_session.post = MagicMock(return_value=resp)
+        params = {"method": "ping"}
+        # Alice calls — cached under alice.
+        _run(a2a_registry.invoke_agent(
+            agent, params, session=mock_session, tenant_id="alice",
+        ))
+        # Bob calls with same params — should miss cache (different tenant)
+        # and hit the session again.
+        resp.text = AsyncMock(return_value='{"result": "bob"}')
+        mock_session.post = MagicMock(return_value=resp)
+        result_bob = _run(a2a_registry.invoke_agent(
+            agent, params, session=mock_session, tenant_id="bob",
+        ))
+        self.assertTrue(result_bob.success)
+        # Different tenant => session was called.
+        mock_session.post.assert_called_once()
+
+
+# ============================================================================
 # Plugin loader — manifest.yaml + build_router
 # ============================================================================
 

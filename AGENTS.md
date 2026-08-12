@@ -289,7 +289,10 @@ broken format strings, wrong column names) actually surface.
       source, description, input_schema_json, endpoint_url, enabled, tenant_id).
       Full CRUD for each: `upsert_*`, `get_*`, `list_*`, `set_*_enabled`,
       `delete_*` (builtins delete-refused where applicable), `record_*`,
-      `*_summary`. No `tenant_id` scoping yet — see "Known unfinished".
+      `*_summary`. `plugins`, `a2a_agents`, `prompt_templates`, `webhooks`,
+      and `federated_tools` all carry a `tenant_id` column (default
+      `"__all__"` = visible to every tenant); list/get paths filter by
+      `(tenant_id IN ("__all__", <caller_tenant>))`. See invariant #35.
     - **Plugin system** (`gateway/plugin.py`): `manifest.yaml` +
       `plugin.py` contract adapted from `mcpchad` (which uses FastAPI's
       `APIRouter`; here plugins return `web.RouteTableDef`). Routes MUST
@@ -420,6 +423,66 @@ broken format strings, wrong column names) actually surface.
       contract with `/integrations/microsoft-learn/search` (POST) and
       `/integrations/microsoft-learn/modules` (GET) endpoints, event
       emission, and `context.get_setting()` for the `api_key` setting.
+35. **Tenant scoping on the extension tables** (multi-tenant safety):
+    - `plugins`, `a2a_agents`, `prompt_templates`, `webhooks`, and
+      `federated_tools` all have a `tenant_id` column defaulting to
+      `"__all__"`. The semantics:
+      - `"__all__"` = global row, visible to every tenant. Admin-created
+        builtins, ContextForge-imported tools, and MCP-discovered servers
+        use this.
+      - any other value = tenant-private row, visible only to that tenant.
+    - List paths filter by `tenant_id IN ("__all__", <caller_tenant>)`:
+      a tenant sees globals + its own privates, never another tenant's.
+      Admin context (`tenant_id=None`) bypasses the filter and sees all
+      rows — the admin REST routes accept a `?tenant_id=` query param
+      for optional scoping.
+    - **DB uniqueness is by `name` alone, not by `(tenant_id, name)`.**
+      Two tenants CANNOT have a row with the same name — tenant-private
+      rows must use distinct names (convention: prefix/suffix the tenant,
+      e.g. `acme_coder`). The "preferred tenant → global fallback"
+      pattern in `get_*_by_name(name, tenant_id=...)` returns a
+      tenant-specific row if one exists, otherwise the global row of the
+      same name, otherwise None. It does NOT allow name collisions.
+    - **Prompt auto-inject** (`chat_completions`) lists templates by
+      `category_for_vertical(r.vertical)` filtered by the caller's
+      `tenant_id`, then prefers a tenant-specific template over a global
+      one in the same category.
+    - **MCP facade** (`POST /mcp`): `tools/list`, `prompts/list`,
+      `tools/call`, and `prompts/get` all read `X-Tenant-Id` from the
+      request header (default `"anonymous"`) and filter accordingly. A
+      tenant cannot discover or invoke another tenant's private A2A
+      agents or federated tools.
+    - **Webhook dispatcher** (`gateway/webhook_dispatcher.py`):
+      `dispatch(event_type, payload, tenant_id=...)` matches a webhook
+      only when `webhook.tenant_id == "__all__"` OR
+      `webhook.tenant_id == event_tenant_id`. Events published via
+      `events.publish()` carry the originating tenant_id, so a webhook
+      scoped to tenant `acme` only receives events that `acme` triggered.
+    - **Per-webhook `max_retries` override**: `webhooks.max_retries` is
+      a nullable int column. NULL = use the global
+      `webhooks.max_retries` from gateway-config.json (default behavior).
+      A positive int = this webhook gets that many retry attempts,
+      overriding the global. `_deliver_with_retry` computes
+      `effective_retries = webhook.max_retries if not None else
+      dispatcher.max_retries` and clamps to >= 1.
+    - **A2A `invoke_agent` tool cache integration**: when
+      `interaction_type == "invoke"` (the default) and the global
+      ToolCache singleton is initialized, `invoke_agent` checks the
+      cache before the HTTP call (keyed by `a2a_<agent.name>`,
+      `parameters`, `tenant_id`). A hit returns an `A2AResult` with
+      `error="__cached__"` and `status_code=200`. Successful miss
+      results are cached. The MCP facade calls `invoke_agent` with
+      `interaction_type="mcp_call"`, which bypasses the in-invoke cache
+      (the facade does its own cache check at the top of `tools/call`).
+      `use_cache=False` disables the cache for a single call.
+    - **MCP discovery `watch_loop` jitter + cache**: each iteration
+      sleeps `interval_seconds + random(0, 10% of interval)` to
+      desynchronize multiple gateways probing the same hosts. A
+      per-host "last successful discovery" cache (in-memory dict, keyed
+      by hostname) skips hosts that produced a result within the last
+      `interval_seconds * 2` (min 120s) — avoids noisy re-probing of
+      healthy known hosts while still re-probing hosts that previously
+      returned nothing.
 
 
 ## Router model v2 — MLP heads, real embedding fine-tune, llm_plan swarm (UNVERIFIED)

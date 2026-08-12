@@ -418,6 +418,10 @@ plugins = Table(
     Column("loaded_at", DateTime),
     Column("error", Text),
     Column("is_builtin", Boolean, default=False),
+    # Plugins are gateway-level (tenant_id always __all__) — kept for
+    # contract symmetry with the other registry tables. Plugins mount
+    # routes on the gateway app itself; they cannot be per-tenant.
+    Column("tenant_id", String(64), default="__all__"),
     Column("created_at", DateTime, default=lambda: datetime.now(UTC)),
     Column("updated_at", DateTime, default=lambda: datetime.now(UTC)),
 )
@@ -427,7 +431,7 @@ a2a_agents = Table(
     "a2a_agents",
     metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
-    Column("name", String(64), unique=True),
+    Column("name", String(64)),
     Column("endpoint_url", String(256)),
     Column("agent_type", String(32)),
     Column("description", Text),
@@ -438,6 +442,10 @@ a2a_agents = Table(
     Column("capabilities_json", Text),
     Column("config_json", Text),
     Column("tags_json", Text),
+    # tenant_id scopes agent records. "__all__" = visible to every tenant
+    # (the default for admin/global agents). Any other value = only that
+    # tenant sees the agent. Names are unique within (tenant_id, name).
+    Column("tenant_id", String(64), default="__all__", index=True),
     Column("created_at", DateTime, default=lambda: datetime.now(UTC)),
     Column("updated_at", DateTime, default=lambda: datetime.now(UTC)),
 )
@@ -483,6 +491,12 @@ prompt_templates = Table(
     Column("is_builtin", Boolean, default=False),
     Column("version", Integer, default=1),
     Column("source", String(32), default="manual"),
+    # tenant_id scopes visibility. "__all__" = visible to every tenant
+    # (builtins and admin globals use this). Any other value = only that
+    # tenant sees the template. Prompt auto-inject looks up by category
+    # using (tenant = '__all__' OR tenant = user_tenant), preferring a
+    # tenant-specific template when one exists.
+    Column("tenant_id", String(64), default="__all__", index=True),
     Column("created_at", DateTime, default=lambda: datetime.now(UTC)),
     Column("updated_at", DateTime, default=lambda: datetime.now(UTC)),
 )
@@ -498,6 +512,14 @@ webhooks = Table(
     Column("secret", String(128)),
     Column("enabled", Boolean, default=True),
     Column("description", Text),
+    # Per-webhook override of the global webhooks.max_retries. NULL = use
+    # the global config default. Set to an int to override for this hook.
+    Column("max_retries", Integer, nullable=True),
+    # tenant_id scopes webhook subscribers. "__all__" = receives every
+    # event regardless of which tenant triggered it (default, matches
+    # historical behavior). Any other value = only receives events that
+    # originated from that tenant (events.publish carries tenant_id).
+    Column("tenant_id", String(64), default="__all__", index=True),
     Column("created_at", DateTime, default=lambda: datetime.now(UTC)),
     Column("updated_at", DateTime, default=lambda: datetime.now(UTC)),
 )
@@ -544,6 +566,11 @@ federated_tools = Table(
     Column("source_url", String(512)),
     Column("tool_json", Text),
     Column("enabled", Boolean, default=True),
+    # tenant_id scopes which federated tools a tenant can see/call.
+    # "__all__" = visible to every tenant (default — matches historical
+    # behavior for ContextForge-imported tools). The MCP facade's
+    # tools/list filters by (tenant = '__all__' OR tenant = caller).
+    Column("tenant_id", String(64), default="__all__", index=True),
     Column("last_synced", DateTime),
     Column("created_at", DateTime, default=lambda: datetime.now(UTC)),
 )
@@ -602,6 +629,22 @@ def _migrate(engine: Engine):
             result_columns = _column_names(conn, "review_results")
             if result_columns and "prompt_text" not in result_columns:
                 conn.execute(text("ALTER TABLE review_results ADD COLUMN prompt_text TEXT"))
+                conn.commit()
+            # Tenant scoping columns added for the gateway extension tables.
+            # Default to "__all__" so pre-existing rows remain visible to
+            # every tenant (preserves historical behavior on upgrade).
+            for table_name in ("plugins", "a2a_agents", "prompt_templates",
+                               "webhooks", "federated_tools"):
+                cols = _column_names(conn, table_name)
+                if cols and "tenant_id" not in cols:
+                    conn.execute(text(
+                        f"ALTER TABLE {table_name} ADD COLUMN tenant_id VARCHAR(64) DEFAULT '__all__'"
+                    ))
+                    conn.commit()
+            # Per-webhook max_retries override (nullable int).
+            wh_cols = _column_names(conn, "webhooks")
+            if wh_cols and "max_retries" not in wh_cols:
+                conn.execute(text("ALTER TABLE webhooks ADD COLUMN max_retries INTEGER"))
                 conn.commit()
     except Exception as e:
         log.warning("schema migration skipped: %s", e)
@@ -2697,9 +2740,14 @@ def upsert_a2a_agent(
     config: dict | None = None,
     tags: list[str] | None = None,
     enabled: bool = True,
+    tenant_id: str = "__all__",
 ) -> dict:
     """Insert or update an A2A agent. auth_value is stored as-is (callers
     should encrypt out-of-band if needed — gateway reads plaintext).
+
+    tenant_id scopes visibility: "__all__" (default) for global agents
+    visible to every tenant, or a specific tenant_id for private agents.
+    (tenant_id, name) is the logical uniqueness key.
     """
     if agent_type not in VALID_A2A_AGENT_TYPES:
         return {"error": f"invalid agent_type: {agent_type}"}
@@ -2712,12 +2760,18 @@ def upsert_a2a_agent(
     try:
         with begin() as conn:
             existing = conn.execute(
-                select(a2a_agents).where(a2a_agents.c.name == name)
+                select(a2a_agents).where(
+                    (a2a_agents.c.name == name)
+                    & (a2a_agents.c.tenant_id == tenant_id)
+                )
             ).mappings().first()
             if existing:
                 conn.execute(
                     update(a2a_agents)
-                    .where(a2a_agents.c.name == name)
+                    .where(
+                        (a2a_agents.c.name == name)
+                        & (a2a_agents.c.tenant_id == tenant_id)
+                    )
                     .values(
                         endpoint_url=endpoint_url,
                         agent_type=agent_type,
@@ -2746,11 +2800,12 @@ def upsert_a2a_agent(
                         config_json=config_json,
                         tags_json=tags_json,
                         enabled=enabled,
+                        tenant_id=tenant_id,
                         created_at=now,
                         updated_at=now,
                     )
                 )
-        row = get_a2a_agent_by_name(name)
+        row = get_a2a_agent_by_name(name, tenant_id=tenant_id)
         return row or {}
     except Exception as e:
         log.warning("upsert_a2a_agent failed: %s", e)
@@ -2769,9 +2824,34 @@ def get_a2a_agent(agent_id: int) -> dict | None:
         return None
 
 
-def get_a2a_agent_by_name(name: str) -> dict | None:
+def get_a2a_agent_by_name(
+    name: str, tenant_id: str | None = None
+) -> dict | None:
+    """Look up an agent by name. If tenant_id is provided, prefer a
+    tenant-specific row; fall back to the global ("__all__") row.
+    If tenant_id is None, return any row with this name (legacy/admin
+    behavior — the caller does not have a tenant context).
+    """
     try:
         with begin() as conn:
+            if tenant_id is not None and tenant_id != "__all__":
+                row = conn.execute(
+                    select(a2a_agents).where(
+                        (a2a_agents.c.name == name)
+                        & (a2a_agents.c.tenant_id == tenant_id)
+                    )
+                ).mappings().first()
+                if row:
+                    return dict(row)
+                # Fall back to global.
+                row = conn.execute(
+                    select(a2a_agents).where(
+                        (a2a_agents.c.name == name)
+                        & (a2a_agents.c.tenant_id == "__all__")
+                    )
+                ).mappings().first()
+                return dict(row) if row else None
+            # No tenant filter: return the first match (admin context).
             row = conn.execute(
                 select(a2a_agents).where(a2a_agents.c.name == name)
             ).mappings().first()
@@ -2781,12 +2861,21 @@ def get_a2a_agent_by_name(name: str) -> dict | None:
         return None
 
 
-def list_a2a_agents(enabled_only: bool = False) -> list[dict]:
+def list_a2a_agents(
+    enabled_only: bool = False, tenant_id: str | None = None
+) -> list[dict]:
+    """List agents. If tenant_id is provided, return that tenant's agents
+    plus all global ("__all__") agents. If None, return every row.
+    """
     try:
         with begin() as conn:
             stmt = select(a2a_agents)
             if enabled_only:
                 stmt = stmt.where(a2a_agents.c.enabled.is_(True))
+            if tenant_id is not None:
+                stmt = stmt.where(
+                    a2a_agents.c.tenant_id.in_(["__all__", tenant_id])
+                )
             stmt = stmt.order_by(a2a_agents.c.name.asc())
             return [dict(r) for r in conn.execute(stmt).mappings().all()]
     except Exception as e:
@@ -2992,8 +3081,15 @@ def upsert_prompt_template(
     enabled: bool = True,
     is_builtin: bool = False,
     source: str = "manual",
+    tenant_id: str = "__all__",
 ) -> dict:
-    """Insert or update a prompt template."""
+    """Insert or update a prompt template.
+
+    tenant_id scopes visibility: "__all__" (default) for templates visible
+    to every tenant (used by builtins and the auto-inject fallback), or a
+    specific tenant_id for tenant-private templates. Auto-inject prefers a
+    tenant-specific template in the same category and falls back to global.
+    """
     if not name or not template_text:
         return {"error": "name and template_text required"}
     variables_json = json.dumps(variables or [])
@@ -3001,12 +3097,18 @@ def upsert_prompt_template(
     try:
         with begin() as conn:
             existing = conn.execute(
-                select(prompt_templates).where(prompt_templates.c.name == name)
+                select(prompt_templates).where(
+                    (prompt_templates.c.name == name)
+                    & (prompt_templates.c.tenant_id == tenant_id)
+                )
             ).mappings().first()
             if existing:
                 conn.execute(
                     update(prompt_templates)
-                    .where(prompt_templates.c.name == name)
+                    .where(
+                        (prompt_templates.c.name == name)
+                        & (prompt_templates.c.tenant_id == tenant_id)
+                    )
                     .values(
                         description=description,
                         template_text=template_text,
@@ -3030,11 +3132,12 @@ def upsert_prompt_template(
                         is_builtin=is_builtin,
                         version=1,
                         source=source,
+                        tenant_id=tenant_id,
                         created_at=now,
                         updated_at=now,
                     )
                 )
-        row = get_prompt_template_by_name(name)
+        row = get_prompt_template_by_name(name, tenant_id=tenant_id)
         return row or {}
     except Exception as e:
         log.warning("upsert_prompt_template failed: %s", e)
@@ -3053,11 +3156,29 @@ def get_prompt_template(template_id: int) -> dict | None:
         return None
 
 
-def get_prompt_template_by_name(name: str) -> dict | None:
+def get_prompt_template_by_name(
+    name: str, tenant_id: str | None = None
+) -> dict | None:
+    """Look up a prompt template by name. If tenant_id is provided and not
+    "__all__", prefer a tenant-specific row and fall back to global.
+    If tenant_id is None or "__all__", return the global row.
+    """
     try:
         with begin() as conn:
+            if tenant_id is not None and tenant_id != "__all__":
+                row = conn.execute(
+                    select(prompt_templates).where(
+                        (prompt_templates.c.name == name)
+                        & (prompt_templates.c.tenant_id == tenant_id)
+                    )
+                ).mappings().first()
+                if row:
+                    return dict(row)
             row = conn.execute(
-                select(prompt_templates).where(prompt_templates.c.name == name)
+                select(prompt_templates).where(
+                    (prompt_templates.c.name == name)
+                    & (prompt_templates.c.tenant_id == "__all__")
+                )
             ).mappings().first()
             return dict(row) if row else None
     except Exception as e:
@@ -3066,8 +3187,13 @@ def get_prompt_template_by_name(name: str) -> dict | None:
 
 
 def list_prompt_templates(
-    enabled_only: bool = False, category: str | None = None
+    enabled_only: bool = False,
+    category: str | None = None,
+    tenant_id: str | None = None,
 ) -> list[dict]:
+    """List templates. If tenant_id is provided, return that tenant's
+    templates plus all global ("__all__") templates. If None, return all.
+    """
     try:
         with begin() as conn:
             stmt = select(prompt_templates)
@@ -3075,6 +3201,10 @@ def list_prompt_templates(
                 stmt = stmt.where(prompt_templates.c.enabled.is_(True))
             if category:
                 stmt = stmt.where(prompt_templates.c.category == category)
+            if tenant_id is not None:
+                stmt = stmt.where(
+                    prompt_templates.c.tenant_id.in_(["__all__", tenant_id])
+                )
             stmt = stmt.order_by(prompt_templates.c.category.asc(), prompt_templates.c.name.asc())
             return [dict(r) for r in conn.execute(stmt).mappings().all()]
     except Exception as e:
@@ -3128,6 +3258,8 @@ def upsert_webhook(
     secret: str = "",
     enabled: bool = True,
     description: str = "",
+    max_retries: int | None = None,
+    tenant_id: str = "__all__",
 ) -> dict:
     if not name or not url:
         return {"error": "name and url required"}
@@ -3136,18 +3268,25 @@ def upsert_webhook(
     try:
         with begin() as conn:
             existing = conn.execute(
-                select(webhooks).where(webhooks.c.name == name)
+                select(webhooks).where(
+                    (webhooks.c.name == name)
+                    & (webhooks.c.tenant_id == tenant_id)
+                )
             ).mappings().first()
             if existing:
                 conn.execute(
                     update(webhooks)
-                    .where(webhooks.c.name == name)
+                    .where(
+                        (webhooks.c.name == name)
+                        & (webhooks.c.tenant_id == tenant_id)
+                    )
                     .values(
                         url=url,
                         events_json=events_json,
                         secret=secret,
                         enabled=enabled,
                         description=description,
+                        max_retries=max_retries,
                         updated_at=now,
                     )
                 )
@@ -3160,11 +3299,13 @@ def upsert_webhook(
                         secret=secret,
                         enabled=enabled,
                         description=description,
+                        max_retries=max_retries,
+                        tenant_id=tenant_id,
                         created_at=now,
                         updated_at=now,
                     )
                 )
-        row = get_webhook_by_name(name)
+        row = get_webhook_by_name(name, tenant_id=tenant_id)
         return row or {}
     except Exception as e:
         log.warning("upsert_webhook failed: %s", e)
@@ -3183,11 +3324,28 @@ def get_webhook(webhook_id: int) -> dict | None:
         return None
 
 
-def get_webhook_by_name(name: str) -> dict | None:
+def get_webhook_by_name(
+    name: str, tenant_id: str | None = None
+) -> dict | None:
+    """Look up a webhook by name. If tenant_id is provided and not
+    "__all__", prefer a tenant-specific row and fall back to global.
+    """
     try:
         with begin() as conn:
+            if tenant_id is not None and tenant_id != "__all__":
+                row = conn.execute(
+                    select(webhooks).where(
+                        (webhooks.c.name == name)
+                        & (webhooks.c.tenant_id == tenant_id)
+                    )
+                ).mappings().first()
+                if row:
+                    return dict(row)
             row = conn.execute(
-                select(webhooks).where(webhooks.c.name == name)
+                select(webhooks).where(
+                    (webhooks.c.name == name)
+                    & (webhooks.c.tenant_id == "__all__")
+                )
             ).mappings().first()
             return dict(row) if row else None
     except Exception as e:
@@ -3195,12 +3353,21 @@ def get_webhook_by_name(name: str) -> dict | None:
         return None
 
 
-def list_webhooks(enabled_only: bool = False) -> list[dict]:
+def list_webhooks(
+    enabled_only: bool = False, tenant_id: str | None = None
+) -> list[dict]:
+    """List webhooks. If tenant_id is provided, return that tenant's
+    webhooks plus all global ("__all__") webhooks. If None, return all.
+    """
     try:
         with begin() as conn:
             stmt = select(webhooks)
             if enabled_only:
                 stmt = stmt.where(webhooks.c.enabled.is_(True))
+            if tenant_id is not None:
+                stmt = stmt.where(
+                    webhooks.c.tenant_id.in_(["__all__", tenant_id])
+                )
             stmt = stmt.order_by(webhooks.c.name.asc())
             return [dict(r) for r in conn.execute(stmt).mappings().all()]
     except Exception as e:
@@ -3324,19 +3491,30 @@ def upsert_federated_tool(
     source_url: str,
     tool: dict,
     enabled: bool = True,
+    tenant_id: str = "__all__",
 ) -> dict:
-    """Insert or update a federated tool record (from ContextForge, etc.)."""
+    """Insert or update a federated tool record (from ContextForge, etc.).
+
+    tenant_id scopes visibility: "__all__" (default) for tools visible to
+    every tenant, or a specific tenant_id for tenant-private federations.
+    """
     tool_json = json.dumps(tool)
     now = datetime.now(UTC)
     try:
         with begin() as conn:
             existing = conn.execute(
-                select(federated_tools).where(federated_tools.c.name == name)
+                select(federated_tools).where(
+                    (federated_tools.c.name == name)
+                    & (federated_tools.c.tenant_id == tenant_id)
+                )
             ).mappings().first()
             if existing:
                 conn.execute(
                     update(federated_tools)
-                    .where(federated_tools.c.name == name)
+                    .where(
+                        (federated_tools.c.name == name)
+                        & (federated_tools.c.tenant_id == tenant_id)
+                    )
                     .values(
                         source=source,
                         source_url=source_url,
@@ -3353,22 +3531,40 @@ def upsert_federated_tool(
                         source_url=source_url,
                         tool_json=tool_json,
                         enabled=enabled,
+                        tenant_id=tenant_id,
                         last_synced=now,
                         created_at=now,
                     )
                 )
-        row = get_federated_tool(name)
+        row = get_federated_tool(name, tenant_id=tenant_id)
         return row or {}
     except Exception as e:
         log.warning("upsert_federated_tool failed: %s", e)
         return {"error": str(e)}
 
 
-def get_federated_tool(name: str) -> dict | None:
+def get_federated_tool(
+    name: str, tenant_id: str | None = None
+) -> dict | None:
+    """Look up a federated tool by name. If tenant_id is provided and not
+    "__all__", prefer a tenant-specific row and fall back to global.
+    """
     try:
         with begin() as conn:
+            if tenant_id is not None and tenant_id != "__all__":
+                row = conn.execute(
+                    select(federated_tools).where(
+                        (federated_tools.c.name == name)
+                        & (federated_tools.c.tenant_id == tenant_id)
+                    )
+                ).mappings().first()
+                if row:
+                    return dict(row)
             row = conn.execute(
-                select(federated_tools).where(federated_tools.c.name == name)
+                select(federated_tools).where(
+                    (federated_tools.c.name == name)
+                    & (federated_tools.c.tenant_id == "__all__")
+                )
             ).mappings().first()
             return dict(row) if row else None
     except Exception as e:
@@ -3376,12 +3572,21 @@ def get_federated_tool(name: str) -> dict | None:
         return None
 
 
-def list_federated_tools(enabled_only: bool = False) -> list[dict]:
+def list_federated_tools(
+    enabled_only: bool = False, tenant_id: str | None = None
+) -> list[dict]:
+    """List federated tools. If tenant_id is provided, return that tenant's
+    tools plus all global ("__all__") tools. If None, return all.
+    """
     try:
         with begin() as conn:
             stmt = select(federated_tools)
             if enabled_only:
                 stmt = stmt.where(federated_tools.c.enabled.is_(True))
+            if tenant_id is not None:
+                stmt = stmt.where(
+                    federated_tools.c.tenant_id.in_(["__all__", tenant_id])
+                )
             stmt = stmt.order_by(federated_tools.c.name.asc())
             return [dict(r) for r in conn.execute(stmt).mappings().all()]
     except Exception as e:

@@ -35,9 +35,16 @@ SERVER_NAME = "glint-v2-gateway"
 SERVER_VERSION = "2.0.0"
 
 
-def _list_federated_tools_as_mcp() -> list[dict[str, Any]]:
-    """Return federated tools in MCP tools/list format."""
-    rows = memory.list_federated_tools(enabled_only=True)
+def _list_federated_tools_as_mcp(
+    tenant_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return federated tools in MCP tools/list format.
+
+    If tenant_id is provided, only tools scoped to "__all__" or that
+    tenant are returned. If None, every enabled tool is returned (admin
+    context — backward compatible).
+    """
+    rows = memory.list_federated_tools(enabled_only=True, tenant_id=tenant_id)
     tools: list[dict[str, Any]] = []
     for row in rows:
         try:
@@ -58,9 +65,15 @@ def _list_federated_tools_as_mcp() -> list[dict[str, Any]]:
     return tools
 
 
-def _list_a2a_agents_as_mcp() -> list[dict[str, Any]]:
-    """Return A2A agents as MCP tools (prefixed with a2a_)."""
-    agents = a2a_registry.list_agents(enabled_only=True)
+def _list_a2a_agents_as_mcp(
+    tenant_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return A2A agents as MCP tools (prefixed with a2a_).
+
+    If tenant_id is provided, only agents scoped to "__all__" or that
+    tenant are returned.
+    """
+    agents = a2a_registry.list_agents(enabled_only=True, tenant_id=tenant_id)
     tools: list[dict[str, Any]] = []
     for agent in agents:
         tool_name = f"a2a_{agent.name}"
@@ -90,9 +103,15 @@ def _list_a2a_agents_as_mcp() -> list[dict[str, Any]]:
     return tools
 
 
-def _list_prompts_as_mcp() -> list[dict[str, Any]]:
-    """Return prompt templates in MCP prompts/list format."""
-    rows = memory.list_prompt_templates(enabled_only=True)
+def _list_prompts_as_mcp(
+    tenant_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return prompt templates in MCP prompts/list format.
+
+    If tenant_id is provided, only templates scoped to "__all__" or that
+    tenant are returned.
+    """
+    rows = memory.list_prompt_templates(enabled_only=True, tenant_id=tenant_id)
     prompts: list[dict[str, Any]] = []
     for row in rows:
         try:
@@ -112,9 +131,11 @@ def _list_prompts_as_mcp() -> list[dict[str, Any]]:
     return prompts
 
 
-def _list_all_tools() -> list[dict[str, Any]]:
+def _list_all_tools(
+    tenant_id: str | None = None,
+) -> list[dict[str, Any]]:
     """Combine federated tools + A2A agents into a single tools/list response."""
-    return _list_federated_tools_as_mcp() + _list_a2a_agents_as_mcp()
+    return _list_federated_tools_as_mcp(tenant_id=tenant_id) + _list_a2a_agents_as_mcp(tenant_id=tenant_id)
 
 
 async def handle_mcp_rpc(request: web.Request) -> web.Response:
@@ -132,6 +153,8 @@ async def handle_mcp_rpc(request: web.Request) -> web.Response:
     method = body.get("method", "")
     req_id = body.get("id")
     params = body.get("params", {})
+    # Tenant context from header (admin/anonymous when absent).
+    tenant_id = request.headers.get("X-Tenant-Id", "anonymous")
 
     if method == "initialize":
         return web.json_response(
@@ -153,7 +176,7 @@ async def handle_mcp_rpc(request: web.Request) -> web.Response:
         )
 
     if method == "tools/list":
-        tools = _list_all_tools()
+        tools = _list_all_tools(tenant_id=tenant_id)
         return web.json_response(
             {"jsonrpc": "2.0", "result": {"tools": tools}, "id": req_id}
         )
@@ -161,7 +184,6 @@ async def handle_mcp_rpc(request: web.Request) -> web.Response:
     if method == "tools/call":
         tool_name = params.get("name", "")
         arguments = params.get("arguments", {})
-        tenant_id = request.headers.get("X-Tenant-Id", "anonymous")
 
         # Check tool cache first
         from . import tool_cache
@@ -182,7 +204,7 @@ async def handle_mcp_rpc(request: web.Request) -> web.Response:
                 )
 
         # Federated tool (no execution yet — just return definition)
-        fed_tool = memory.get_federated_tool(tool_name)
+        fed_tool = memory.get_federated_tool(tool_name, tenant_id=tenant_id)
         if fed_tool is not None:
             try:
                 tool_def = json.loads(fed_tool.get("tool_json") or "{}")
@@ -211,7 +233,7 @@ async def handle_mcp_rpc(request: web.Request) -> web.Response:
         # A2A agent invocation
         if tool_name.startswith("a2a_"):
             agent_name = tool_name[4:]
-            agent = a2a_registry.get_agent_by_name(agent_name)
+            agent = a2a_registry.get_agent_by_name(agent_name, tenant_id=tenant_id)
             if agent is None:
                 return _mcp_error(req_id, -32602, f"agent not found: {agent_name}")
             if not agent.enabled:
@@ -249,14 +271,14 @@ async def handle_mcp_rpc(request: web.Request) -> web.Response:
         return _mcp_error(req_id, -32602, f"tool not found: {tool_name}")
 
     if method == "prompts/list":
-        prompts = _list_prompts_as_mcp()
+        prompts = _list_prompts_as_mcp(tenant_id=tenant_id)
         return web.json_response(
             {"jsonrpc": "2.0", "result": {"prompts": prompts}, "id": req_id}
         )
 
     if method == "prompts/get":
         prompt_name = params.get("name", "")
-        row = memory.get_prompt_template_by_name(prompt_name)
+        row = memory.get_prompt_template_by_name(prompt_name, tenant_id=tenant_id)
         if row is None:
             return _mcp_error(req_id, -32602, f"prompt not found: {prompt_name}")
         from . import prompt_registry

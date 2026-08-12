@@ -211,7 +211,12 @@ async def init_app(conf_path: str = "./gateway-config.json") -> web.Application:
             bypass_keys=cache_config.get("bypass_keys") or [],
         )
     else:
+        # Explicitly clear the module-level singleton so that a prior
+        # init_cache() call (e.g. from a different config or a test) does
+        # not leave a stale cache lying around when the current config
+        # disables it.
         TOOL_CACHE = None
+        tool_cache_mod._default_cache = None  # type: ignore[attr-defined]
 
     # Webhook dispatcher
     webhook_config = conf.config.get("webhooks", {}) or {}
@@ -1336,9 +1341,15 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                             memory.list_prompt_templates,
                             True,  # enabled_only
                             category,
+                            tenant_id,  # tenant filter (includes __all__)
                         )
                         if templates:
+                            # Prefer a tenant-specific template over global.
                             tmpl = templates[0]
+                            for candidate in templates:
+                                if candidate.get("tenant_id") == tenant_id:
+                                    tmpl = candidate
+                                    break
                             variables = {
                                 "vertical": r.vertical,
                                 "complexity": str(r.complexity),
@@ -3263,7 +3274,9 @@ async def admin_disable_plugin(request: web.Request):
 
 
 async def admin_list_a2a_agents(request: web.Request):
-    return web.json_response({"agents": [_jsonify(a) for a in memory.list_a2a_agents()]})
+    # Admin sees all; tenant_id query param optionally filters.
+    tenant_id = request.query.get("tenant_id")
+    return web.json_response({"agents": [_jsonify(a) for a in memory.list_a2a_agents(tenant_id=tenant_id)]})
 
 
 async def admin_create_a2a_agent(request: web.Request):
@@ -3285,6 +3298,7 @@ async def admin_create_a2a_agent(request: web.Request):
         config=body.get("config"),
         tags=body.get("tags"),
         enabled=bool(body.get("enabled", True)),
+        tenant_id=body.get("tenant_id", "__all__"),
     )
     if "error" in row:
         return web.json_response(row, status=400)
@@ -3320,6 +3334,7 @@ async def admin_update_a2a_agent(request: web.Request):
         config=body.get("config"),
         tags=body.get("tags"),
         enabled=bool(body.get("enabled", existing.get("enabled", True))),
+        tenant_id=body.get("tenant_id", existing.get("tenant_id", "__all__")),
     )
     return web.json_response(_jsonify(row))
 
@@ -3426,7 +3441,8 @@ async def admin_contextforge_sync_log(request: web.Request):
 
 
 async def admin_contextforge_tools(request: web.Request):
-    return web.json_response({"tools": [_jsonify(t) for t in memory.list_federated_tools()]})
+    tenant_id = request.query.get("tenant_id")
+    return web.json_response({"tools": [_jsonify(t) for t in memory.list_federated_tools(tenant_id=tenant_id)]})
 
 
 # ============================================================
@@ -3469,8 +3485,9 @@ async def admin_mcp_discover(request: web.Request):
 async def admin_list_prompts(request: web.Request):
     enabled_only = request.query.get("enabled_only", "").lower() in ("1", "true", "yes")
     category = request.query.get("category")
+    tenant_id = request.query.get("tenant_id")
     return web.json_response(
-        {"templates": [_jsonify(t) for t in memory.list_prompt_templates(enabled_only=enabled_only, category=category)]}
+        {"templates": [_jsonify(t) for t in memory.list_prompt_templates(enabled_only=enabled_only, category=category, tenant_id=tenant_id)]}
     )
 
 
@@ -3487,6 +3504,7 @@ async def admin_create_prompt(request: web.Request):
         category=body.get("category", "general"),
         enabled=bool(body.get("enabled", True)),
         source=body.get("source", "admin"),
+        tenant_id=body.get("tenant_id", "__all__"),
     )
     if "error" in row:
         return web.json_response(row, status=400)
@@ -3517,6 +3535,7 @@ async def admin_update_prompt(request: web.Request):
         variables=body.get("variables"),
         category=body.get("category", existing.get("category", "general")),
         enabled=bool(body.get("enabled", existing.get("enabled", True))),
+        tenant_id=body.get("tenant_id", existing.get("tenant_id", "__all__")),
     )
     return web.json_response(_jsonify(row))
 
@@ -3534,7 +3553,8 @@ async def admin_delete_prompt(request: web.Request):
 
 
 async def admin_list_webhooks(request: web.Request):
-    return web.json_response({"webhooks": [_jsonify(w) for w in memory.list_webhooks()]})
+    tenant_id = request.query.get("tenant_id")
+    return web.json_response({"webhooks": [_jsonify(w) for w in memory.list_webhooks(tenant_id=tenant_id)]})
 
 
 async def admin_create_webhook(request: web.Request):
@@ -3544,6 +3564,14 @@ async def admin_create_webhook(request: web.Request):
         return web.json_response({"error": "invalid JSON body"}, status=400)
     if not body.get("name") or not body.get("url"):
         return web.json_response({"error": "name and url required"}, status=400)
+    # max_retries: null = use global default; positive int = override.
+    raw_retries = body.get("max_retries")
+    max_retries: int | None = None
+    if raw_retries is not None:
+        try:
+            max_retries = int(raw_retries)
+        except (TypeError, ValueError):
+            max_retries = None
     row = memory.upsert_webhook(
         name=body["name"],
         url=body["url"],
@@ -3551,6 +3579,8 @@ async def admin_create_webhook(request: web.Request):
         secret=body.get("secret", ""),
         enabled=bool(body.get("enabled", True)),
         description=body.get("description", ""),
+        max_retries=max_retries,
+        tenant_id=body.get("tenant_id", "__all__"),
     )
     if "error" in row:
         return web.json_response(row, status=400)

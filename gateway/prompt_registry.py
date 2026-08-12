@@ -127,8 +127,8 @@ def _row_to_template(row: dict) -> PromptTemplate:
     )
 
 
-def get_template(name: str) -> PromptTemplate | None:
-    row = memory.get_prompt_template_by_name(name)
+def get_template(name: str, tenant_id: str | None = None) -> PromptTemplate | None:
+    row = memory.get_prompt_template_by_name(name, tenant_id=tenant_id)
     return _row_to_template(row) if row else None
 
 
@@ -138,9 +138,13 @@ def get_template_by_id(template_id: int) -> PromptTemplate | None:
 
 
 def list_templates(
-    enabled_only: bool = False, category: str | None = None
+    enabled_only: bool = False,
+    category: str | None = None,
+    tenant_id: str | None = None,
 ) -> list[PromptTemplate]:
-    rows = memory.list_prompt_templates(enabled_only=enabled_only, category=category)
+    rows = memory.list_prompt_templates(
+        enabled_only=enabled_only, category=category, tenant_id=tenant_id
+    )
     return [_row_to_template(r) for r in rows]
 
 
@@ -153,6 +157,7 @@ def upsert_template(
     enabled: bool = True,
     is_builtin: bool = False,
     source: str = "manual",
+    tenant_id: str = "__all__",
 ) -> PromptTemplate | None:
     row = memory.upsert_prompt_template(
         name=name,
@@ -163,11 +168,12 @@ def upsert_template(
         enabled=enabled,
         is_builtin=is_builtin,
         source=source,
+        tenant_id=tenant_id,
     )
     if "error" in row:
         log.warning("upsert_template failed: %s", row["error"])
         return None
-    return get_template(name)
+    return get_template(name, tenant_id=tenant_id)
 
 
 def delete_template(template_id: int) -> bool:
@@ -236,6 +242,7 @@ def inject_into_messages(
     variables: dict[str, Any] | None = None,
     position: str = "system",
     replace_existing_system: bool = True,
+    tenant_id: str | None = None,
 ) -> list[dict]:
     """Inject a rendered template into the messages array.
 
@@ -244,9 +251,12 @@ def inject_into_messages(
               "user" appends as a user message.
               "assistant" appends as an assistant message.
 
+    tenant_id: when provided, prefers a tenant-specific template of the same
+              name and falls back to the global ("__all__") template.
+
     Returns a NEW list; the input is not mutated.
     """
-    template = get_template(template_name)
+    template = get_template(template_name, tenant_id=tenant_id)
     if not template or not template.enabled:
         return list(messages)
     rendered = render_template(template, variables)

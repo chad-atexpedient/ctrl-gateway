@@ -89,8 +89,10 @@ def agent_from_row(row: dict) -> A2AAgentRecord:
     )
 
 
-def list_agents(enabled_only: bool = False) -> list[A2AAgentRecord]:
-    rows = memory.list_a2a_agents(enabled_only=enabled_only)
+def list_agents(
+    enabled_only: bool = False, tenant_id: str | None = None
+) -> list[A2AAgentRecord]:
+    rows = memory.list_a2a_agents(enabled_only=enabled_only, tenant_id=tenant_id)
     return [agent_from_row(r) for r in rows]
 
 
@@ -99,8 +101,10 @@ def get_agent(agent_id: int) -> A2AAgentRecord | None:
     return agent_from_row(row) if row else None
 
 
-def get_agent_by_name(name: str) -> A2AAgentRecord | None:
-    row = memory.get_a2a_agent_by_name(name)
+def get_agent_by_name(
+    name: str, tenant_id: str | None = None
+) -> A2AAgentRecord | None:
+    row = memory.get_a2a_agent_by_name(name, tenant_id=tenant_id)
     return agent_from_row(row) if row else None
 
 
@@ -116,6 +120,7 @@ def register_agent(
     config: dict | None = None,
     tags: list[str] | None = None,
     enabled: bool = True,
+    tenant_id: str = "__all__",
 ) -> A2AAgentRecord | None:
     row = memory.upsert_a2a_agent(
         name=name,
@@ -129,11 +134,12 @@ def register_agent(
         config=config,
         tags=tags,
         enabled=enabled,
+        tenant_id=tenant_id,
     )
     if "error" in row:
         log.warning("register_agent failed: %s", row["error"])
         return None
-    return get_agent_by_name(name)
+    return get_agent_by_name(name, tenant_id=tenant_id)
 
 
 def delete_agent(agent_id: int) -> bool:
@@ -200,12 +206,40 @@ async def invoke_agent(
     timeout_seconds: float = 30.0,
     tenant_id: str = "anonymous",
     interaction_type: str = "invoke",
+    use_cache: bool = True,
 ) -> A2AResult:
     """Invoke an A2A agent. Returns a typed result.
 
     Errors are caught and recorded into a2a_metrics; the result is never
     raised except for programming errors.
+
+    Tool cache: when `use_cache` is True and the global ToolCache singleton
+    is initialized, successful results are cached keyed by
+    (a2a_<agent.name>, parameters, tenant_id). Cached hits return as a
+    successful A2AResult with response=the cached payload and the
+    `cached=True` flag set on the result's `error` field (the only field
+    we can stamp without changing the dataclass contract — callers that
+    care can check `result.error == "__cached__"`). The MCP facade wraps
+    invoke_agent and surfaces the cached flag itself; direct callers do
+    not see this distinction in the typed result.
     """
+    # Tool cache lookup (only for non-streaming invoke interactions).
+    if use_cache and interaction_type == "invoke":
+        from . import tool_cache as _tc_mod
+        cache = _tc_mod.cache()
+        if cache is not None:
+            cached = cache.get(f"a2a_{agent.name}", parameters, tenant_id=tenant_id)
+            if cached is not None:
+                # Reconstruct an A2AResult from the cached payload. The
+                # cache stores a dict shape mirroring what the MCP facade
+                # surfaces (success/response/latency_ms/error).
+                return A2AResult(
+                    success=bool(cached.get("success", True)),
+                    response=cached.get("response"),
+                    latency_ms=float(cached.get("latency_ms", 0.0)),
+                    error="__cached__" if cached.get("error") is None else cached.get("error"),
+                    status_code=200,
+                )
     url, payload = build_request_payload(agent, parameters)
     headers = build_auth_headers(agent)
     headers.setdefault("Content-Type", "application/json")
@@ -249,6 +283,24 @@ async def invoke_agent(
                 interaction_type=interaction_type,
                 error=err,
             )
+            # Cache successful results for future calls. We store the full
+            # payload shape (success/response/latency/error) so the cache
+            # hit path can rebuild an A2AResult without a second hit.
+            if use_cache and interaction_type == "invoke" and success:
+                from . import tool_cache as _tc_mod
+                cache = _tc_mod.cache()
+                if cache is not None:
+                    cache.set(
+                        f"a2a_{agent.name}",
+                        parameters,
+                        {
+                            "success": True,
+                            "response": response_payload,
+                            "latency_ms": latency_ms,
+                            "error": None,
+                        },
+                        tenant_id=tenant_id,
+                    )
             return A2AResult(
                 success=success,
                 response=response_payload,

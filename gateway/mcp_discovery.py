@@ -18,6 +18,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -226,10 +227,53 @@ async def watch_loop(
     ports: list[int] | None = None,
     auto_register: bool = True,
 ) -> None:
-    """Background task: periodic re-discovery."""
+    """Background task: periodic re-discovery with jitter and per-host
+    last-seen caching.
+
+    Jitter: each loop iteration sleeps `interval_seconds` plus a random
+    jitter of up to 10% of the interval, desynchronizing multiple
+    gateways running watch_loop in parallel (avoids probe storms on
+    shared infrastructure).
+
+    Per-host last-seen cache: a host that has produced at least one
+    successful discovery in the last `interval_seconds * 2` window is
+    skipped on the next tick — repeated probing of healthy known hosts
+    adds load without information gain. Hosts that previously produced
+    no discoveries are always re-probed.
+    """
+    import random
+    # Map of host -> last successful discovery timestamp (monotonic).
+    last_seen: dict[str, float] = {}
+    cooldown = max(interval_seconds * 2, 120)
     while True:
         try:
-            await discover(hosts=hosts, ports=ports, auto_register=auto_register)
+            # Skip hosts seen recently.
+            now = time.monotonic()
+            live_hosts = hosts
+            if hosts:
+                live_hosts = [
+                    h for h in hosts
+                    if h not in last_seen or (now - last_seen[h]) > cooldown
+                ]
+            if live_hosts:
+                results = await discover(
+                    hosts=live_hosts, ports=ports, auto_register=auto_register
+                )
+                # Record host last-seen for any host that produced a result.
+                successful_hosts = {r.source_url for r in results}
+                for r in results:
+                    # Extract host from source_url for the cache key.
+                    try:
+                        parsed = urlparse(r.source_url)
+                        if parsed.hostname:
+                            last_seen[parsed.hostname] = time.monotonic()
+                    except Exception:
+                        pass
+                # Also mark hosts that had no results as eligible for
+                # immediate re-probe by removing stale entries.
+                _ = successful_hosts  # kept for clarity / future use
         except Exception as e:
             log.warning("mcp_discovery watch_loop error: %s", e)
-        await asyncio.sleep(interval_seconds)
+        # Jitter: 0..10% of the interval.
+        jitter = random.uniform(0, max(interval_seconds * 0.1, 1.0))
+        await asyncio.sleep(interval_seconds + jitter)
