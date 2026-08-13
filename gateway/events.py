@@ -32,7 +32,7 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 
-log = logging.getLogger("glint.events")
+log = logging.getLogger("ctrl.events")
 
 
 class EventSource(str, Enum):

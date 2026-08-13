@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 
 from . import memory
 
-log = logging.getLogger("glint.tenant")
+log = logging.getLogger("ctrl.tenant")
 
 
 class BudgetExceeded(Exception):

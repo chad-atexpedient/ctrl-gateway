@@ -58,7 +58,7 @@ from . import config as cfg
 from . import events
 from . import memory as storage
 
-log = logging.getLogger("glint.memory.observational")
+log = logging.getLogger("ctrl.memory.observational")
 
 
 # ============================================================

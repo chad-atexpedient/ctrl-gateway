@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 from urllib.parse import urlparse
 
-log = logging.getLogger("glint.firewall")
+log = logging.getLogger("ctrl.firewall")
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +429,7 @@ class HostFirewallManager:
     raise from `sync()` — the enforcer still works at the gateway level.
     """
 
-    RULE_PREFIX = "Glint-Block"
+    RULE_PREFIX = "CTRL-Gateway-Block"
 
     def __init__(self, enabled: bool = False, platform: str = "auto",
                  persist_on_shutdown: bool = False):
@@ -533,7 +533,7 @@ class HostFirewallManager:
         if rc != 0:
             return []
         out: list[HostFirewallRule] = []
-        # Parse: "Rule Name: Glint-Block_xxx" and "Remote IP: 1.2.3.4"
+        # Parse: "Rule Name: CTRL-Gateway-Block_xxx" and "Remote IP: 1.2.3.4"
         name = None
         ip = None
         for line in stdout.splitlines():
@@ -589,7 +589,7 @@ class HostFirewallManager:
             # Look for our comment marker
             if self.RULE_PREFIX not in line:
                 continue
-            # Parse: "1  DROP  all  --  *  *  0.0.0.0/0  1.2.3.4  /* Glint-Block_xxx_xxx */"
+            # Parse: "1  DROP  all  --  *  *  0.0.0.0/0  1.2.3.4  /* CTRL-Gateway-Block_xxx_xxx */"
             parts = line.split()
             if len(parts) < 8:
                 continue

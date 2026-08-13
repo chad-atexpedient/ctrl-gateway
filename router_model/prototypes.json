@@ -1,5 +1,5 @@
 {
-  "_doc": "Structural prototypes for Glint-V2. STRUCTURAL ONLY — never include topic verticals (medical, health, finance, etc.) as prototypes. The Glint lesson: prototypes encode difficulty profile, not topic, so topic prototypes create false positives. Centroids are filled in by router_model/train.py from training data; this file seeds the schema and initial example names.",
+  "_doc": "Structural prototypes for CTRL Gateway. STRUCTURAL ONLY — never include topic verticals (medical, health, finance, etc.) as prototypes. The Glint lesson: prototypes encode difficulty profile, not topic, so topic prototypes create false positives. Centroids are filled in by router_model/train.py from training data; this file seeds the schema and initial example names.",
   "_doc_thresholds": "Per-prototype similarity threshold (in gateway-policy.json: prototype_thresholds). Higher = stricter matching.",
   "_doc_kind_enforcement": "trainer_worker.py refuses to add a prototype with kind='topic'. Only kind='structural' allowed.",
 

@@ -1,1 +1,1 @@
-"""Glint-V2 test suite."""
+"""CTRL Gateway test suite."""

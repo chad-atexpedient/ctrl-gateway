@@ -21,7 +21,7 @@ import aiohttp
 from . import circuit, transcoder
 from . import config as cfg
 
-log = logging.getLogger("glint.endpoints")
+log = logging.getLogger("ctrl.endpoints")
 
 
 class EndpointHTTPError(RuntimeError):

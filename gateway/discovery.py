@@ -17,7 +17,7 @@ import aiohttp
 
 from . import transcoder
 
-log = logging.getLogger("glint.discovery")
+log = logging.getLogger("ctrl.discovery")
 
 PROBE_TIMEOUT = 3  # seconds per target
 TEST_TIMEOUT = 20  # seconds for connection test

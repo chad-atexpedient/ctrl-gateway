@@ -29,9 +29,9 @@ class Metrics:
 
     def render(self) -> str:
         lines = [
-            "# HELP glint_uptime_seconds Process uptime.",
-            "# TYPE glint_uptime_seconds gauge",
-            f"glint_uptime_seconds {time.time() - self._start:.3f}",
+            "# HELP ctrl_gateway_uptime_seconds Process uptime.",
+            "# TYPE ctrl_gateway_uptime_seconds gauge",
+            f"ctrl_gateway_uptime_seconds {time.time() - self._start:.3f}",
         ]
         with self._lock:
             for (name, labels), value in sorted(self._counters.items()):

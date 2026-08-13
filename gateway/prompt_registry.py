@@ -26,7 +26,7 @@ from typing import Any
 
 from . import memory
 
-log = logging.getLogger("glint.prompts")
+log = logging.getLogger("ctrl.prompts")
 
 
 @dataclass

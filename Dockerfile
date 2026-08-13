@@ -15,8 +15,8 @@ COPY router_model/ ./router_model/
 COPY gateway-config.json gateway-policy.json ./
 COPY tests/ ./tests/
 
-RUN useradd --create-home --uid 10001 glint && chown -R glint:glint /app
-USER glint
+RUN useradd --create-home --uid 10001 ctrlgateway && chown -R ctrlgateway:ctrlgateway /app
+USER ctrlgateway
 
 EXPOSE 8076
 

@@ -1,3 +1,3 @@
-"""Glint-V2 gateway package."""
+"""CTRL Gateway package."""
 
 __version__ = "2.0.0"

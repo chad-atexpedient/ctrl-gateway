@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from . import config as cfg
 from . import endpoints, transcoder
 
-log = logging.getLogger("glint.swarm")
+log = logging.getLogger("ctrl.swarm")
 
 
 @dataclass

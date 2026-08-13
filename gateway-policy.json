@@ -1,5 +1,5 @@
 {
-  "_doc": "Glint-V2 routing policy. First-match-wins for overrides. Hot-reload via POST /reload. See README for context.",
+  "_doc": "CTRL Gateway routing policy. First-match-wins for overrides. Hot-reload via POST /reload. See README for context.",
 
   "_doc_overrides": "Each override is a condition -> action. First match wins. Conditions evaluated top-to-bottom. Specific conditions above catch-alls. override_only tiers are only reachable via these (never via cost arithmetic).",
   "overrides": [
@@ -50,7 +50,7 @@
       "condition": "router_complexity >= 4 AND (router_flag_code OR router_flag_math)",
       "action": "route_to_tier",
       "tier": "tier4",
-      "source_tag": "glint_override"
+      "source_tag": "ctrl_override"
     },
     {
       "name": "high_complexity_with_code",
@@ -58,7 +58,7 @@
       "condition": "router_complexity >= 3 AND (router_flag_code OR router_flag_math)",
       "action": "route_to_tier",
       "tier": "tier2",
-      "source_tag": "glint_override"
+      "source_tag": "ctrl_override"
     },
     {
       "name": "high_complexity_with_reasoning",
@@ -66,7 +66,7 @@
       "condition": "router_complexity >= 3 AND router_flag_reasoning",
       "action": "route_to_tier",
       "tier": "tier3",
-      "source_tag": "glint_override"
+      "source_tag": "ctrl_override"
     },
     {
       "name": "low_complexity_default",
@@ -74,7 +74,7 @@
       "condition": "router_complexity <= 2 AND NOT router_flag_code AND NOT router_flag_math AND NOT router_flag_reasoning",
       "action": "route_to_tier",
       "tier": "tier0",
-      "source_tag": "glint_override"
+      "source_tag": "ctrl_override"
     }
   ],
 

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Glint-V2 Gateway</title>
+<title>CTRL Gateway</title>
 <style>
 :root{--bg:#080b10;--panel:#0f141c;--card:#141a24;--border:#1c2430;--text:#c5d0de;--dim:#5a6678;--bright:#e8f0fc;--accent:#00d4aa;--accent2:#0ea5e9;--warn:#ff9f43;--err:#ff5252;--t0:#4fc3f7;--t1:#66bb6a;--t2:#ab47bc;--t3:#ff9f43;--t4:#ff5252;--tm:#ec407a}
 *{margin:0;padding:0;box-sizing:border-box}
@@ -64,7 +64,7 @@ nav .right{margin-left:auto;display:flex;align-items:center;gap:8px;padding:8px 
 
 <nav>
   <div class="inner">
-    <div class="brand">Glint<span>-V2</span></div>
+    <div class="brand">CTRL<span> Gateway</span></div>
     <div class="tab active" data-tab="live" onclick="showTab('live')">Live</div>
     <div class="tab" data-tab="providers" onclick="showTab('providers')">Providers</div>
     <div class="tab" data-tab="keys" onclick="showTab('keys')">Keys</div>
@@ -87,7 +87,7 @@ nav .right{margin-left:auto;display:flex;align-items:center;gap:8px;padding:8px 
 <!-- ===== LIVE TAB ===== -->
 <div class="tab-content active" id="tab-live">
   <div class="hero-mini">
-    <h1>Glint<span>-V2</span> Gateway</h1>
+    <h1>CTRL<span> Gateway</span></h1>
     <div class="nums" id="hero-nums">
       <div class="num"><div class="v" id="num-decisions">—</div><div class="l">Decisions</div></div>
       <div class="num"><div class="v" id="num-accuracy">—</div><div class="l">Accuracy</div></div>
@@ -537,7 +537,7 @@ function safeArg(value) { return encodeURIComponent(value).replace(/'/g, '%27');
 async function fetchJSON(path, opts={}) {
   try {
     const headers = opts.headers || {};
-    const token = sessionStorage.getItem('glint_api_key');
+    const token = sessionStorage.getItem('ctrl_api_key');
     if (token) headers['Authorization'] = 'Bearer ' + token;
     if (opts.body) headers['Content-Type'] = 'application/json';
     const r = await fetch(path, {...opts, headers});
@@ -554,7 +554,7 @@ function flash(elId, msg, isError=false) {
 }
 async function api(path, method='POST', body=null) {
   const headers = {};
-  const token = sessionStorage.getItem('glint_api_key');
+  const token = sessionStorage.getItem('ctrl_api_key');
   if (token) headers['Authorization'] = 'Bearer ' + token;
   if (body) headers['Content-Type'] = 'application/json';
   const r = await fetch(path, {method, headers, body: body?JSON.stringify(body):undefined});
@@ -569,12 +569,12 @@ function copyToClipboard(id) {
   const el = document.getElementById(id); el.select(); document.execCommand('copy'); toast('Copied!');
 }
 function promptForKey() {
-  const token = prompt('Enter Glint admin API key:'); if (token) { sessionStorage.setItem('glint_api_key', token); updateKeyStatus(); refreshAll(); connectEvents(); }
+  const token = prompt('Enter CTRL Gateway admin API key:'); if (token) { sessionStorage.setItem('ctrl_api_key', token); updateKeyStatus(); refreshAll(); connectEvents(); }
 }
-function clearKey() { sessionStorage.removeItem('glint_api_key'); updateKeyStatus(); refreshAll(); connectEvents(); }
+function clearKey() { sessionStorage.removeItem('ctrl_api_key'); updateKeyStatus(); refreshAll(); connectEvents(); }
 function updateKeyStatus() {
   const el = document.getElementById('key-status');
-  if (el) el.textContent = sessionStorage.getItem('glint_api_key') ? 'key set' : '';
+  if (el) el.textContent = sessionStorage.getItem('ctrl_api_key') ? 'key set' : '';
 }
 function showTab(name) {
   document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
@@ -1279,7 +1279,7 @@ async function connectEvents() {
   if (eventSource) eventSource.abort();
   const controller = new AbortController(); eventSource = controller;
   const headers = {};
-  const token = sessionStorage.getItem('glint_api_key');
+  const token = sessionStorage.getItem('ctrl_api_key');
   if (token) headers.Authorization = 'Bearer ' + token;
   try {
     const response = await fetch('/events', {headers, signal:controller.signal});

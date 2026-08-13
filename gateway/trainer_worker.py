@@ -42,7 +42,7 @@ from . import config as cfg
 from . import memory
 from . import router as router_mod
 
-log = logging.getLogger("glint.trainer")
+log = logging.getLogger("ctrl.trainer")
 
 
 CHECKPOINTS_DIR = Path("./router_model/checkpoints")

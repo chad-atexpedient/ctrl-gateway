@@ -30,7 +30,7 @@ from . import endpoints, events, transcoder
 from . import memory as storage
 from . import memory_observational as om
 
-log = logging.getLogger("glint.observer")
+log = logging.getLogger("ctrl.observer")
 
 
 OBSERVER_SYSTEM_PROMPT = (

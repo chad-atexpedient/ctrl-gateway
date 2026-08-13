@@ -1,5 +1,5 @@
 {
-  "_doc": "Provider presets for Glint-V2 guided setup. Each preset defines how to connect to a provider. Most providers are OpenAI-compatible (kind=openai) and only need base_url + api_key. Anthropic and Google have native adapters. The dashboard's Setup wizard reads these presets so users can add a provider with one click + an API key.",
+  "_doc": "Provider presets for CTRL Gateway guided setup. Each preset defines how to connect to a provider. Most providers are OpenAI-compatible (kind=openai) and only need base_url + api_key. Anthropic and Google have native adapters. The dashboard's Setup wizard reads these presets so users can add a provider with one click + an API key.",
   "version": 1,
   "presets": {
     "openai": {

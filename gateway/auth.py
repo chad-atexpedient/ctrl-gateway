@@ -34,7 +34,7 @@ from aiohttp import web
 
 from . import config as cfg
 
-log = logging.getLogger("glint.auth")
+log = logging.getLogger("ctrl.auth")
 
 
 DEFAULT_ADMIN_PATHS = (

@@ -25,7 +25,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
-log = logging.getLogger("glint.tool_cache")
+log = logging.getLogger("ctrl.tool_cache")
 
 
 @dataclass

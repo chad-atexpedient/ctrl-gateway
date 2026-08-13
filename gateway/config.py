@@ -1,4 +1,4 @@
-"""Glint-V2 gateway configuration loader with hot reload.
+"""CTRL Gateway configuration loader with hot reload.
 
 Reads gateway-config.json + gateway-policy.json + router_model/taxonomy.yaml.
 Hot-reloadable via /reload endpoint. Thread-safe atomic swap.
@@ -16,7 +16,7 @@ from typing import Any
 
 import yaml
 
-log = logging.getLogger("glint.config")
+log = logging.getLogger("ctrl.config")
 
 
 class ConfigError(Exception):
@@ -180,20 +180,20 @@ class ConfigManager:
             except Exception:
                 pass
 
-            # Env overrides (docker-compose / k8s): GLINT_DB_URL, GLINT_MODE
-            if os.environ.get("GLINT_DB_URL"):
-                config["db_url"] = os.environ["GLINT_DB_URL"]
-            if os.environ.get("GLINT_MODE"):
-                config["mode"] = os.environ["GLINT_MODE"]
-            if os.environ.get("GLINT_AUTH_ENABLED"):
-                config.setdefault("auth", {})["enabled"] = os.environ["GLINT_AUTH_ENABLED"].lower() in (
+            # Env overrides (docker-compose / k8s): CTRL_DB_URL, CTRL_MODE
+            if os.environ.get("CTRL_DB_URL"):
+                config["db_url"] = os.environ["CTRL_DB_URL"]
+            if os.environ.get("CTRL_MODE"):
+                config["mode"] = os.environ["CTRL_MODE"]
+            if os.environ.get("CTRL_AUTH_ENABLED"):
+                config.setdefault("auth", {})["enabled"] = os.environ["CTRL_AUTH_ENABLED"].lower() in (
                     "1", "true", "yes", "on",
                 )
-            if os.environ.get("GLINT_ADMIN_API_KEY"):
-                raw_key = os.environ["GLINT_ADMIN_API_KEY"]
+            if os.environ.get("CTRL_ADMIN_API_KEY"):
+                raw_key = os.environ["CTRL_ADMIN_API_KEY"]
                 digest = "sha256:" + hashlib.sha256(raw_key.encode()).hexdigest()
                 config.setdefault("auth", {}).setdefault("keys", {})[digest] = {
-                    "tenant_id": os.environ.get("GLINT_ADMIN_TENANT", "admin"),
+                    "tenant_id": os.environ.get("CTRL_ADMIN_TENANT", "admin"),
                     "scope": ["admin", "user"],
                     "prefix": raw_key[:12],
                 }

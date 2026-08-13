@@ -1,4 +1,4 @@
-"""Glint-V2 router inference engine.
+"""CTRL Gateway router inference engine.
 
 Hybrid architecture:
   - Frozen ONNX sentence embedding (bge-small-en-v1.5 default, 384-d)
@@ -29,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 
-log = logging.getLogger("glint.router")
+log = logging.getLogger("ctrl.router")
 
 EMBED_DIM_DEFAULT = 384
 PROJECTION_DIM = 64

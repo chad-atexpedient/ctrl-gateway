@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 
 from . import memory
 
-log = logging.getLogger("glint.circuit")
+log = logging.getLogger("ctrl.circuit")
 
 
 @dataclass

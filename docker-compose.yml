@@ -1,8 +1,8 @@
-# Glint-V2 multi-instance mode
+# CTRL Gateway multi-instance mode
 #
 # In single mode (default), the gateway uses SQLite. Set:
 #   gateway-config.json -> mode: "multi"
-#   gateway-config.json -> db_url: "postgresql+psycopg://glint:glint@postgres:5432/glint"
+#   gateway-config.json -> db_url: "postgresql+psycopg://ctrlgateway:ctrlgateway@postgres:5432/ctrlgateway"
 # to enable multi-instance horizontal scaling.
 #
 # Run multiple gateway instances behind a load balancer:
@@ -14,15 +14,15 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: glint
-      POSTGRES_USER: glint
+      POSTGRES_DB: ctrlgateway
+      POSTGRES_USER: ctrlgateway
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
     volumes:
-      - glint-pgdata:/var/lib/postgresql/data
+      - ctrl-gateway-pgdata:/var/lib/postgresql/data
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U glint"]
+      test: ["CMD-SHELL", "pg_isready -U ctrlgateway"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -33,10 +33,10 @@ services:
     environment:
       TEACHER_API_KEY: ${TEACHER_API_KEY:-}
       TEACHER_BASE_URL: ${TEACHER_BASE_URL:-}
-      GLINT_DB_URL: ${GLINT_DB_URL:?set GLINT_DB_URL}
-      GLINT_MODE: multi
-      GLINT_AUTH_ENABLED: "true"
-      GLINT_ADMIN_API_KEY: ${GLINT_ADMIN_API_KEY:?set GLINT_ADMIN_API_KEY}
+      CTRL_DB_URL: ${CTRL_DB_URL:?set CTRL_DB_URL}
+      CTRL_MODE: multi
+      CTRL_AUTH_ENABLED: "true"
+      CTRL_ADMIN_API_KEY: ${CTRL_ADMIN_API_KEY:?set CTRL_ADMIN_API_KEY}
     depends_on:
       postgres:
         condition: service_healthy
@@ -61,4 +61,4 @@ services:
       - gateway
 
 volumes:
-  glint-pgdata:
+  ctrl-gateway-pgdata:
