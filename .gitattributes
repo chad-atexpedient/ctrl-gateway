@@ -1,0 +1,39 @@
+# Auto-detect text files and normalize line endings to LF in the repository,
+# regardless of what line endings a contributor's editor/OS produces on checkout.
+* text=auto eol=lf
+
+# Explicit text types (kept LF regardless of platform).
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+*.txt text eol=lf
+*.html text eol=lf
+*.conf text eol=lf
+*.gitignore text eol=lf
+*.gitattributes text eol=lf
+Dockerfile text eol=lf
+LICENSE text eol=lf
+
+# Binary artifacts — never diff or line-ending-normalize these, even if a
+# future contributor adds real model weights/exports under router_model/data.
+*.db binary
+*.sqlite binary
+*.sqlite3 binary
+*.onnx binary
+*.pt binary
+*.pth binary
+*.safetensors binary
+*.npz binary
+*.npy binary
+*.pkl binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary

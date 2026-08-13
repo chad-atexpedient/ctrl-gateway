@@ -1,8 +1,9 @@
 [project]
-name = "glint-v2"
+name = "ctrl-gateway"
 version = "2.0.0"
 description = "Semantic gateway / transcoder / router for LLM inference fleets"
 requires-python = ">=3.11"
+license = "Apache-2.0"
 
 [tool.ruff]
 line-length = 120
