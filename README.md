@@ -1,11 +1,11 @@
-# Glint-V2
+# CTRL Gateway
 
 A **semantic LLM gateway** that routes requests to the cheapest-sufficient model,
 auto-discovers new models from all providers, learns from feedback, and manages
 a multi-tenant inference fleet — with a plugin system, A2A agent orchestration,
 MCP facade, and a real-time comparison dashboard.
 
-Glint-V2 sits between your application and your LLM providers (OpenAI, Anthropic,
+CTRL Gateway sits between your application and your LLM providers (OpenAI, Anthropic,
 Google, Ollama, OpenRouter, Groq, Together, DeepSeek, and 15+ others). It
 classifies every request by vertical + complexity, routes it to the cheapest
 model that can handle it, falls back on failure, and learns from the outcomes
@@ -53,7 +53,7 @@ via the dashboard's **Providers** tab or the `/admin/endpoints` API.
 
 ```
                           ┌──────────────────────────────────────────────┐
-                          │              Glint-V2 Gateway                 │
+                          │                 CTRL Gateway                 │
                           │                                              │
   Client ──POST /v1/chat▶│  Auth → Injection Check → Router → Policy    │
   Client ──POST /mcp────▶│  MCP Facade (tools/list, tools/call)         │
@@ -200,7 +200,7 @@ estimation and cascade-chain routing:
   ordered by ascending cost, walking candidates until
   `cascade_success_probability(chain) >= target_success_probability`. Raises
   `BudgetError("quality_target_unmet")` → HTTP 429 when no chain meets target.
-- **Quality estimation** (`quality.estimate_success_probability`): Wilson lower
+- **Quality estimation** (`policy.estimate_success_probability`): Wilson lower
   bound (95% confidence) of observed success rate, clamped to a conservative
   0.5 prior when <10 samples exist. A new model with zero history CANNOT claim
   100% confidence.
@@ -345,6 +345,26 @@ metadata. Assembled into the message array before routing.
 
 ---
 
+## Translation-intent handling
+
+`gateway/translation.py` detects "translate X to Y" / "how do you say X in Y"
+style requests via regex and can respond in one of four modes (configured via
+`gateway-policy.json` → `translation.mode`, off by default):
+
+| Mode | Behavior |
+|------|----------|
+| `off` | No special handling. |
+| `detect_only` | Regex-detects and tags the routing decision, but doesn't change anything. |
+| `rewrite` | Rewrites the system prompt to be a translator before dispatch. |
+| `dedicated_endpoint` | Routes to `translation.dedicated_tier` if one is configured. |
+
+Rationale: translation is a constrained task where a small, translation-tuned
+model can outperform a general LLM at much lower cost — but only worth doing
+for requests that are actually translation requests, so intent is detected
+per-request rather than applying a translation filter to every message.
+
+---
+
 ## Configuration reference
 
 Top-level keys in `gateway-config.json`:
@@ -353,6 +373,7 @@ Top-level keys in `gateway-config.json`:
 |-----|-------------|
 | `mode` | `"single"` (SQLite) or `"multi"` (Postgres) |
 | `db_url` | SQLAlchemy connection string |
+| `host` / `port` | HTTP bind address + port |
 | `endpoints` | Provider endpoint definitions |
 | `tiers` | Tier ladder with capability scores |
 | `tenants` | Per-user tier access, budgets, rate limits |
@@ -361,6 +382,8 @@ Top-level keys in `gateway-config.json`:
 | `embedding` | Router embedding model (ONNX path, checksum) |
 | `routing` | Router thresholds (confidence, OOD, top-2 margin) |
 | `security` | Injection profiles, provider allowlist, host firewall |
+| `drift` | Distribution drift detection (per-vertical share week-over-week) |
+| `logging` | Trace/flagged retention, structured JSON logging |
 | `auth` | Per-tenant API keys + public paths |
 | `http` | CORS, max body size, health poll interval |
 | `memory` | Observational memory config |
@@ -382,6 +405,7 @@ Top-level keys in `gateway-config.json`:
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/v1/chat/completions` | OpenAI-compatible chat (stream + non-stream) |
+| POST | `/v1/messages` | Anthropic Messages API-compatible chat (stream + non-stream) |
 | GET | `/v1/models` | List available models (tier-scoped) |
 | GET | `/health` | Liveness probe |
 | GET | `/ready` | Readiness probe (router loaded, endpoints healthy) |
@@ -421,11 +445,36 @@ Top-level keys in `gateway-config.json`:
 
 ---
 
+## Wire formats: OpenAI and Anthropic
+
+`/v1/chat/completions` and `/v1/messages` are two doors into the exact same
+gateway: routing, policy, memory, security, and billing all run identically
+regardless of which one a client calls — only request/response translation
+at the edge differs (`gateway/transcoder.py`'s `decode_inbound_anthropic_request`
+/ `encode_outbound_anthropic_response` / `AnthropicOutboundStreamEncoder`).
+This is independent of which *upstream* actually serves the request: an
+Anthropic-format client hitting `/v1/messages` can still get routed to an
+OpenAI-compatible or Ollama upstream, and vice versa — the gateway's internal
+pivot format is always OpenAI's, so every combination of inbound/upstream
+wire format works.
+
+`/v1/messages` supports text and image content blocks, tool use, and
+streaming. One known gap: a streamed tool call is translated as a single
+`tool_use` content block emitted once the arguments are complete, not
+incrementally token-by-token — matching the existing limitation on the
+outbound side (an Anthropic *upstream*'s own streamed tool-use blocks are
+likewise not translated back to OpenAI's incremental format; see
+`_decode_anthropic_stream` in `gateway/transcoder.py`). Non-streaming tool
+use is unaffected.
+
+---
+
 ## Authentication
 
-Per-tenant API keys with hashed storage (`sha256:<digest>`). Keys are shown once
-on generation. When `auth.enabled` is false, `X-User-Id` header identifies
-tenants (trusted reverse proxy mode).
+Per-tenant API keys. Keys generated via the admin API (`POST /admin/keys`, or
+the dashboard's **Keys** tab) are stored hashed (`sha256:<digest>`) and shown
+once on generation — this is the recommended path. When `auth.enabled` is
+false, `X-User-Id` header identifies tenants (trusted reverse proxy mode).
 
 ```bash
 # Generate a key
@@ -440,18 +489,33 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 }
 ```
 
+Keys added directly to config this way (rather than through the admin API)
+are matched as plaintext unless you pre-hash them yourself as `sha256:<digest>`
+— prefer the admin API for anything beyond local testing.
+
+`POST /admin/keys` also accepts an optional `kind` (e.g. `"openai"`,
+`"anthropic"`; defaults to `"openai"` for keys created before this field
+existed). It's informational metadata for tracking which wire format or
+upstream family a key is meant for — it does **not** restrict which endpoint
+or route the key can actually call, and it isn't limited to a fixed enum:
+any short identifier (lowercase letters/digits/`_`/`-`, normalized
+automatically) is accepted, so tagging a key for a new provider never needs a
+gateway code change.
+
 ---
 
 ## Project layout
 
 ```
-glint-v2/
+ctrl-gateway/
 ├── gateway/
 │   ├── app.py                    — aiohttp app, all routes, init/cleanup
-│   ├── policy.py                 — routing decisions (cost-first, budget-aware)
+│   ├── policy.py                 — routing decisions (cost-first, budget-aware, Wilson confidence)
 │   ├── router.py                 — embedding + MLP heads inference (numpy)
-│   ├── endpoints.py              — endpoint pool, clients, breakers
+│   ├── endpoints.py              — endpoint pool, clients
+│   ├── circuit.py                — per-endpoint circuit breaker (CLOSED/OPEN/HALF_OPEN, DB-persisted)
 │   ├── transcoder.py             — payload rewriting per provider kind
+│   ├── translation.py            — translation-intent detection + system-prompt rewrite
 │   ├── memory.py                 — SQLAlchemy schema + helpers (30+ tables)
 │   ├── memory_observational.py   — working memory (Mastra pattern)
 │   ├── config.py                 — config loading + validation
@@ -477,17 +541,17 @@ glint-v2/
 │   ├── observer_worker.py        — observational memory worker
 │   ├── swarm.py                  — multi-step task decomposition
 │   ├── ood.py                    — out-of-distribution detection
-│   ├── quality.py                — Wilson confidence success estimation
 │   ├── metrics.py                — Prometheus metrics
 │   ├── provider_presets.json     — 22 provider connection templates
 │   ├── dashboard/
-│   │   └── index.html            — SPA dashboard (10 tabs)
+│   │   └── index.html            — SPA dashboard (11 tabs)
 │   └── plugins/
 │       └── microsoft_learn/      — sample plugin
 ├── router_model/
 │   ├── train.py                  — PyTorch MLP training (trunk + heads)
 │   ├── eval.py                   — evaluation (numpy mirror)
 │   ├── embed_finetune.py         — contrastive embedding fine-tune
+│   ├── export_onnx.py            — packages trained artifacts into what the gateway loads
 │   ├── generate_data.py          — synthetic training data
 │   ├── taxonomy.yaml             — 65 vertical definitions
 │   └── prototypes.json           — structural prototype centroids
@@ -497,6 +561,7 @@ glint-v2/
 │   ├── test_review_fixes.py      — regression tests
 │   ├── test_integration.py       — end-to-end with mock upstreams
 │   ├── test_security.py          — security hub tests
+│   ├── test_ssrf.py              — SSRF protection + DNS-rebinding resistance
 │   ├── test_budgets.py           — budget-aware routing tests
 │   ├── test_plugins.py           — extension module tests
 │   └── test_model_catalog.py     — model discovery + catalog tests
@@ -522,9 +587,10 @@ ruff check gateway tests router_model
 mypy gateway
 ```
 
-Test suite: **313+ tests** covering routing policy, budget enforcement, security
-profiles, plugin system, A2A registry, model catalog, tenant scoping, and
-end-to-end integration with mock upstreams.
+Test suite: **389 tests** covering routing policy, budget enforcement, security
+profiles, SSRF protection, plugin system, A2A registry, model catalog, tenant
+scoping, the Anthropic-compatible `/v1/messages` wire format, and end-to-end
+integration with mock upstreams.
 
 ---
 
@@ -534,16 +600,20 @@ end-to-end integration with mock upstreams.
 # 1. Start Postgres
 docker compose up -d postgres
 
-# 2. Set mode in gateway-config.json
+# 2. Set mode in gateway-config.json (or CTRL_MODE / CTRL_DB_URL env vars)
 # "mode": "multi",
-# "db_url": "postgresql+psycopg://user:pass@localhost:5432/glint"
+# "db_url": "postgresql+psycopg://user:pass@localhost:5432/ctrlgateway"
 
-# 3. Migrate existing SQLite data
-python -m gateway.memory migrate --from sqlite:///glint-v2.db --to postgresql+psycopg://...
-
-# 4. Run multiple gateway instances behind LB
+# 3. Run multiple gateway instances behind LB
 docker compose up --scale gateway=3
 ```
+
+Schema creation is automatic — the gateway calls `metadata.create_all()` +
+an idempotent migration pass against whatever `db_url` points at (SQLite or
+Postgres) on every startup, so a fresh Postgres database is ready to use with
+no manual setup. There's currently no built-in tool to carry *existing* data
+from a single-instance SQLite database into Postgres; if you need that, plan
+on a one-off export/import rather than an in-place switch.
 
 ---
 

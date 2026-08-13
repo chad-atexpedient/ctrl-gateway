@@ -1,4 +1,4 @@
-# Glint-V2 — Agent Working Notes
+# CTRL Gateway — Agent Working Notes
 
 ## Verification commands (run before finishing any task)
 
@@ -116,7 +116,7 @@ broken format strings, wrong column names) actually surface.
     embedding signature changes. Add new runtime subsystems there.
 24. **Overlay mutations are single-instance only**: `OverlayManager` raises
     when `mode == "multi"` (runtime file writes are not shared). Multi mode
-    requires `GLINT_DB_URL` and config shipped via image/volume.
+    requires `CTRL_DB_URL` and config shipped via image/volume.
 25. **The event loop must never block on DB/ONNX**: chat_completions offloads
     memory, router predict, usage reservation/settlement, and all DB writes
     via `asyncio.to_thread`. Keep new sync DB calls inside `to_thread`.
@@ -194,11 +194,13 @@ broken format strings, wrong column names) actually surface.
       when no chain reaches the target — caller maps to 429 `insufficient_quota`.
       Falls back to `cost_first_route` when the tenant has no plan, no token
       budget, and no per-model limits.
-    - `quality.estimate_success_probability` returns Wilson lower bound (95%
+    - `policy.estimate_success_probability` returns Wilson lower bound (95%
       confidence) of observed success rate, clamped to a conservative prior
       (0.5) when fewer than `min_samples` (=10) outcomes exist. This means
       a new model with zero history CANNOT claim 100% confidence — to meet a
       0.99 target via a single model you'd need > 300 samples with 0 failures.
+      (There is no `gateway/quality.py` — this and `cascade_success_probability`/
+      `cost_to_complete_p99` all live in `policy.py`; don't reintroduce a split.)
     - `policy.cost_to_complete_p99` is the 99th-percentile cost estimate
       (geometric retry distribution, capped at `max_retries+1` attempts),
       surfaced in `routing_log.extra.achieved_success_probability` /
@@ -335,7 +337,7 @@ broken format strings, wrong column names) actually surface.
       `EventSource.MCP`. `discovery.probe_mcp_servers()` wraps it.
     - **Unified MCP facade** (`POST /mcp`, `gateway/mcp_facade.py`):
       JSON-RPC 2.0 over HTTP. `initialize` returns protocol version
-      `2024-11-05`, server name `glint-v2-gateway`. `tools/list` returns
+      `2024-11-05`, server name `ctrl-gateway`. `tools/list` returns
       all enabled `federated_tools` plus every enabled `a2a_agent` exposed
       as a synthetic `a2a_<name>` tool. `tools/call` retrieves the
       federated tool definition (input schema) and, for A2A-backed
@@ -359,7 +361,7 @@ broken format strings, wrong column names) actually surface.
       variables, and prepends it as a system message. Event source:
       `EventSource.PROMPT`.
     - **Webhook dispatcher** (`gateway/webhook_dispatcher.py`): async
-      fan-out with HMAC SHA-256 signing (`X-Glint-Signature: sha256=<hex>`),
+      fan-out with HMAC SHA-256 signing (`X-Gateway-Signature: sha256=<hex>`),
       exponential backoff retry (`initial_backoff_seconds` ×
       `backoff_multiplier` ^ attempt, capped at
       `delivery_timeout_seconds`), bounded concurrency
@@ -398,6 +400,20 @@ broken format strings, wrong column names) actually surface.
       `_deliver_with_retry` — all call with `allow_localhost=True,
       allow_private=True` (admin-configured integrations reaching
       in-cluster upstreams is a supported case).
+      **`validate_url()` alone only checks at request-construction
+      time** — a hostname that resolves safe at check-time can still
+      resolve to a blocked IP at actual connect-time (DNS rebinding
+      TOCTOU). Close that gap by building the `aiohttp.ClientSession`
+      with `connector=ssrf.safe_connector(allow_localhost=...,
+      allow_private=...)` instead of a bare `TCPConnector`:
+      `safe_connector()` wraps DNS resolution in `SSRFSafeResolver`,
+      which re-checks every resolved address against the same policy at
+      actual connect time and raises `OSError` (aiohttp wraps this in
+      `ClientConnectorDNSError`) if none remain safe. `a2a_registry.py`,
+      `contextforge_client.py`, `mcp_discovery.py`, `model_sync.py`, and
+      `webhook_dispatcher.py` all build their session this way now — do
+      the same for any new outbound integration, or the TOCTOU gap is
+      back.
     - **Dashboard**: 4 new tabs (`Plugins`, `A2A`, `Prompts`, `Webhooks`)
       added in `gateway/dashboard/index.html` with full CRUD UIs: plugin
       list/reload/enable/disable, A2A agent CRUD + invoke + test +
@@ -448,10 +464,17 @@ broken format strings, wrong column names) actually surface.
       `tenant_id`, then prefers a tenant-specific template over a global
       one in the same category.
     - **MCP facade** (`POST /mcp`): `tools/list`, `prompts/list`,
-      `tools/call`, and `prompts/get` all read `X-Tenant-Id` from the
-      request header (default `"anonymous"`) and filter accordingly. A
-      tenant cannot discover or invoke another tenant's private A2A
-      agents or federated tools.
+      `tools/call`, and `prompts/get` resolve `tenant_id` from
+      `request["tenant_id"]` (set by `auth_middleware` from the
+      auth-verified API key), falling back to the `X-User-Id` header only
+      when auth is disabled (trusted-reverse-proxy mode), else
+      `"anonymous"`. **Never read a raw client-supplied `X-Tenant-Id`
+      header here** — it used to, and that let any authenticated caller
+      impersonate any other tenant for `tools/list`/`tools/call`/
+      `prompts/get`, including invoking another tenant's private A2A
+      agents. Fixed to match every other tenant-scoped handler in
+      `app.py`. A tenant cannot discover or invoke another tenant's
+      private A2A agents or federated tools.
     - **Webhook dispatcher** (`gateway/webhook_dispatcher.py`):
       `dispatch(event_type, payload, tenant_id=...)` matches a webhook
       only when `webhook.tenant_id == "__all__"` OR
@@ -484,6 +507,57 @@ broken format strings, wrong column names) actually surface.
       healthy known hosts while still re-probing hosts that previously
       returned nothing.
 
+36. **Two inbound wire formats, one pivot**: `POST /v1/messages`
+    (`anthropic_messages()`) is a thin wrapper around `POST
+    /v1/chat/completions`'s handler (`chat_completions(request,
+    wire_format="anthropic")`) — NOT a separate implementation. Routing,
+    policy, memory, security, and billing are 100% shared and have no idea
+    which wire format the caller used.
+    - `wire_format` only touches three points inside `chat_completions()`:
+      (1) inbound body translation right after JSON parsing
+      (`transcoder.decode_inbound_anthropic_request`), (2) nothing else for
+      non-streaming — see below, (3) the streaming branch's per-chunk
+      `response.write()` calls, wrapped through
+      `transcoder.AnthropicOutboundStreamEncoder` when set. Deliberately NOT
+      threaded through the ~20+ scattered `_openai_error(...)`/inline-error
+      call sites inside that function — refactoring a ~950-line handler to
+      thread a format flag through every early return was assessed as
+      higher-risk than the alternative below.
+    - Non-streaming translation (both success and every error path,
+      including the swarm-mode early return and the ones that build
+      `{"error": {...}}` inline instead of calling `_openai_error()`)
+      happens in `anthropic_messages()` itself, AFTER `chat_completions()`
+      returns: it checks `response.prepared` (False for any plain
+      `web.Response` that hasn't hit `.prepare()`/been sent yet — true only
+      once the streaming branch calls `response.prepare(request)`) and, if
+      not yet prepared, swaps the still-OpenAI-shaped JSON body for a
+      translated one before it's sent. This works because aiohttp doesn't
+      actually write a returned-but-unprepared `Response` to the socket
+      until after the handler coroutine returns — see `_anthropic_error_
+      from_openai()` (maps by HTTP status, since Anthropic's error `type`
+      vocabulary doesn't correspond 1:1 with OpenAI's free-form `code`).
+    - The streaming encoder only ever has to understand ONE input shape
+      (OpenAI `chat.completion.chunk` SSE) no matter which upstream serves
+      the request: `EndpointClient.send()` already runs the upstream's
+      `stream_decoder` (Anthropic/Ollama/Gemini) before app.py sees a byte,
+      and openai/llamacpp-kind upstreams are already OpenAI-shaped. It
+      buffers partial SSE frames like `_iter_sse_data` does — raw
+      openai/llamacpp passthrough chunks aren't guaranteed to land on frame
+      boundaries.
+    - Streamed tool calls are batched into one `tool_use` content block at
+      stream end rather than translated incrementally — matching
+      `_decode_anthropic_stream`'s existing (pre-dating this feature) scope
+      for the opposite direction, which also doesn't translate a real
+      Anthropic upstream's incremental tool-use streaming. Non-streaming
+      tool use is fully translated both directions.
+    - `POST /admin/keys`' optional `kind` (default `"openai"`; see
+      `OverlayManager.generate_key`/`KNOWN_KEY_KINDS`) is unrelated
+      metadata-only tagging, not enforcement — it does not gate which
+      endpoint/route a key may call, and it's validated as a general
+      lowercase identifier, not restricted to `KNOWN_KEY_KINDS`. Don't
+      wire it into auth/routing without a separate explicit design — that
+      would be a behavior change, not a bookkeeping one.
+
 
 ## Router model v2 — MLP heads, real embedding fine-tune, llm_plan swarm (UNVERIFIED)
 
@@ -515,6 +589,13 @@ python -m unittest discover -s tests
 python router_model/generate_data.py --out router_model/data/base   # needs TEACHER_API_KEY
 python router_model/train.py --base-data-dir router_model/data/base --output-heads router_model/checkpoints/v1_heads.npz --output-onnx router_model/checkpoints/v1_model.onnx --output-metadata router_model/checkpoints/v1_meta.json
 python router_model/eval.py --heads router_model/checkpoints/v1_heads.npz --onnx router_model/checkpoints/v1_model.onnx --base-eval router_model/data/base/eval.jsonl --output-json router_model/checkpoints/v1_eval.json
+
+# train.py writes to --output-onnx/--output-heads (a checkpoints/ path, not
+# where the gateway loads from). To actually deploy a manually-trained
+# checkpoint, copy it into place with export_onnx.py -- this is the manual
+# equivalent of what TrainerWorker._persist_as_boot_default (invariant #30)
+# does automatically at the end of an auto-retrain run:
+python router_model/export_onnx.py --source-heads router_model/checkpoints/v1_heads.npz --source-onnx router_model/checkpoints/v1_model.onnx --source-metadata router_model/checkpoints/v1_meta.json --update-config gateway-config.json
 ```
 
 Watch specifically for: PyTorch/numpy shape mismatches surfacing as
@@ -535,27 +616,20 @@ prototype separation or needs re-weighting once real data exists.
 - `tests/mock_endpoints.py` covers llama/openai chat + stream + failure
   scripting; add cases there for new endpoint behaviors, including swarm's
   `llm_plan` planner calls once that path gets exercised.
-- The dashboard carries its API key in `sessionStorage` (`glint_api_key`);
+- The dashboard carries its API key in `sessionStorage` (`ctrl_api_key`);
   the event stream uses authenticated `fetch` streaming (EventSource cannot
   set headers). Named SSE events are consumed via `renderEvent`.
-- The "Glint Roman Empire lesson" is referenced by name in four places
-  (`gateway-config.json`, `gateway-policy.json`, `prototypes.json`,
-  `generate_data.py`) as if written up in README.md, but the actual incident
-  never got documented there — only the resulting rule did (topic prototypes
-  forbidden; prototypes encode difficulty profile, not topic). If you know
-  the real story, add it to README under structural prototypes.
+- The "Glint Roman Empire lesson" is referenced by name in six places
+  (`gateway/config.py` ×2, `tests/test_unit.py`, `gateway-policy.json`,
+  `router_model/prototypes.json` ×2, `router_model/generate_data.py`,
+  `router_model/train.py`) as if written up in README.md, but the actual
+  incident never got documented there — only the resulting rule did (topic
+  prototypes forbidden; prototypes encode difficulty profile, not topic).
+  The name is deliberately preserved as-is through the Glint-V2 → CTRL
+  Gateway rename (it's the proper noun for a past incident, not a product
+  identifier). If you know the real story, add it to README under
+  structural prototypes.
 - **Gateway extensions — known unfinished / do not assume working**:
-  - `tenant_id` is NOT yet a column on `plugins`, `prompt_templates`,
-    `webhooks`, or `federated_tools` — every tenant currently sees every
-    row in those tables. Add a migration + filter-by-tenant on all
-    list/get/upsert paths before exposing this to multi-tenant deployments.
-    `a2a_agents` has `tenant_id` on metrics but not on the agent records
-    themselves.
-  - The tool cache is only consulted by the `/mcp` facade's `tools/call`
-    handler — A2A `invoke_agent` and plugin route handlers do NOT consult
-    the cache directly. If you want caching at the A2A layer, call
-    `tool_cache.cache.get(key)`/`set(...)` inside `invoke_agent` or wrap it
-    at the facade level (see the facade's existing pattern).
   - Plugin `reload()` re-imports the module and re-runs `build_router`,
     but already-registered aiohttp routes persist — aiohttp cannot remove
     routes from a running `Application.router`. The reload method warns
@@ -572,10 +646,10 @@ prototype separation or needs re-weighting once real data exists.
     MCP method groups — only `initialize`, `tools/list`, `tools/call`,
     `prompts/list`, `prompts/get`. Add `resources/list` and `resources/read`
     when there's a concrete use case.
-  - Webhook delivery does not yet respect a per-webhook `max_retries`
-    override — all webhooks use the global `webhooks.max_retries` from
-    config. Add a `max_retries` column to the `webhooks` table if
-    per-webhook tuning is needed.
-  - MCP discovery's `watch_loop` probes every host:port pair on every
-    tick — no jitter, no result caching. With a large `hosts` list this
-    could be noisy; consider adding jitter + a per-host probe cache.
+
+  (Previously this list also warned that extension-table `tenant_id`
+  scoping, A2A's tool-cache integration, per-webhook `max_retries`, and
+  MCP discovery's jitter/cache were unbuilt — all four shipped since; see
+  invariant #35 and the MCP discovery entry in #34. Re-check here before
+  re-adding a "known unfinished" item that invariants #1–35 already
+  describe as done.)
