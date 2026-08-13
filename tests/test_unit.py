@@ -1,4 +1,4 @@
-"""Unit tests for Glint-V2."""
+"""Unit tests for CTRL Gateway."""
 import json
 import os
 import sys
@@ -218,6 +218,222 @@ class TestTranscoder(unittest.TestCase):
         req = transcoder.transcode(ep, tier, {"messages": [{"role": "user", "content": "hi"}]})
         self.assertIn("/chat/completions", req.url)
         self.assertEqual(req.headers["Authorization"], "Bearer sk-test")
+
+    def test_stream_usage_regex_matches_transcoder_usage_chunk(self):
+        """Regression: gateway.app's streaming handler regex-extracts real
+        token usage from the trailing usage chunk transcoder._openai_usage_chunk
+        emits (used by _decode_anthropic_stream, and by any OpenAI-compatible
+        upstream that honors stream_options.include_usage) instead of always
+        settling on the pre-request estimate. Pin that the two independently
+        -maintained pieces (app.py's regex, transcoder's wire format) agree.
+        """
+        import json as json_mod
+
+        from gateway import app as app_mod
+        from gateway import transcoder
+
+        chunk = transcoder._openai_usage_chunk("chatcmpl-1", "claude", 12, 7)
+        serialized = json_mod.dumps(chunk, ensure_ascii=False)
+        m = app_mod.STREAM_USAGE_RE.search(serialized)
+        self.assertIsNotNone(m, "app.py's STREAM_USAGE_RE must match transcoder's real usage-chunk wire format")
+        self.assertEqual(int(m.group(1)), 12)
+        self.assertEqual(int(m.group(2)), 7)
+
+
+class TestAnthropicWireFormat(unittest.TestCase):
+    """Inbound/outbound translation for POST /v1/messages (see
+    transcoder.decode_inbound_anthropic_request / encode_outbound_
+    anthropic_response / AnthropicOutboundStreamEncoder, and app.py's
+    anthropic_messages()). Pure dict-in/dict-out or bytes-in/bytes-out, so
+    these run without the HTTP layer -- tests/test_integration.py's
+    TestAnthropicMessagesEndpoint covers the full /v1/messages round trip
+    through actual routing.
+    """
+
+    def test_decode_inbound_basic_text_and_system(self):
+        from gateway import transcoder
+        body = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 512,
+            "system": "Be terse.",
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.5,
+        }
+        out = transcoder.decode_inbound_anthropic_request(body)
+        self.assertEqual(out["model"], "claude-sonnet-4-20250514")
+        self.assertEqual(out["max_tokens"], 512)
+        self.assertEqual(out["temperature"], 0.5)
+        self.assertEqual(out["messages"][0], {"role": "system", "content": "Be terse."})
+        self.assertEqual(out["messages"][1], {"role": "user", "content": "hi"})
+
+    def test_decode_inbound_tool_use_and_tool_result(self):
+        from gateway import transcoder
+        body = {
+            "max_tokens": 100,
+            "messages": [
+                {"role": "user", "content": "what's the weather"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "checking..."},
+                    {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "nyc"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "72F sunny"},
+                ]},
+            ],
+        }
+        out = transcoder.decode_inbound_anthropic_request(body)
+        msgs = out["messages"]
+        self.assertEqual(msgs[0], {"role": "user", "content": "what's the weather"})
+        self.assertEqual(msgs[1]["role"], "assistant")
+        self.assertEqual(msgs[1]["content"], "checking...")
+        self.assertEqual(msgs[1]["tool_calls"][0]["id"], "toolu_1")
+        self.assertEqual(msgs[1]["tool_calls"][0]["function"]["name"], "get_weather")
+        self.assertEqual(json.loads(msgs[1]["tool_calls"][0]["function"]["arguments"]), {"city": "nyc"})
+        self.assertEqual(msgs[2], {"role": "tool", "tool_call_id": "toolu_1", "content": "72F sunny"})
+
+    def test_decode_inbound_image_block(self):
+        from gateway import transcoder
+        body = {
+            "max_tokens": 50,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is this"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+            ]}],
+        }
+        out = transcoder.decode_inbound_anthropic_request(body)
+        parts = out["messages"][0]["content"]
+        self.assertEqual(parts[0], {"type": "text", "text": "what is this"})
+        self.assertEqual(parts[1]["type"], "image_url")
+        self.assertEqual(parts[1]["image_url"]["url"], "data:image/png;base64,AAAA")
+
+    def test_decode_inbound_tools_and_tool_choice(self):
+        from gateway import transcoder
+        body = {
+            "max_tokens": 50,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "get_weather", "description": "gets weather", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "tool", "name": "get_weather"},
+        }
+        out = transcoder.decode_inbound_anthropic_request(body)
+        self.assertEqual(out["tools"][0]["type"], "function")
+        self.assertEqual(out["tools"][0]["function"]["name"], "get_weather")
+        self.assertEqual(out["tool_choice"], {"type": "function", "function": {"name": "get_weather"}})
+
+    def test_encode_outbound_response_text(self):
+        from gateway import transcoder
+        resp = {
+            "id": "chatcmpl-1",
+            "model": "gateway",
+            "choices": [{"message": {"role": "assistant", "content": "hello"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 5},
+        }
+        out = transcoder.encode_outbound_anthropic_response(resp)
+        self.assertEqual(out["type"], "message")
+        self.assertEqual(out["role"], "assistant")
+        self.assertEqual(out["content"], [{"type": "text", "text": "hello"}])
+        self.assertEqual(out["stop_reason"], "end_turn")
+        self.assertEqual(out["usage"], {"input_tokens": 3, "output_tokens": 5})
+
+    def test_encode_outbound_response_tool_calls(self):
+        from gateway import transcoder
+        resp = {
+            "id": "chatcmpl-2",
+            "model": "gateway",
+            "choices": [{
+                "message": {
+                    "role": "assistant", "content": "",
+                    "tool_calls": [{"id": "call_1", "function": {"name": "f", "arguments": '{"x": 1}'}}],
+                },
+                "finish_reason": "tool_calls",
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+        out = transcoder.encode_outbound_anthropic_response(resp)
+        self.assertEqual(out["stop_reason"], "tool_use")
+        self.assertEqual(out["content"][0]["type"], "tool_use")
+        self.assertEqual(out["content"][0]["name"], "f")
+        self.assertEqual(out["content"][0]["input"], {"x": 1})
+
+    def test_anthropic_stop_reason_mapping(self):
+        from gateway import transcoder
+        self.assertEqual(transcoder._anthropic_stop_reason(None), "end_turn")
+        self.assertEqual(transcoder._anthropic_stop_reason("stop"), "end_turn")
+        self.assertEqual(transcoder._anthropic_stop_reason("length"), "max_tokens")
+        self.assertEqual(transcoder._anthropic_stop_reason("tool_calls"), "tool_use")
+
+    def test_stream_encoder_full_text_response(self):
+        from gateway import transcoder
+        enc = transcoder.AnthropicOutboundStreamEncoder(message_id="msg_test")
+        chunks = [
+            {"id": "c1", "object": "chat.completion.chunk", "model": "gateway",
+             "choices": [{"index": 0, "delta": {"content": "hel"}, "finish_reason": None}]},
+            {"id": "c1", "object": "chat.completion.chunk", "model": "gateway",
+             "choices": [{"index": 0, "delta": {"content": "lo"}, "finish_reason": "stop"}]},
+        ]
+        out = b""
+        for c in chunks:
+            out += enc.feed(f"data: {json.dumps(c)}\n\n".encode())
+        out += enc.feed(b"data: [DONE]\n\n")
+        out += enc.finish()
+        text = out.decode()
+        self.assertIn("event: message_start", text)
+        self.assertIn('"text": "hel"', text)
+        self.assertIn('"text": "lo"', text)
+        self.assertIn("event: content_block_stop", text)
+        self.assertIn('"stop_reason": "end_turn"', text)  # finish_reason "stop" -> end_turn
+        self.assertIn("event: message_stop", text)
+        self.assertNotIn("[DONE]", text)
+        self.assertNotIn("chat.completion.chunk", text)
+
+    def test_stream_encoder_handles_frame_split_across_feed_calls(self):
+        """A raw OpenAI-compatible passthrough chunk boundary can land in the
+        middle of one SSE frame (see _iter_sse_data's own docstring/prior
+        art) -- the encoder must buffer, not assume one JSON object per
+        feed() call."""
+        from gateway import transcoder
+        enc = transcoder.AnthropicOutboundStreamEncoder()
+        payload = {"id": "c1", "object": "chat.completion.chunk", "model": "m",
+                   "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": None}]}
+        frame = f"data: {json.dumps(payload)}\n\n".encode()
+        split_at = len(frame) // 2
+        part1, part2 = frame[:split_at], frame[split_at:]
+
+        out1 = enc.feed(part1)
+        self.assertEqual(out1, b"", "must not emit anything from a partial, unterminated frame")
+        out2 = enc.feed(part2)
+        self.assertIn(b"event: message_start", out2)
+        self.assertIn(b'"text": "hi"', out2)
+
+    def test_stream_encoder_tool_calls_batched_at_stream_end(self):
+        from gateway import transcoder
+        enc = transcoder.AnthropicOutboundStreamEncoder()
+        chunks = [
+            {"choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "function": {"name": "get_weather", "arguments": ""}},
+            ]}, "finish_reason": None}]},
+            {"choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": '{"city":'}},
+            ]}, "finish_reason": None}]},
+            {"choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": '"nyc"}'}},
+            ]}, "finish_reason": "tool_calls"}]},
+        ]
+        out = b""
+        for c in chunks:
+            out += enc.feed(f"data: {json.dumps(c)}\n\n".encode())
+        out += enc.finish()
+        text = out.decode()
+        self.assertIn("event: content_block_start", text)
+        self.assertIn('"type": "tool_use"', text)
+        self.assertIn('"name": "get_weather"', text)
+        self.assertIn('"type": "input_json_delta"', text)
+        self.assertIn("city", text)
+        self.assertIn('"stop_reason": "tool_use"', text)
+
+    def test_stream_encoder_empty_stream_emits_nothing(self):
+        from gateway import transcoder
+        enc = transcoder.AnthropicOutboundStreamEncoder()
+        self.assertEqual(enc.finish(), b"")
 
 
 class TestTranslation(unittest.TestCase):

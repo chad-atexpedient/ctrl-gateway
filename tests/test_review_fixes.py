@@ -343,6 +343,60 @@ class TestAnthropicGeminiTranscoders(unittest.TestCase):
         ]))
         self.assertIn(b'"content": "hi"', gemini)
 
+    def test_anthropic_stream_surfaces_real_usage(self):
+        """Regression: _decode_anthropic_stream used to read message_start
+        and message_delta only for id/model/stop_reason and silently drop
+        their `usage` sub-object, so a streamed Anthropic response never
+        reported real token counts — callers (including the gateway's own
+        settlement code) had no choice but to fall back to pre-request
+        estimates. It should now emit a trailing OpenAI-style usage chunk
+        (empty `choices`, top-level `usage`) built from the real
+        input_tokens (message_start) and output_tokens (message_delta).
+        """
+        import asyncio
+        import json as json_mod
+
+        from gateway import transcoder
+
+        async def collect(decoder, chunks):
+            async def source():
+                for chunk in chunks:
+                    yield chunk
+            return b"".join([part async for part in decoder(source())])
+
+        raw = asyncio.run(collect(transcoder._decode_anthropic_stream, [
+            b'event: message_start\ndata: {"type":"message_start","message":'
+            b'{"id":"msg_1","model":"claude","usage":{"input_tokens":12,"output_tokens":1}}}\n\n',
+            b'event: content_block_delta\ndata: {"type":"content_block_delta",'
+            b'"delta":{"type":"text_delta","text":"hi"}}\n\n',
+            b'event: message_delta\ndata: {"type":"message_delta",'
+            b'"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}\n\n',
+        ]))
+
+        self.assertTrue(raw.rstrip(b"\n").endswith(b"data: [DONE]"))
+        events = []
+        for line in raw.split(b"\n\n"):
+            if line.startswith(b"data:"):
+                payload = line[len(b"data:"):].strip()
+                if payload and payload != b"[DONE]":
+                    events.append(json_mod.loads(payload))
+        self.assertEqual(len(events), 4)  # role, content, finish, usage
+
+        usage_events = [e for e in events if "usage" in e]
+        self.assertEqual(len(usage_events), 1, "exactly one trailing usage chunk expected")
+        usage_chunk = usage_events[0]
+        self.assertEqual(usage_chunk["choices"], [])
+        self.assertEqual(
+            usage_chunk["usage"],
+            {"prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19},
+        )
+        # The usage chunk must be appended after the content delta, not before it.
+        content_index = next(
+            i for i, e in enumerate(events)
+            if (e.get("choices") or [{}])[0].get("delta", {}).get("content") == "hi"
+        )
+        self.assertLess(content_index, events.index(usage_chunk))
+
     def test_provider_presets_loaded(self):
         from gateway import config as cfg
         conf = cfg.ConfigManager().current()
@@ -960,7 +1014,7 @@ class TestHashedAuthKeys(unittest.TestCase):
         import hashlib
 
         from gateway.auth import AuthManager
-        raw = "glint-secret"
+        raw = "ctrl-secret"
         digest = "sha256:" + hashlib.sha256(raw.encode()).hexdigest()
         manager = AuthManager({
             "enabled": True,

@@ -21,7 +21,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
-log = logging.getLogger("glint.transcoder")
+log = logging.getLogger("ctrl.transcoder")
 
 
 class TranscodedRequest:
@@ -365,21 +365,410 @@ def _decode_anthropic_response(raw: dict) -> dict:
 async def _decode_anthropic_stream(source: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
     message_id = "chatcmpl-anthropic"
     model = ""
+    # Anthropic reports real token usage in-band: message_start carries the
+    # (accurate) input_tokens up front, message_delta carries the cumulative
+    # output_tokens near the end. Previously both were read only for
+    # message_id/model/stop_reason and the usage sub-object was discarded, so
+    # the gateway had no way to settle billing/quotas on real streamed token
+    # counts and silently fell back to pre-request estimates for every
+    # streamed Anthropic response. Track them and emit a trailing OpenAI-style
+    # usage chunk (choices: [], usage: {...} — the same shape OpenAI itself
+    # uses for stream_options.include_usage) so callers that look for it,
+    # including this gateway's own settlement code, see real numbers.
+    input_tokens = 0
+    output_tokens = 0
     async for event in _iter_sse_data(source):
         event_type = event.get("type")
         if event_type == "message_start":
             message = event.get("message") or {}
             message_id = message.get("id") or message_id
             model = message.get("model") or model
+            usage = message.get("usage") or {}
+            input_tokens = int(usage.get("input_tokens", 0) or 0)
+            output_tokens = int(usage.get("output_tokens", 0) or 0)
             yield _sse(_openai_stream_chunk(message_id, model, {"role": "assistant"}, None))
         elif event_type == "content_block_delta":
             delta = event.get("delta") or {}
             if delta.get("type") == "text_delta":
                 yield _sse(_openai_stream_chunk(message_id, model, {"content": delta.get("text", "")}, None))
         elif event_type == "message_delta":
+            usage = event.get("usage") or {}
+            if "input_tokens" in usage:
+                input_tokens = int(usage.get("input_tokens", 0) or 0)
+            if "output_tokens" in usage:
+                output_tokens = int(usage.get("output_tokens", 0) or 0)
             finish = _openai_finish_reason((event.get("delta") or {}).get("stop_reason"))
             yield _sse(_openai_stream_chunk(message_id, model, {}, finish))
+    if input_tokens or output_tokens:
+        yield _sse(_openai_usage_chunk(message_id, model, input_tokens, output_tokens))
     yield b"data: [DONE]\n\n"
+
+
+# ---- Inbound Anthropic Messages API support (POST /v1/messages on this
+# gateway itself) -----------------------------------------------------------
+#
+# Everything above this point translates OpenAI-pivot -> Anthropic for
+# OUTBOUND calls to an Anthropic upstream. The functions below are the
+# mirror image for the INBOUND side: a client calling this gateway's own
+# /v1/messages endpoint in Anthropic's wire format, translated to/from the
+# same OpenAI pivot the rest of the gateway (routing, policy, memory,
+# billing) already speaks -- see app.py's chat_completions(wire_format=...)
+# and anthropic_messages().
+
+
+def decode_inbound_anthropic_request(body: dict) -> dict:
+    """Convert an inbound Anthropic Messages API request body into the
+    gateway's internal OpenAI chat-completions pivot format (the same shape
+    chat_completions() already parses for native OpenAI-format callers).
+    Reverse of _AnthropicAdapter.encode(). Pure dict->dict, like every
+    other _decode_*/encode_* function in this module, so it's testable
+    without the HTTP layer.
+    """
+    out: dict[str, Any] = {}
+    if "model" in body:
+        out["model"] = body["model"]
+
+    messages: list[dict] = []
+    system = body.get("system")
+    if isinstance(system, str) and system:
+        messages.append({"role": "system", "content": system})
+    elif isinstance(system, list):
+        text = "\n\n".join(
+            part.get("text", "") for part in system
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+        if text:
+            messages.append({"role": "system", "content": text})
+
+    for m in body.get("messages", []):
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if isinstance(content, str):
+            messages.append({"role": role, "content": content})
+            continue
+        if not isinstance(content, list):
+            messages.append({"role": role, "content": _text_content(content)})
+            continue
+
+        if role == "assistant":
+            text_parts = []
+            tool_calls = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    text_parts.append(part.get("text", ""))
+                elif part.get("type") == "tool_use":
+                    tool_calls.append({
+                        "id": part.get("id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": part.get("name", ""),
+                            "arguments": json.dumps(part.get("input", {}), ensure_ascii=False),
+                        },
+                    })
+            out_message: dict[str, Any] = {"role": "assistant", "content": "".join(text_parts)}
+            if tool_calls:
+                out_message["tool_calls"] = tool_calls
+            messages.append(out_message)
+            continue
+
+        # Non-assistant role (in practice always "user"): tool_result blocks
+        # each become their own OpenAI `role: tool` message; remaining
+        # text/image blocks become one regular message with OpenAI-style
+        # content parts.
+        openai_parts: list[dict] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            ptype = part.get("type")
+            if ptype == "tool_result":
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": part.get("tool_use_id", ""),
+                    "content": _text_content(part.get("content", "")),
+                })
+            elif ptype == "text":
+                openai_parts.append({"type": "text", "text": part.get("text", "")})
+            elif ptype == "image":
+                source = part.get("source") or {}
+                if source.get("type") == "base64":
+                    media_type = source.get("media_type", "image/png")
+                    data = source.get("data", "")
+                    openai_parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{media_type};base64,{data}"},
+                    })
+                elif source.get("type") == "url":
+                    openai_parts.append({"type": "image_url", "image_url": {"url": source.get("url", "")}})
+        if openai_parts:
+            if len(openai_parts) == 1 and openai_parts[0]["type"] == "text":
+                messages.append({"role": role, "content": openai_parts[0]["text"]})
+            else:
+                messages.append({"role": role, "content": openai_parts})
+
+    out["messages"] = messages
+    if "max_tokens" in body:
+        out["max_tokens"] = body["max_tokens"]
+    if body.get("temperature") is not None:
+        out["temperature"] = body["temperature"]
+    if body.get("top_p") is not None:
+        out["top_p"] = body["top_p"]
+    if body.get("stop_sequences"):
+        out["stop"] = body["stop_sequences"]
+    if "stream" in body:
+        out["stream"] = bool(body["stream"])
+    if body.get("tools"):
+        out["tools"] = [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.get("name", ""),
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("input_schema", {"type": "object"}),
+                },
+            }
+            for tool in body["tools"]
+        ]
+    if body.get("tool_choice"):
+        choice = body["tool_choice"]
+        ctype = choice.get("type") if isinstance(choice, dict) else None
+        if ctype == "auto":
+            out["tool_choice"] = "auto"
+        elif ctype == "any":
+            out["tool_choice"] = "required"
+        elif ctype == "tool" and choice.get("name"):
+            out["tool_choice"] = {"type": "function", "function": {"name": choice["name"]}}
+    return out
+
+
+def _anthropic_stop_reason(reason: str | None) -> str:
+    """Map an OpenAI-pivot finish_reason back to an Anthropic stop_reason."""
+    if not reason:
+        return "end_turn"
+    normalized = str(reason).lower()
+    if normalized in ("length", "max_tokens"):
+        return "max_tokens"
+    if normalized in ("tool_calls", "tool_use", "function_call"):
+        return "tool_use"
+    return "end_turn"
+
+
+def encode_outbound_anthropic_response(resp: dict) -> dict:
+    """Convert the gateway's internal OpenAI chat.completion response (the
+    same shape chat_completions() returns to native OpenAI-format callers)
+    into an Anthropic Messages API response, for the /v1/messages
+    non-streaming path. Reverse of _decode_anthropic_response.
+    """
+    choice = (resp.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    content: list[dict[str, Any]] = []
+    text = message.get("content")
+    if isinstance(text, str) and text:
+        content.append({"type": "text", "text": text})
+    elif isinstance(text, list):
+        # Defensive: internal pivot content is normally a plain string for
+        # assistant messages, but tolerate an OpenAI-style content-part list.
+        joined = _text_content(text)
+        if joined:
+            content.append({"type": "text", "text": joined})
+    for call in message.get("tool_calls") or []:
+        function = call.get("function", {})
+        arguments = function.get("arguments", {})
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                arguments = {"raw": arguments}
+        content.append({
+            "type": "tool_use",
+            "id": call.get("id", ""),
+            "name": function.get("name", ""),
+            "input": arguments,
+        })
+    usage = resp.get("usage") or {}
+    return {
+        "id": resp.get("id") or ("msg_" + uuid.uuid4().hex[:24]),
+        "type": "message",
+        "role": "assistant",
+        "model": resp.get("model", ""),
+        "content": content,
+        "stop_reason": _anthropic_stop_reason(choice.get("finish_reason")),
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+        },
+    }
+
+
+def _anthropic_sse(event_type: str, payload: dict) -> bytes:
+    """Anthropic's streaming format names each event (unlike OpenAI's
+    anonymous `data: {...}` frames): `event: <type>\\ndata: <json>\\n\\n`."""
+    return f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+
+
+class AnthropicOutboundStreamEncoder:
+    """Stateful translator: internal OpenAI-pivot SSE bytes -> Anthropic
+    Messages API SSE bytes, for the /v1/messages streaming response path.
+
+    By the time chat_completions() has bytes to write to the client, they
+    are ALWAYS OpenAI-pivot-shaped SSE (chat.completion.chunk), regardless
+    of which upstream actually served the request: EndpointClient.send()
+    already runs the upstream's stream_decoder (_decode_anthropic_stream /
+    _decode_ollama_stream / _decode_gemini_stream above) before app.py ever
+    sees a byte, and openai/llamacpp-kind upstreams are already
+    OpenAI-shaped. So this encoder only has to understand ONE input shape,
+    no matter which upstream served the request.
+
+    Raw passthrough chunks (openai/llamacpp kinds, which have no
+    stream_decoder) are not guaranteed to land on SSE frame boundaries, so
+    this buffers partial frames the same way _iter_sse_data does, rather
+    than assuming one JSON object per feed() call.
+
+    Text-delta streaming is fully translated. A tool_calls delta is
+    accumulated and emitted as a single (non-incremental) tool_use content
+    block at stream end instead of streamed token-by-token -- matching the
+    scope of _decode_anthropic_stream above, which likewise only forwards
+    text_delta content and not incremental tool-call streaming from a real
+    Anthropic upstream. Extending both directions to stream tool-call
+    arguments incrementally would need a shared design; not attempted here.
+    """
+
+    def __init__(self, message_id: str | None = None):
+        self._buffer = b""
+        self._message_id = message_id or ("msg_" + uuid.uuid4().hex[:24])
+        self._model = ""
+        self._started = False
+        self._text_block_open = False
+        self._output_tokens = 0
+        self._finish_reason: str | None = None
+        self._tool_calls: dict[int, dict[str, str]] = {}
+
+    def feed(self, chunk: bytes) -> bytes:
+        self._buffer += chunk
+        out = bytearray()
+        while b"\n\n" in self._buffer:
+            frame, self._buffer = self._buffer.split(b"\n\n", 1)
+            out += self._handle_frame(frame)
+        return bytes(out)
+
+    def finish(self) -> bytes:
+        out = bytearray()
+        if self._buffer.strip():
+            out += self._handle_frame(self._buffer)
+            self._buffer = b""
+        out += self._close()
+        return bytes(out)
+
+    def _handle_frame(self, frame: bytes) -> bytes:
+        out = bytearray()
+        for line in frame.splitlines():
+            if not line.startswith(b"data:"):
+                continue
+            data = line[5:].strip()
+            if not data or data == b"[DONE]":
+                continue
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            out += self._handle_payload(payload)
+        return bytes(out)
+
+    def _handle_payload(self, payload: dict) -> bytes:
+        out = bytearray()
+        if not self._started:
+            self._started = True
+            self._model = payload.get("model") or self._model
+            out += _anthropic_sse("message_start", {
+                "type": "message_start",
+                "message": {
+                    "id": self._message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": self._model,
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                },
+            })
+        choices = payload.get("choices") or []
+        if choices:
+            choice = choices[0]
+            delta = choice.get("delta") or {}
+            if delta.get("content"):
+                if not self._text_block_open:
+                    self._text_block_open = True
+                    out += _anthropic_sse("content_block_start", {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "text", "text": ""},
+                    })
+                out += _anthropic_sse("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": delta["content"]},
+                })
+            for tc in delta.get("tool_calls") or []:
+                idx = tc.get("index", 0)
+                slot = self._tool_calls.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                function = tc.get("function") or {}
+                if function.get("name"):
+                    slot["name"] = function["name"]
+                if function.get("arguments"):
+                    slot["arguments"] += function["arguments"]
+            if choice.get("finish_reason"):
+                self._finish_reason = choice["finish_reason"]
+        usage = payload.get("usage")
+        if usage and "completion_tokens" in usage:
+            self._output_tokens = int(usage.get("completion_tokens", 0) or 0)
+        return bytes(out)
+
+    def _close(self) -> bytes:
+        out = bytearray()
+        if not self._started:
+            # Nothing was ever emitted (e.g. the stream failed before any
+            # chunk arrived) -- don't emit a dangling message_delta/stop
+            # with no matching message_start.
+            return bytes(out)
+        next_index = 0
+        if self._text_block_open:
+            out += _anthropic_sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+            next_index = 1
+        for idx in sorted(self._tool_calls):
+            slot = self._tool_calls[idx]
+            block_index = next_index
+            next_index += 1
+            arguments = slot["arguments"]
+            try:
+                parsed_input = json.loads(arguments) if arguments else {}
+            except json.JSONDecodeError:
+                parsed_input = {"raw": arguments}
+            out += _anthropic_sse("content_block_start", {
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": {"type": "tool_use", "id": slot["id"], "name": slot["name"], "input": {}},
+            })
+            out += _anthropic_sse("content_block_delta", {
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {"type": "input_json_delta", "partial_json": json.dumps(parsed_input, ensure_ascii=False)},
+            })
+            out += _anthropic_sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
+        stop_reason = self._finish_reason
+        if stop_reason is None and self._tool_calls:
+            stop_reason = "tool_calls"
+        out += _anthropic_sse("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": _anthropic_stop_reason(stop_reason), "stop_sequence": None},
+            "usage": {"output_tokens": self._output_tokens},
+        })
+        out += _anthropic_sse("message_stop", {"type": "message_stop"})
+        return bytes(out)
 
 
 class _GeminiAdapter:
@@ -660,6 +1049,24 @@ def _openai_stream_chunk(
         "created": int(time.time()),
         "model": model,
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    }
+
+
+def _openai_usage_chunk(chunk_id: str, model: str, input_tokens: int, output_tokens: int) -> dict:
+    """A trailing SSE chunk carrying real token usage, matching the shape
+    OpenAI itself sends when a client requests stream_options.include_usage:
+    an empty `choices` list plus a top-level `usage` object."""
+    return {
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [],
+        "usage": {
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+        },
     }
 
 

@@ -15,7 +15,7 @@ import secrets
 import threading
 from pathlib import Path
 
-log = logging.getLogger("glint.admin")
+log = logging.getLogger("ctrl.admin")
 
 
 class OverlayManager:
@@ -170,23 +170,44 @@ class OverlayManager:
 
     # ---- API key management ----
 
-    def generate_key(self, tenant_id: str, scope: list[str] | None = None) -> str:
-        """Generate a new API key. Returns the key (only shown once)."""
-        key = "glint-" + secrets.token_urlsafe(32)
+    # Recommended/default key kinds -- reuses the same taxonomy as endpoint
+    # `kind` (see _validated_endpoint above), but `generate_key` does NOT
+    # restrict to only these: any short identifier is accepted so new wire
+    # formats/upstream families don't require a code change here.
+    KNOWN_KEY_KINDS = ("openai", "anthropic", "gemini", "ollama", "llamacpp")
+
+    def generate_key(self, tenant_id: str, scope: list[str] | None = None, kind: str = "openai") -> str:
+        """Generate a new API key. Returns the key (only shown once).
+
+        `kind` is informational/organizational metadata recording which wire
+        format or upstream family this key is meant for (e.g. "openai",
+        "anthropic" -- see KNOWN_KEY_KINDS for the recommended set). It does
+        NOT restrict which endpoint or route the key may actually call --
+        auth/routing enforcement is unchanged. Any short identifier is
+        accepted (not just KNOWN_KEY_KINDS) so this stays generally
+        applicable as new wire formats/providers are added, rather than
+        hardcoded to a fixed pair.
+        """
+        key = "ctrl-" + secrets.token_urlsafe(32)
         scope = scope or ["user"]
         if not isinstance(tenant_id, str) or not re.fullmatch(r"[A-Za-z0-9._:@-]{1,64}", tenant_id):
             raise ValueError("invalid tenant_id")
         if not isinstance(scope, list) or not set(scope).issubset({"user", "admin"}):
             raise ValueError("scope must contain only user/admin")
+        if not isinstance(kind, str):
+            raise ValueError("kind must be a string")
+        kind = kind.strip().lower()
+        if not re.fullmatch(r"[a-z0-9_-]{1,32}", kind):
+            raise ValueError("kind must be 1-32 chars: lowercase letters, digits, underscore, or dash")
         with self._lock:
             self._ensure_mutable()
             keys = self._auth_keys
             import hashlib
             digest = "sha256:" + hashlib.sha256(key.encode()).hexdigest()
-            keys[digest] = {"tenant_id": tenant_id, "scope": scope, "prefix": key[:12]}
+            keys[digest] = {"tenant_id": tenant_id, "scope": scope, "prefix": key[:12], "kind": kind}
             self._set_nested("auth", "keys", keys)
             self._reload()
-            log.info("API key generated for tenant '%s' (scope=%s)", tenant_id, scope)
+            log.info("API key generated for tenant '%s' (scope=%s, kind=%s)", tenant_id, scope, kind)
             return key
 
     def list_keys(self) -> list[dict]:
@@ -197,6 +218,7 @@ class OverlayManager:
                 "key_masked": v.get("prefix", k[:12]) + "...",
                 "tenant_id": v.get("tenant_id"),
                 "scope": v.get("scope", ["user"]),
+                "kind": v.get("kind", "openai"),
             }
             for k, v in keys.items()
         ]
@@ -207,7 +229,7 @@ class OverlayManager:
             self._ensure_mutable()
             keys = self._auth_keys
             target = key_or_prefix
-            if target.startswith("glint-"):
+            if target.startswith("ctrl-"):
                 import hashlib
                 digest = "sha256:" + hashlib.sha256(target.encode()).hexdigest()
                 if digest in keys:

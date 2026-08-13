@@ -311,6 +311,214 @@ class TestChatPipeline(IntegrationBase):
         self.assertEqual(data["error"]["code"], "model_not_found")
 
 
+class TestAnthropicMessagesEndpoint(IntegrationBase):
+    """POST /v1/messages -- Anthropic Messages API-compatible entry point.
+
+    Exercises wire_format="anthropic" end-to-end: inbound request
+    translation, routing through the exact same pipeline /v1/chat/completions
+    uses (mock upstreams, memory, billing), and outbound response/stream
+    translation back to Anthropic's shape. tests/test_unit.py's
+    TestAnthropicWireFormat covers the translation functions in isolation.
+    """
+
+    def _messages(self, text: str, stream: bool = False, **extra):
+        body = {
+            "model": "gateway",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": text}],
+            "stream": stream,
+            **extra,
+        }
+        return self.client.post("/v1/messages", json=body)
+
+    def test_non_streaming_response_is_anthropic_shaped(self):
+        r = self.loop.run_until_complete(self._messages("hello there"))
+        self.assertEqual(r.status, 200, self.loop.run_until_complete(r.text()))
+        data = self.loop.run_until_complete(r.json())
+        self.assertEqual(data["type"], "message")
+        self.assertEqual(data["role"], "assistant")
+        self.assertEqual(data["content"][0]["type"], "text")
+        self.assertIn("mock response from", data["content"][0]["text"])
+        self.assertEqual(data["stop_reason"], "end_turn")
+        self.assertIn("input_tokens", data["usage"])
+        self.assertIn("output_tokens", data["usage"])
+        self.assertNotIn("choices", data)
+        self.assertNotIn("object", data)
+        # Routing/memory/billing pipeline ran exactly like the OpenAI path
+        trace = self._trace()
+        self.assertEqual(trace["count"], 1)
+        self.assertTrue(trace["decisions"][0]["response_ok"])
+
+    def test_system_prompt_and_multi_turn_history_translated(self):
+        r = self.loop.run_until_complete(self.client.post("/v1/messages", json={
+            "model": "gateway",
+            "max_tokens": 128,
+            "system": "You are terse.",
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "ack"},
+                {"role": "user", "content": "second"},
+            ],
+        }))
+        self.assertEqual(r.status, 200, self.loop.run_until_complete(r.text()))
+        data = self.loop.run_until_complete(r.json())
+        self.assertEqual(data["type"], "message")
+
+    def test_streaming_response_is_anthropic_sse(self):
+        r = self.loop.run_until_complete(self._messages("stream this", stream=True))
+        self.assertEqual(r.status, 200)
+        body = self.loop.run_until_complete(r.text())
+        self.assertIn("event: message_start", body)
+        self.assertIn("event: content_block_delta", body)
+        self.assertIn('"type": "text_delta"', body)
+        self.assertIn("event: message_stop", body)
+        self.assertIn('"stop_reason": "end_turn"', body)
+        # Proof this is genuinely translated, not the OpenAI SSE passed through
+        self.assertNotIn("chat.completion.chunk", body)
+        self.assertNotIn("data: [DONE]", body)
+        trace = self._trace()
+        self.assertTrue(trace["decisions"][0]["response_ok"])
+
+    def test_unknown_model_returns_anthropic_error_shape(self):
+        r = self.loop.run_until_complete(self.client.post("/v1/messages", json={
+            "model": "does-not-exist",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
+        self.assertEqual(r.status, 404)
+        data = self.loop.run_until_complete(r.json())
+        self.assertEqual(data["type"], "error")
+        self.assertEqual(data["error"]["type"], "not_found_error")
+        self.assertNotIn("code", data["error"])  # OpenAI-only field shouldn't leak through
+
+    def test_missing_messages_returns_anthropic_error_shape(self):
+        r = self.loop.run_until_complete(self.client.post("/v1/messages", json={
+            "model": "gateway",
+            "max_tokens": 16,
+            "messages": [],
+        }))
+        self.assertEqual(r.status, 400)
+        data = self.loop.run_until_complete(r.json())
+        self.assertEqual(data["type"], "error")
+        self.assertEqual(data["error"]["type"], "invalid_request_error")
+
+
+class TestAdminKeyKind(IntegrationBase):
+    """OverlayManager.generate_key()'s `kind` field: informational metadata
+    for which wire format/upstream family a key is meant for. Reuses the
+    same recommended vocabulary as endpoint `kind` (openai/anthropic/...)
+    but must NOT be a hardcoded enum -- any short identifier is valid, so
+    tagging a key for a new wire format/provider never needs a gateway code
+    change.
+    """
+
+    def test_generate_key_defaults_to_openai_kind(self):
+        r = self.loop.run_until_complete(self.client.post("/admin/keys", json={"tenant_id": "acme"}))
+        self.assertEqual(r.status, 201, self.loop.run_until_complete(r.text()))
+        data = self.loop.run_until_complete(r.json())
+        self.assertEqual(data["kind"], "openai")
+        listed = self.loop.run_until_complete(self.client.get("/admin/keys"))
+        keys = self.loop.run_until_complete(listed.json())["keys"]
+        self.assertTrue(any(k["tenant_id"] == "acme" and k["kind"] == "openai" for k in keys))
+
+    def test_generate_key_with_anthropic_kind(self):
+        r = self.loop.run_until_complete(self.client.post("/admin/keys", json={
+            "tenant_id": "acme", "kind": "anthropic",
+        }))
+        self.assertEqual(r.status, 201)
+        data = self.loop.run_until_complete(r.json())
+        self.assertEqual(data["kind"], "anthropic")
+        self.assertTrue(data["key"].startswith("ctrl-"))
+
+    def test_generate_key_kind_is_not_a_hardcoded_enum(self):
+        """The user's own ask: kind must stay generally applicable, not
+        restricted to a fixed openai/anthropic pair."""
+        r = self.loop.run_until_complete(self.client.post("/admin/keys", json={
+            "tenant_id": "acme", "kind": "my-custom-upstream",
+        }))
+        self.assertEqual(r.status, 201, self.loop.run_until_complete(r.text()))
+        data = self.loop.run_until_complete(r.json())
+        self.assertEqual(data["kind"], "my-custom-upstream")
+
+    def test_generate_key_normalizes_kind_case(self):
+        r = self.loop.run_until_complete(self.client.post("/admin/keys", json={
+            "tenant_id": "acme", "kind": "Anthropic",
+        }))
+        self.assertEqual(r.status, 201)
+        data = self.loop.run_until_complete(r.json())
+        self.assertEqual(data["kind"], "anthropic")
+
+    def test_generate_key_rejects_invalid_kind(self):
+        r = self.loop.run_until_complete(self.client.post("/admin/keys", json={
+            "tenant_id": "acme", "kind": "not a valid kind!",
+        }))
+        self.assertEqual(r.status, 400)
+
+
+class TestQualityProfileTracking(IntegrationBase):
+    """Regression tests for the budget-aware router's quality-profile feed.
+
+    Previously chat_completions never called memory.record_quality_sample()
+    after a request settled, so model_quality_profiles stayed empty forever
+    and policy.estimate_success_probability() always fell back to the
+    no-data prior -- the "budget-aware" routing feature quietly never
+    activated on real traffic. These tests exercise every call site added in
+    gateway/app.py's chat_completions handler (non-streaming success/failure,
+    fallback attribution, and streaming success) and assert the DB is
+    actually populated afterward.
+    """
+
+    def test_successful_chat_populates_quality_profile(self):
+        from gateway import memory
+        r = self.loop.run_until_complete(self._chat("populate quality profile"))
+        self.assertEqual(r.status, 200, self.loop.run_until_complete(r.text()))
+        d = self._trace()["decisions"][0]
+        self.assertTrue(d["response_ok"])
+        profile = memory.get_quality_profile(d["endpoint"], d["vertical"], d["complexity"])
+        self.assertIsNotNone(profile, "successful chat completion should record a quality sample")
+        self.assertEqual(profile["total_count"], 1)
+        self.assertEqual(profile["success_count"], 1)
+
+    def test_fallback_success_records_quality_against_serving_endpoint(self):
+        # mock_a (the cheapest, first-choice endpoint) fails; mock_b serves the
+        # request instead. The quality sample must land on mock_b (the endpoint
+        # that actually responded), not on mock_a (the originally-chosen one).
+        from gateway import memory
+        os.environ["MOCK_FAIL_ENDPOINTS"] = "mock_a"
+        r = self.loop.run_until_complete(self._chat("should fall back"))
+        self.assertEqual(r.status, 200)
+        d = self._trace()["decisions"][0]
+        self.assertEqual(d["endpoint"], "mock_b")
+        served_profile = memory.get_quality_profile("mock_b", d["vertical"], d["complexity"])
+        self.assertIsNotNone(served_profile)
+        self.assertEqual(served_profile["success_count"], 1)
+        failed_profile = memory.get_quality_profile("mock_a", d["vertical"], d["complexity"])
+        self.assertIsNone(failed_profile, "the endpoint that never responded should not get a success sample")
+
+    def test_all_endpoints_down_records_failure_sample(self):
+        from gateway import memory
+        os.environ["MOCK_FAIL_ENDPOINTS"] = "mock_a,mock_b,mock_ollama"
+        r = self.loop.run_until_complete(self._chat("will fail"))
+        self.assertEqual(r.status, 502)
+        d = self._trace()["decisions"][0]
+        self.assertFalse(d["response_ok"])
+        profile = memory.get_quality_profile(d["endpoint"], d["vertical"], d["complexity"])
+        self.assertIsNotNone(profile, "a fully-failed request should still record a failure sample")
+        self.assertEqual(profile["total_count"], 1)
+        self.assertEqual(profile["success_count"], 0)
+
+    def test_streaming_success_populates_quality_profile(self):
+        from gateway import memory
+        r = self.loop.run_until_complete(self._chat("stream this", stream=True))
+        self.assertEqual(r.status, 200)
+        self.loop.run_until_complete(r.text())  # drain the SSE body so the handler completes
+        d = self._trace()["decisions"][0]
+        self.assertTrue(d["response_ok"])
+        profile = memory.get_quality_profile(d["endpoint"], d["vertical"], d["complexity"])
+        self.assertIsNotNone(profile, "successful streaming completion should record a quality sample")
+        self.assertEqual(profile["success_count"], 1)
+
+
 class TestOllamaNative(IntegrationBase):
     """Ollama native /api/chat must be decoded into OpenAI chat.completions."""
 
@@ -390,6 +598,66 @@ class TestFlywheel(IntegrationBase):
         self.assertEqual(row.vertical, "programming")
         self.assertEqual(row.trust_score, 0.9)
 
+    def test_persist_failure_marks_review_failed_not_stuck(self):
+        """Regression: if persisting a review result raised (e.g. a DB error),
+        the queue item was left in whatever state dequeue_review() set it to
+        ("in_progress"). requeue_stale_reviews() would flip it back to
+        "pending" once its staleness window elapsed, so it would be
+        dequeued and retried forever -- repeatedly re-spending reviewer API
+        budget on an item that fails the same deterministic way every time.
+        It must instead be marked "failed", like every other error path in
+        _process_batch, so it fails cleanly once and never returns to the
+        queue.
+        """
+        from unittest.mock import patch
+
+        from sqlalchemy import select
+
+        from gateway import memory, reviewer
+
+        did = memory.log_decision(
+            tenant_id="t1", session_id="s1", model_version="stub-v0", policy_version=1,
+            query_hash="h2", query_preview="write a python function",
+            vertical="programming", complexity=2,
+            flags={"code": True, "math": False, "reasoning": False, "long_output": False},
+            tier="tier0", endpoint="mock_a", source="arith",
+            ms_classify=1.0, ms_total=10.0, est_cost_usd=0.001,
+            escalated=False, fallback_used=False, has_image=False,
+            has_injection_signal=False, vertical_top2_prob=0.9,
+        )
+        labels = {
+            "vertical": "programming", "complexity": 2, "code": True,
+            "math": False, "reasoning": False, "long_output": False,
+        }
+        os.environ["MOCK_REVIEWER_LABELS"] = json.dumps([labels])
+        reviewer.enqueue_for_review(did, "t1", cost_estimate=0.001)
+
+        item = memory.dequeue_review()
+        self.assertIsNotNone(item)
+        # dequeue_review() returns the pre-update snapshot (still "pending");
+        # confirm what it actually persisted was the "in_progress" transition.
+        with memory.engine().connect() as conn:
+            pre_row = conn.execute(
+                select(memory.review_queue).where(memory.review_queue.c.id == item["id"])
+            ).first()
+        self.assertEqual(pre_row.status, "in_progress")
+
+        rw = reviewer.worker()
+        with patch.object(
+            memory, "store_review_result",
+            side_effect=RuntimeError("simulated persistence failure"),
+        ):
+            self.loop.run_until_complete(rw._process_batch([item]))
+
+        with memory.engine().connect() as conn:
+            row = conn.execute(
+                select(memory.review_queue).where(memory.review_queue.c.id == item["id"])
+            ).first()
+        self.assertIsNotNone(row)
+        self.assertEqual(row.status, "failed")
+        self.assertNotEqual(row.status, "in_progress")
+        self.assertIn("simulated persistence failure", row.last_error or "")
+
 
 class TestOpsSurface(IntegrationBase):
     """/ready, /metrics, /config redaction, budget propagation."""
@@ -415,7 +683,7 @@ class TestOpsSurface(IntegrationBase):
         r = self.loop.run_until_complete(self.client.get("/metrics"))
         self.assertEqual(r.status, 200)
         body = self.loop.run_until_complete(r.text())
-        self.assertIn("glint_uptime_seconds", body)
+        self.assertIn("ctrl_gateway_uptime_seconds", body)
 
     def test_config_redacts_auth_keys(self):
         r = self.loop.run_until_complete(self.client.get("/config"))

@@ -1,4 +1,4 @@
-"""Glint-V2 gateway aiohttp application.
+"""CTRL Gateway aiohttp application.
 
 Wires together:
   - config (hot reload)
@@ -69,7 +69,7 @@ from . import swarm as swarm_mod
 from . import tool_cache as tool_cache_mod
 from . import webhook_dispatcher as webhook_mod
 
-log = logging.getLogger("glint.app")
+log = logging.getLogger("ctrl.app")
 
 INJECTION_PATTERNS: list = []
 INJECTION_PROFILES: list = []  # list[security.InjectionProfile]
@@ -357,7 +357,7 @@ async def init_app(conf_path: str = "./gateway-config.json") -> web.Application:
             app=app,
             config=conf,
             event_bus=events.bus(),
-            plugin_root=plugins_config.get("root", "./plugins"),
+            plugin_root=plugins_config.get("root", "./gateway/plugins"),
             scan_interval_seconds=int(plugins_config.get("scan_interval_seconds", 30)),
             auto_load=bool(plugins_config.get("auto_load", True)),
         )
@@ -366,6 +366,7 @@ async def init_app(conf_path: str = "./gateway-config.json") -> web.Application:
 
     # Routes
     app.router.add_post("/v1/chat/completions", chat_completions)
+    app.router.add_post("/v1/messages", anthropic_messages)
     app.router.add_get("/v1/models", list_models)
     app.router.add_get("/stats", get_stats)
     app.router.add_get("/config", get_config)
@@ -754,13 +755,40 @@ def _openai_error(
     }, status=status, headers=headers)
 
 
-async def chat_completions(request: web.Request) -> web.StreamResponse:
+# Matches the trailing usage chunk transcoder._openai_usage_chunk() emits
+# (e.g. from the Anthropic stream decoder, or any OpenAI-compatible upstream
+# honoring stream_options.include_usage): {"usage": {"prompt_tokens": N,
+# "completion_tokens": M, ...}}. Used by chat_completions' streaming branch
+# to settle real token usage/cost instead of always falling back to the
+# pre-request estimate. Module-level so it's compiled once and independently
+# testable against transcoder's actual output shape.
+STREAM_USAGE_RE = re.compile(
+    r'"usage"\s*:\s*\{\s*"prompt_tokens"\s*:\s*(\d+)\s*,\s*"completion_tokens"\s*:\s*(\d+)'
+)
+
+
+async def chat_completions(request: web.Request, wire_format: str = "openai") -> web.StreamResponse:
     try:
         body = await request.json()
     except Exception:
         return _openai_error("invalid_json", "Body must be valid JSON.", 400)
     if not isinstance(body, dict):
         return _openai_error("invalid_body", "Body must be a JSON object.", 400)
+    if wire_format == "anthropic":
+        # Translate Anthropic Messages API shape -> the OpenAI pivot shape
+        # every line below (and every other wire_format) already expects.
+        # See anthropic_messages() for the matching outbound translation;
+        # routing/policy/memory/security/billing logic below is completely
+        # unaware this request didn't arrive in OpenAI's own format.
+        try:
+            body = transcoder.decode_inbound_anthropic_request(body)
+        except Exception:
+            return _openai_error("invalid_body", "Body must be a valid Anthropic Messages API request.", 400)
+        # No separate empty-messages check here: the existing `messages =
+        # body.get("messages", [])` check a few lines below already covers
+        # the translated body the same way it covers a native OpenAI-format
+        # request, so both wire formats get identical validation ordering
+        # (including running the rate-limit check first).
     conf = request.app["conf_mgr"].current()
     rt: router_mod.Router = request.app["router"]
     tenant_mgr: tenant.TenantManager = request.app["tenant_mgr"]
@@ -1472,6 +1500,9 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                 except Exception as e:
                     ms_total = (time.time() - t0) * 1000
                     await asyncio.to_thread(_finalize_decision, decision_id, ms_total, False, str(e))
+                    await asyncio.to_thread(
+                        memory.record_quality_sample, decision.endpoint, r.vertical, r.complexity, False,
+                    )
                     _record_request_metrics(decision.tier, decision.endpoint, False, ms_total)
                     await asyncio.to_thread(
                         tenant_mgr.settle_usage,
@@ -1491,15 +1522,53 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                         error_type="server_error" if status >= 500 else "invalid_request_error",
                     )
                 await response.prepare(request)
+                # Real token usage, if the upstream reports it in-band (e.g. the
+                # Anthropic stream decoder's trailing usage chunk, or an
+                # OpenAI-compatible upstream honoring stream_options.include_usage).
+                # Stays None when not present, so settlement below falls back to
+                # the pre-request estimate exactly as before.
+                real_tokens_in: int | None = None
+                real_tokens_out: int | None = None
+
+                def _extract_usage(s: str) -> None:
+                    nonlocal real_tokens_in, real_tokens_out
+                    if '"usage"' not in s:
+                        return
+                    m = STREAM_USAGE_RE.search(s)
+                    if m:
+                        real_tokens_in = int(m.group(1))
+                        real_tokens_out = int(m.group(2))
+
                 try:
                     collected_text = ""
-                    await response.write(first_chunk)
+                    # wire_format="anthropic" translates the SAME underlying
+                    # OpenAI-pivot SSE bytes to Anthropic's named-event SSE
+                    # shape as they're written out. The regex-based
+                    # collected_text/_extract_usage bookkeeping below always
+                    # sees the untranslated first_chunk/chunk bytes (it has
+                    # to -- those regexes are OpenAI-shaped), completely
+                    # independent of what actually gets written to the client.
+                    anthropic_encoder = (
+                        transcoder.AnthropicOutboundStreamEncoder() if wire_format == "anthropic" else None
+                    )
+                    if anthropic_encoder is not None:
+                        translated = anthropic_encoder.feed(first_chunk)
+                        if translated:
+                            await response.write(translated)
+                    else:
+                        await response.write(first_chunk)
                     first_text = first_chunk.decode("utf-8", errors="ignore")
                     first_match = re.search(r'"content"\s*:\s*"((?:[^"\\]|\\.)*)"', first_text)
                     if first_match:
                         collected_text += json.loads(f'"{first_match.group(1)}"')
+                    _extract_usage(first_text)
                     async for chunk in stream_iter:
-                        await response.write(chunk)
+                        if anthropic_encoder is not None:
+                            translated = anthropic_encoder.feed(chunk)
+                            if translated:
+                                await response.write(translated)
+                        else:
+                            await response.write(chunk)
                         # Try to extract text from SSE chunks for memory recording
                         try:
                             s = chunk.decode("utf-8", errors="ignore")
@@ -1507,8 +1576,13 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                                 m = re.search(r'"content":"((?:[^"\\]|\\.)*)"', s)
                                 if m:
                                     collected_text += m.group(1).encode().decode("unicode_escape", errors="ignore")
+                            _extract_usage(s)
                         except Exception:
                             pass
+                    if anthropic_encoder is not None:
+                        final = anthropic_encoder.finish()
+                        if final:
+                            await response.write(final)
                     await response.write_eof()
                     response_ok = True
                     error = None
@@ -1517,13 +1591,27 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                     response_ok = False
                     error = str(e)
                 ms_total = (time.time() - t0) * 1000
+                # Prefer real cost (computed from real token counts, same pricing
+                # formula the non-stream success path uses) over the pre-request
+                # estimate when the upstream actually reported usage in-band.
+                actual_cost_usd: float | None
+                if response_ok and real_tokens_in is not None and real_tokens_out is not None:
+                    actual_cost_usd = _actual_endpoint_cost(
+                        conf, decision.endpoint,
+                        {"prompt_tokens": real_tokens_in, "completion_tokens": real_tokens_out},
+                    )
+                else:
+                    actual_cost_usd = decision.cost_usd if response_ok else None
                 await asyncio.to_thread(
                     _finalize_decision,
                     decision_id,
                     ms_total,
                     response_ok,
                     error,
-                    actual_cost_usd=decision.cost_usd if response_ok else None,
+                    actual_cost_usd=actual_cost_usd,
+                )
+                await asyncio.to_thread(
+                    memory.record_quality_sample, decision.endpoint, r.vertical, r.complexity, response_ok,
                 )
                 _record_request_metrics(decision.tier, decision.endpoint, response_ok, ms_total)
                 await asyncio.to_thread(
@@ -1532,9 +1620,9 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                     reserved_tokens_in=ctx.estimated_input_tokens,
                     reserved_tokens_out=ctx.estimated_output_tokens,
                     reserved_cost_usd=decision.cost_usd,
-                    actual_tokens_in=ctx.estimated_input_tokens if response_ok else 0,
-                    actual_tokens_out=ctx.estimated_output_tokens if response_ok else 0,
-                    actual_cost_usd=decision.cost_usd if response_ok else 0.0,
+                    actual_tokens_in=(real_tokens_in if real_tokens_in is not None else ctx.estimated_input_tokens) if response_ok else 0,
+                    actual_tokens_out=(real_tokens_out if real_tokens_out is not None else ctx.estimated_output_tokens) if response_ok else 0,
+                    actual_cost_usd=actual_cost_usd if actual_cost_usd is not None else 0.0,
                     completed=response_ok,
                     endpoint_name=decision.endpoint,
                 )
@@ -1582,6 +1670,9 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                     log.warning("all endpoints failed for decision %d: %s", decision_id, e)
                     ms_total = (time.time() - t0) * 1000
                     await asyncio.to_thread(_finalize_decision, decision_id, ms_total, False, str(e))
+                    await asyncio.to_thread(
+                        memory.record_quality_sample, decision.endpoint, r.vertical, r.complexity, False,
+                    )
                     _record_request_metrics(decision.tier, decision.endpoint, False, ms_total)
                     await asyncio.to_thread(
                         tenant_mgr.settle_usage,
@@ -1605,6 +1696,9 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                 actual_cost = _actual_endpoint_cost(conf, actual_endpoint, usage)
                 await asyncio.to_thread(
                     _finalize_decision, decision_id, ms_total, True, None, actual_cost_usd=actual_cost,
+                )
+                await asyncio.to_thread(
+                    memory.record_quality_sample, actual_endpoint, r.vertical, r.complexity, True,
                 )
                 _record_request_metrics(actual_tier, actual_endpoint, True, ms_total)
                 if used_fallback:
@@ -1665,6 +1759,75 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
                 return web.json_response(resp_data)
 
 
+def _anthropic_error_from_openai(payload: dict, status: int) -> dict:
+    """Translate an OpenAI-shaped error body (what _openai_error() and every
+    inline `{"error": {...}}` response in chat_completions() produce) into
+    Anthropic's error envelope. Anthropic's error `type` is a fixed
+    vocabulary keyed off HTTP status, not the free-form code/type OpenAI
+    uses, so this maps by status rather than trying to translate the
+    OpenAI `code`/`type` strings directly.
+    """
+    inner = payload.get("error")
+    if isinstance(inner, dict):
+        message = inner.get("message", "")
+    else:
+        message = str(inner) if inner is not None else ""
+    if status == 400:
+        etype = "invalid_request_error"
+    elif status == 401:
+        etype = "authentication_error"
+    elif status == 403:
+        etype = "permission_error"
+    elif status == 404:
+        etype = "not_found_error"
+    elif status == 413:
+        etype = "request_too_large"
+    elif status == 429:
+        etype = "rate_limit_error"
+    elif status >= 500:
+        etype = "api_error"
+    else:
+        etype = "invalid_request_error"
+    return {"type": "error", "error": {"type": etype, "message": message}}
+
+
+async def anthropic_messages(request: web.Request) -> web.StreamResponse:
+    """POST /v1/messages -- Anthropic Messages API-compatible entry point.
+
+    Delegates everything (routing, policy, memory, security, billing) to
+    chat_completions(wire_format="anthropic"); that parameter only affects
+    inbound body parsing and, for a streaming reply, the per-chunk SSE shape
+    written directly to the client (see chat_completions()'s streaming
+    branch) -- both already fully translated by the time control returns
+    here. A NON-streaming reply, success or error, comes back from
+    chat_completions() as a plain (not yet `.prepared`) OpenAI-shaped
+    web.Response that hasn't been sent to the client yet, so it's still
+    safe to swap out for a translated one here.
+    """
+    response = await chat_completions(request, wire_format="anthropic")
+    if getattr(response, "prepared", False):
+        # Streaming: bytes were already translated + written inside
+        # chat_completions() itself: nothing left to do here.
+        return response
+    try:
+        payload = json.loads(response.body or b"{}")
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return response
+    if not isinstance(payload, dict):
+        return response
+    if "error" in payload:
+        translated: dict = _anthropic_error_from_openai(payload, response.status)
+    elif "choices" in payload:
+        translated = transcoder.encode_outbound_anthropic_response(payload)
+    else:
+        return response
+    passthrough_headers = {
+        k: v for k, v in response.headers.items()
+        if k.lower() not in ("content-type", "content-length")
+    }
+    return web.json_response(translated, status=response.status, headers=passthrough_headers)
+
+
 def _finalize_decision(
     decision_id: int,
     ms_total: float,
@@ -1684,10 +1847,10 @@ def _finalize_decision(
 def _record_request_metrics(tier: str, endpoint: str, response_ok: bool, ms_total: float):
     """Prometheus counters for completed chat requests."""
     reg = metrics_mod.registry()
-    reg.inc("glint_requests_total", {"tier": tier, "endpoint": endpoint, "status": "ok" if response_ok else "error"})
-    reg.inc("glint_request_duration_ms", {"tier": tier}, value=ms_total)
+    reg.inc("ctrl_gateway_requests_total", {"tier": tier, "endpoint": endpoint, "status": "ok" if response_ok else "error"})
+    reg.inc("ctrl_gateway_request_duration_ms", {"tier": tier}, value=ms_total)
     if not response_ok:
-        reg.inc("glint_upstream_failures_total", {"endpoint": endpoint})
+        reg.inc("ctrl_gateway_upstream_failures_total", {"endpoint": endpoint})
 
 
 def _extract_text(content) -> str:
@@ -1983,7 +2146,7 @@ async def list_models(request: web.Request):
         "id": "gateway",
         "object": "model",
         "created": int(time.time()),
-        "owned_by": "glint-v2",
+        "owned_by": "ctrl-gateway",
         "capabilities": {
             "tiers": [t["name"] for t in conf.config.get("tiers", [])],
             "reviewer_model": conf.reviewer().get("model"),
@@ -2504,17 +2667,31 @@ async def admin_delete_endpoint(request: web.Request):
 
 
 async def admin_generate_key(request: web.Request):
-    """Generate a new gateway API key. Returns the key ONCE."""
+    """Generate a new gateway API key. Returns the key ONCE.
+
+    Optional `kind` in the request body records which wire format/upstream
+    family the key is meant for (e.g. "openai", "anthropic" -- see
+    OverlayManager.KNOWN_KEY_KINDS for the recommended set). Purely
+    informational: it does not restrict which endpoint or route the key can
+    actually call. Defaults to "openai" for backward compatibility with
+    keys generated before this field existed.
+    """
     body = await request.json()
     tenant_id = body.get("tenant_id", "anonymous")
     scope = body.get("scope", ["user"])
+    kind = body.get("kind", "openai")
+    if isinstance(kind, str):
+        # Mirror OverlayManager.generate_key()'s own normalization so the
+        # response (and the value the caller sees) matches what actually
+        # got stored, instead of echoing back the pre-normalization input.
+        kind = kind.strip().lower()
     mgr = request.app["overlay_manager"]
     try:
-        key = mgr.generate_key(tenant_id, scope)
+        key = mgr.generate_key(tenant_id, scope, kind)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
     await _apply_runtime_config(request.app, request.app["conf_mgr"].current())
-    return web.json_response({"key": key, "tenant_id": tenant_id, "scope": scope}, status=201)
+    return web.json_response({"key": key, "tenant_id": tenant_id, "scope": scope, "kind": kind}, status=201)
 
 
 async def admin_list_keys(request: web.Request):
@@ -3034,18 +3211,18 @@ async def get_metrics(request: web.Request):
     # Live gauges
     pool = request.app["endpoint_pool"]
     for name, count in pool.all_inflight().items():
-        reg.set_gauge("glint_endpoint_inflight", {"endpoint": name}, count)
+        reg.set_gauge("ctrl_gateway_endpoint_inflight", {"endpoint": name}, count)
     for name, state in circuit.registry().all_states().items():
-        reg.set_gauge("glint_breaker_open", {"endpoint": name}, 1.0 if state == "OPEN" else 0.0)
+        reg.set_gauge("ctrl_gateway_breaker_open", {"endpoint": name}, 1.0 if state == "OPEN" else 0.0)
     try:
-        reg.set_gauge("glint_review_queue_depth", {}, float(memory.review_stats().get("pending", 0)))
+        reg.set_gauge("ctrl_gateway_review_queue_depth", {}, float(memory.review_stats().get("pending", 0)))
     except Exception:
         pass
     return web.Response(text=reg.render(), content_type="text/plain; version=0.0.4")
 
 
 async def root_index(request: web.Request):
-    return web.Response(text="Glint-V2 Gateway. See /dashboard for the live SPA.", content_type="text/plain")
+    return web.Response(text="CTRL Gateway. See /dashboard for the live SPA.", content_type="text/plain")
 
 
 async def dashboard_spa(request: web.Request):
