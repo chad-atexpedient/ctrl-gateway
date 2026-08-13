@@ -1026,6 +1026,11 @@ async def chat_completions(request: web.Request, wire_format: str = "openai") ->
                 circuit.registry().get(ep["name"], _breaker_config(ep)) for ep in conf.config.get("endpoints", [])
             ]}
             requested_model = body.get("model", "gateway")
+            # Fetched lazily below (cost-first/budget-aware path may already
+            # populate it); left None here so every other routing path can
+            # still reach the plan-allowed_models choke point right before
+            # dispatch without re-fetching when it's already known.
+            plan_quota: dict | None = None
             direct_decision = _direct_model_route(
                 conf, requested_model, tenant_mgr, tenant_id, breaker_states,
             )
@@ -1142,6 +1147,17 @@ async def chat_completions(request: web.Request, wire_format: str = "openai") ->
                     decision.endpoint = _first_endpoint_for_tier(conf, accessible, breaker_states)
                     decision.rationale += "; downgraded for tenant access"
                     decision.source = decision.source + "_tenant_access"
+                else:
+                    # Tenant's tier_access no longer overlaps with any
+                    # configured tier at all — there is nothing accessible to
+                    # downgrade to. Reject instead of silently proceeding on
+                    # the router's original (inaccessible) tier.
+                    return _openai_error(
+                        "tier_not_accessible",
+                        "Your account does not have access to any configured model tier.",
+                        403,
+                        error_type="invalid_request_error",
+                    )
 
             # Working-memory tier inheritance (only when cost-first chose the tier,
             # and never when a compaction redirect already escalated for context).
@@ -1391,6 +1407,29 @@ async def chat_completions(request: web.Request, wire_format: str = "openai") ->
             tier_cfg = conf.tier(decision.tier)
             if not endpoint_cfg or not tier_cfg:
                 return _openai_error("invalid_routing_decision", "No valid upstream route is available.", 500, error_type="server_error")
+
+            # Plan-based allowed_models enforcement — single choke point every
+            # routing path passes through right before dispatch. Previously
+            # plan_allowed_endpoint() was only consulted inside
+            # budget_aware_route()'s eligibility filter, so a directly-named
+            # model (_direct_model_route), a deterministic pre_route match
+            # (vision/medical/freshness/structural-prototype/override), or
+            # budget_aware_route's own no-fit escalation branch (which returns
+            # before its eligibility filter runs) could all bypass a tenant's
+            # plan.allowed_models restriction. decision.endpoint is final by
+            # this point (post tier-access downgrade, working-memory
+            # inheritance, context-capacity redirect, swarm/translation
+            # overrides), so this is the last point before the request is
+            # actually sent.
+            if plan_quota is None:
+                plan_quota = await asyncio.to_thread(memory.get_tenant_plan_quota, tenant_id)
+            if not policy_mod.plan_allowed_endpoint(plan_quota, decision.endpoint):
+                return _openai_error(
+                    "model_not_allowed",
+                    f"model '{decision.endpoint}' is not included in your plan's allowed models.",
+                    403,
+                    error_type="invalid_request_error",
+                )
 
             # Assemble messages with memory context (Mastra-style pipeline)
             forwarded_body = dict(body)
@@ -1734,19 +1773,62 @@ async def chat_completions(request: web.Request, wire_format: str = "openai") ->
                     reviewer.enqueue_for_review,
                     decision_id, tenant_id, cost_estimate=actual_cost, prompt_text=text,
                 )
-                # Record usage
-                await asyncio.to_thread(
-                    tenant_mgr.settle_usage,
-                    tenant_id,
-                    reserved_tokens_in=ctx.estimated_input_tokens,
-                    reserved_tokens_out=ctx.estimated_output_tokens,
-                    reserved_cost_usd=decision.cost_usd,
-                    actual_tokens_in=int(usage.get("prompt_tokens", 0)),
-                    actual_tokens_out=int(usage.get("completion_tokens", 0)),
-                    actual_cost_usd=actual_cost,
-                    completed=True,
-                    endpoint_name=actual_endpoint,
-                )
+                # Record usage. reserve_usage() above was booked under
+                # decision.endpoint (the originally-chosen endpoint) before
+                # dispatch. If _forward_with_fallback actually served the
+                # request from a different endpoint (used_fallback), settling
+                # the real usage directly under actual_endpoint here (as the
+                # single call below used to do unconditionally) would leave a
+                # phantom reservation on decision.endpoint that never gets
+                # reversed, AND make actual_endpoint's per-model daily counter
+                # (which, unlike the tenant-wide total, DOES filter by
+                # endpoint_name) go negative, since it never had a
+                # reservation to begin with. Move the reservation instead:
+                # first zero out decision.endpoint's reserved tokens/cost
+                # (completed=True + actual=0 nets a pure release without
+                # double-counting the request_count, which stays attributed
+                # to decision.endpoint from the original reserve_usage()
+                # call), then settle the real usage under actual_endpoint
+                # against a zero reservation there so its delta equals the
+                # actual usage exactly.
+                if used_fallback:
+                    await asyncio.to_thread(
+                        tenant_mgr.settle_usage,
+                        tenant_id,
+                        reserved_tokens_in=ctx.estimated_input_tokens,
+                        reserved_tokens_out=ctx.estimated_output_tokens,
+                        reserved_cost_usd=decision.cost_usd,
+                        actual_tokens_in=0,
+                        actual_tokens_out=0,
+                        actual_cost_usd=0.0,
+                        completed=True,
+                        endpoint_name=decision.endpoint,
+                    )
+                    await asyncio.to_thread(
+                        tenant_mgr.settle_usage,
+                        tenant_id,
+                        reserved_tokens_in=0,
+                        reserved_tokens_out=0,
+                        reserved_cost_usd=0.0,
+                        actual_tokens_in=int(usage.get("prompt_tokens", 0)),
+                        actual_tokens_out=int(usage.get("completion_tokens", 0)),
+                        actual_cost_usd=actual_cost,
+                        completed=True,
+                        endpoint_name=actual_endpoint,
+                    )
+                else:
+                    await asyncio.to_thread(
+                        tenant_mgr.settle_usage,
+                        tenant_id,
+                        reserved_tokens_in=ctx.estimated_input_tokens,
+                        reserved_tokens_out=ctx.estimated_output_tokens,
+                        reserved_cost_usd=decision.cost_usd,
+                        actual_tokens_in=int(usage.get("prompt_tokens", 0)),
+                        actual_tokens_out=int(usage.get("completion_tokens", 0)),
+                        actual_cost_usd=actual_cost,
+                        completed=True,
+                        endpoint_name=actual_endpoint,
+                    )
                 if memory_enabled:
                     _maybe_force_observe(request.app, tenant_id, session_id)
                 events.emit_status(

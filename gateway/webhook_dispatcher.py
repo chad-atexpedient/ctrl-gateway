@@ -171,15 +171,19 @@ class WebhookDispatcher:
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             from . import ssrf
-            # connector re-checks the SSRF policy at actual connect time,
-            # closing the TOCTOU/DNS-rebinding gap the validate_url() call
-            # in _deliver_with_retry() below can't close on its own (see
-            # ssrf.SSRFSafeResolver). This session is reused across
-            # deliveries to many different webhook URLs; policy is the same
-            # fixed one for all of them, so one shared connector is fine.
+            # ssrf_client_kwargs() bundles the connect-time-DNS-rebinding
+            # -safe connector (closing the TOCTOU/DNS-rebinding gap the
+            # validate_url() call in _deliver_with_retry() below can't close
+            # on its own — see ssrf.SSRFSafeResolver) with a redirect-target
+            # guard (closing the separate gap where a webhook endpoint's 3xx
+            # response redirects to a blocked target — see
+            # ssrf.redirect_guard_trace_config). This session is reused
+            # across deliveries to many different webhook URLs; policy is
+            # the same fixed one for all of them, so one shared session is
+            # fine.
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=self.delivery_timeout_seconds),
-                connector=ssrf.safe_connector(allow_localhost=True, allow_private=True),
+                **ssrf.ssrf_client_kwargs(allow_localhost=True, allow_private=True),
             )
         return self._session
 

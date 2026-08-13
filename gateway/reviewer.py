@@ -225,6 +225,24 @@ class ReviewQueueWorker:
             user_payload += f"[{i}] {p}\n\n"
 
         try:
+            from . import ssrf
+
+            request_url = f"{endpoint.rstrip('/')}/chat/completions"
+            # endpoint is admin-configured (gateway-config.json ->
+            # reviewer.endpoint), not a hardcoded gateway-internal URL, so it
+            # gets the same SSRF policy as every other admin-configured
+            # integration in this codebase (allow_localhost=True,
+            # allow_private=True is intentional here for local/self-hosted
+            # reviewer setups — only the DNS-rebinding/redirect-bypass gaps
+            # around that policy need closing, not the policy itself).
+            try:
+                ssrf.validate_url(request_url, allow_localhost=True, allow_private=True)
+            except ssrf.SSRFBlockedURL as e:
+                log.warning("reviewer endpoint SSRF blocked %s: %s", request_url, e.reason)
+                for it in items:
+                    memory.complete_review(it["id"], status="failed", error=f"ssrf_blocked: {e.reason}")
+                return
+
             timeout = aiohttp.ClientTimeout(total=timeout_s)
             headers = {"Content-Type": "application/json"}
             if api_key:
@@ -239,8 +257,15 @@ class ReviewQueueWorker:
                 "stream": False,
                 "response_format": {"type": "json_object"},
             }
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(f"{endpoint.rstrip('/')}/chat/completions", headers=headers, json=body) as resp:
+            # ssrf_client_kwargs() bundles the connect-time-DNS-rebinding
+            # -safe connector with a redirect-target guard, closing the gaps
+            # the validate_url() pre-check above can't close on its own
+            # (see ssrf.SSRFSafeResolver / ssrf.redirect_guard_trace_config).
+            async with aiohttp.ClientSession(
+                timeout=timeout,
+                **ssrf.ssrf_client_kwargs(allow_localhost=True, allow_private=True),
+            ) as session:
+                async with session.post(request_url, headers=headers, json=body) as resp:
                     if resp.status != 200:
                         text = await resp.text()
                         log.warning("reviewer API HTTP %d: %s", resp.status, text[:200])

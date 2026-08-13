@@ -35,6 +35,7 @@ Contract (adapted from mcpchad for aiohttp):
 from __future__ import annotations
 
 import asyncio
+import functools
 import importlib.util
 import logging
 import threading
@@ -42,6 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import attr
 import yaml
 from aiohttp import web
 
@@ -50,6 +52,13 @@ from . import events as events_mod
 from . import memory
 
 log = logging.getLogger("ctrl.plugin")
+
+# Vocabulary for manifest auth.scope, matching auth.py's request["auth_scope"]
+# set (populated by auth_middleware from each API key's configured "scope"
+# list — see auth.py's module docstring). "admin" keys are treated as a
+# superset of "user" for plugin-route purposes, same as admin_paths in
+# auth.py implicitly are (an admin key satisfies any admin_paths check).
+VALID_PLUGIN_AUTH_SCOPES = ("admin", "user", "anonymous")
 
 
 @dataclass
@@ -122,6 +131,58 @@ class PluginContext:
 
     def get_setting(self, key: str, default: Any = None) -> Any:
         return self.manifest.get("settings", {}).get(key, default)
+
+
+def _plugin_scope_allows(request: web.Request, required_scope: str) -> bool:
+    """Check the authenticated caller's resolved scope (auth.py's
+    request["auth_scope"], a set like {"admin"} or {"admin", "user"}) against
+    a plugin manifest's declared auth.scope requirement.
+
+    "anonymous" means the route is intentionally open to anyone (including
+    callers with no resolved identity at all) — the plugin-manifest
+    equivalent of a public path. "user"/"admin" both require a resolved
+    identity: if auth is disabled, the path is public, or the caller is an
+    unauthenticated fallback with no scope info at all, request["auth_scope"]
+    is missing — treated as no-access rather than silently allowed, since
+    there is nothing to actually check the requirement against.
+    """
+    if required_scope == "anonymous":
+        return True
+    granted = request.get("auth_scope")
+    if not granted:
+        return False
+    if required_scope == "admin":
+        return "admin" in granted
+    if required_scope == "user":
+        return "user" in granted or "admin" in granted
+    return False
+
+
+def _wrap_route_for_scope(route_def, plugin_name: str, required_scope: str):
+    """Return a new RouteDef whose handler enforces required_scope before
+    delegating to the plugin's real handler.
+
+    aiohttp's RouteDef (built via attr.s(frozen=True)) can't have its
+    `handler` field reassigned in place, so this constructs a replacement
+    RouteDef via attr.evolve() with only the handler swapped — the route's
+    method/path/kwargs are unchanged, and this happens once at load time
+    (before self.app.add_routes()), not per-request.
+    """
+    original_handler = route_def.handler
+
+    @functools.wraps(original_handler)
+    async def _scope_enforced_handler(request: web.Request, *args, **kwargs):
+        if not _plugin_scope_allows(request, required_scope):
+            return web.json_response(
+                {
+                    "error": "unauthorized",
+                    "detail": f"plugin '{plugin_name}' route requires auth scope '{required_scope}'",
+                },
+                status=403,
+            )
+        return await original_handler(request, *args, **kwargs)
+
+    return attr.evolve(route_def, handler=_scope_enforced_handler)
 
 
 class PluginLoader:
@@ -208,6 +269,33 @@ class PluginLoader:
         if routes is None:
             self._record_error(name, directory, manifest, prefix, "build_router returned None")
             return False
+        # Enforce the manifest's declared auth.scope (admin | user |
+        # anonymous), if any. Previously this field was parsed only for
+        # display (LoadedPlugin.summary()) and never actually gated route
+        # access — any plugin route was reachable by whatever the gateway's
+        # own path-level auth (auth.py's admin_paths / public_paths) already
+        # allowed, regardless of what the plugin itself declared. A manifest
+        # with no "auth" section at all keeps the old, unenforced behavior
+        # (routes registered as-is) for backward compatibility with existing
+        # plugins.
+        auth_section = manifest.get("auth")
+        if auth_section is not None:
+            if not isinstance(auth_section, dict) or "scope" not in auth_section:
+                self._record_error(
+                    name, directory, manifest, prefix,
+                    "manifest auth section must be a mapping with a 'scope' key",
+                )
+                return False
+            required_scope = auth_section.get("scope")
+            if required_scope not in VALID_PLUGIN_AUTH_SCOPES:
+                self._record_error(
+                    name, directory, manifest, prefix,
+                    f"invalid auth.scope {required_scope!r}; must be one of {VALID_PLUGIN_AUTH_SCOPES}",
+                )
+                return False
+            routes = [
+                _wrap_route_for_scope(rd, name, required_scope) for rd in routes
+            ]
         try:
             self.app.add_routes(list(routes))
         except Exception as e:

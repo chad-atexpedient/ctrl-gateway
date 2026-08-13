@@ -26,6 +26,7 @@ from typing import Any
 import aiohttp
 
 from . import memory
+from . import tenant as tenant_mod
 
 log = logging.getLogger("ctrl.a2a")
 
@@ -223,6 +224,29 @@ async def invoke_agent(
     invoke_agent and surfaces the cached flag itself; direct callers do
     not see this distinction in the typed result.
     """
+    # Rate-limit enforcement. A2A invocations previously had no budget or
+    # rate-limiting check at all before doing work — an agent could be
+    # invoked without bound. There's no per-request cost model for A2A
+    # anywhere in the codebase (tenant.py has no A2A-specific pricing), so
+    # this doesn't invent one; it wires in the same tenant-wide token-bucket
+    # rate limiter chat_completions() already consults via
+    # tenant_mgr.check_rate_limit() before doing any work, as a minimum
+    # guard against unbounded invocation volume.
+    try:
+        _tenant_mgr = tenant_mod.manager()
+    except RuntimeError:
+        _tenant_mgr = None
+    if _tenant_mgr is not None:
+        try:
+            _tenant_mgr.check_rate_limit(tenant_id)
+        except tenant_mod.RateLimited as e:
+            return A2AResult(
+                success=False,
+                response=None,
+                latency_ms=0.0,
+                error=f"rate_limited: retry after {e.retry_after_seconds:.1f}s",
+                status_code=429,
+            )
     # Tool cache lookup (only for non-streaming invoke interactions).
     if use_cache and interaction_type == "invoke":
         from . import tool_cache as _tc_mod
@@ -258,12 +282,19 @@ async def invoke_agent(
     started = time.monotonic()
     owns_session = False
     if session is None:
-        # connector re-checks the SSRF policy at actual connect time, closing
-        # the TOCTOU/DNS-rebinding gap the validate_url() call above can't
-        # close on its own (see ssrf.SSRFSafeResolver).
+        # ssrf_client_kwargs() bundles both the connector (re-checks the SSRF
+        # policy at actual connect time, closing the TOCTOU/DNS-rebinding gap
+        # the validate_url() call above can't close on its own — see
+        # ssrf.SSRFSafeResolver) AND a redirect-target guard (a 3xx from the
+        # agent could otherwise point at a blocked target that the connector
+        # alone would never see, since aiohttp skips the custom resolver for
+        # IP-literal redirect hosts).
         session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=timeout_seconds),
-            connector=ssrf.safe_connector(allow_localhost=True, allow_private=True),
+            **ssrf.ssrf_client_kwargs(
+                allow_localhost=True,
+                allow_private=True,
+                timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+            ),
         )
         owns_session = True
     try:

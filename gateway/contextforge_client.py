@@ -35,7 +35,7 @@ from typing import Any
 
 import aiohttp
 
-from . import a2a_registry, memory
+from . import a2a_registry, memory, security
 
 log = logging.getLogger("ctrl.contextforge")
 
@@ -86,16 +86,23 @@ class ContextForgeClient:
             if self.api_key:
                 headers["Authorization"] = f"Bearer {self.api_key}"
             from . import ssrf
-            # connector re-checks the SSRF policy at actual connect time,
-            # closing the TOCTOU/DNS-rebinding gap the validate_url() call
-            # in _fetch() below can't close on its own (see
-            # ssrf.SSRFSafeResolver). This session is reused across many
-            # requests to the same configured external_url, so one shared
-            # connector is fine here.
+            # ssrf_client_kwargs() bundles both the connector (re-checks the
+            # SSRF policy at actual connect time, closing the
+            # TOCTOU/DNS-rebinding gap the validate_url() call in _fetch()
+            # below can't close on its own — see ssrf.SSRFSafeResolver) AND a
+            # redirect-target guard (a 3xx from the external ContextForge
+            # instance could otherwise point at a blocked target that the
+            # connector alone would never see, since aiohttp skips the
+            # custom resolver for IP-literal redirect hosts). This session is
+            # reused across many requests to the same configured
+            # external_url, so one shared connector is fine here.
             self._session = aiohttp.ClientSession(
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=self.timeout_seconds),
-                connector=ssrf.safe_connector(allow_localhost=True, allow_private=True),
+                **ssrf.ssrf_client_kwargs(
+                    allow_localhost=True,
+                    allow_private=True,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=self.timeout_seconds),
+                ),
             )
         return self._session
 
@@ -191,6 +198,82 @@ class ContextForgeClient:
             log.warning("fetch_prompts: %s", e)
             return []
 
+    # ----- Injection sanitization for externally-sourced content -----
+    #
+    # Everything pulled from an external ContextForge server (tool
+    # descriptions, prompt template text, agent descriptions) is stored and
+    # later served into the gateway's own LLM-facing pipeline (MCP clients,
+    # prompt auto-injection into system messages). An external ContextForge
+    # instance is admin-configured but not necessarily trusted content —
+    # this reuses gateway.security's existing profile-based injection
+    # detector (the same mechanism app.py's chat_completions() applies to
+    # user prompts via security.check_injection_with_action()) rather than
+    # syncing this content completely unscanned.
+
+    def _load_injection_profiles(self) -> list[security.InjectionProfile]:
+        try:
+            db_profiles = memory.list_injection_profiles(True)
+        except Exception as e:
+            log.warning("load injection profiles for contextforge sync failed: %s", e)
+            db_profiles = []
+        profiles: list[security.InjectionProfile] = []
+        for row in db_profiles:
+            try:
+                profiles.append(security.InjectionProfile.from_config(
+                    name=row["name"],
+                    regexes=row.get("regexes", []),
+                    severity=row.get("severity", "medium"),
+                    action=row.get("action", "alert"),
+                    enabled=row.get("enabled", True),
+                    is_builtin=row.get("is_builtin", False),
+                ))
+            except Exception as e:
+                log.warning("skip invalid injection profile %r: %s", row.get("name"), e)
+        if not profiles:
+            # No DB-configured profiles yet (never seeded, or injection
+            # detection disabled) — fall back to the built-in defaults
+            # rather than syncing external content completely unscanned.
+            profiles = security.build_default_profiles()
+        return profiles
+
+    def _scan_content(
+        self,
+        profiles: list[security.InjectionProfile],
+        text: str,
+        label: str,
+    ) -> tuple[bool, str, str | None]:
+        """Scan one piece of externally-sourced text before it's stored.
+
+        Returns (blocked, text_to_store, reason). High-severity matches
+        whose profile action is "block" exclude the item from being synced
+        (the caller records a sync error and skips it). Lower-severity
+        matches (alert/log) are recorded as a security event but still sync,
+        with any detected control tokens stripped from the stored text.
+        """
+        if not text:
+            return False, text, None
+        result = security.check_injection_with_action(text, profiles, strip_control_tokens=True)
+        if not result.has_injection:
+            return False, text, None
+        top = result.matched_profiles[0] if result.matched_profiles else {"name": "unknown", "pattern": ""}
+        reason = f"{label}: injection signal ({top.get('name')}, severity={result.severity})"
+        try:
+            memory.record_security_event(
+                "__contextforge_sync__",
+                "injection_blocked" if result.action == "block" else "injection_alerted",
+                result.severity,
+                reason,
+                matched_pattern=str(top.get("pattern", ""))[:256],
+                query_preview=text[:1000],
+                action_taken=result.action,
+                request_metadata={"source": "contextforge_sync", "label": label},
+            )
+        except Exception as e:
+            log.warning("record security event (contextforge sync) failed: %s", e)
+        if result.action == "block":
+            return True, text, reason
+        return False, result.sanitized_text, reason
+
     # ----- Sync engine: merge into local registries -----
 
     async def sync_all(self) -> dict[str, SyncResult]:
@@ -257,6 +340,7 @@ class ContextForgeClient:
     def _merge_agents(self, items: list[dict]) -> dict[str, Any]:
         synced = added = updated = 0
         errors: list[str] = []
+        profiles = self._load_injection_profiles()
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -264,6 +348,14 @@ class ContextForgeClient:
             if not name:
                 continue
             try:
+                blocked, safe_description, reason = self._scan_content(
+                    profiles, item.get("description", ""), f"a2a agent '{name}' description",
+                )
+                if blocked:
+                    errors.append(f"agent {name}: excluded from sync ({reason})")
+                    continue
+                item = dict(item)
+                item["description"] = safe_description
                 existing = a2a_registry.get_agent_by_name(str(name))
                 if existing:
                     a2a_registry.register_agent(
@@ -350,6 +442,7 @@ class ContextForgeClient:
     def _merge_tools(self, items: list[dict]) -> dict[str, Any]:
         synced = added = updated = 0
         errors: list[str] = []
+        profiles = self._load_injection_profiles()
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -357,6 +450,14 @@ class ContextForgeClient:
             if not name:
                 continue
             try:
+                blocked, safe_description, reason = self._scan_content(
+                    profiles, item.get("description", ""), f"tool '{name}' description",
+                )
+                if blocked:
+                    errors.append(f"tool {name}: excluded from sync ({reason})")
+                    continue
+                item = dict(item)
+                item["description"] = safe_description
                 existing = memory.get_federated_tool(str(name))
                 memory.upsert_federated_tool(
                     name=str(name),
@@ -377,6 +478,7 @@ class ContextForgeClient:
     def _merge_prompts(self, items: list[dict]) -> dict[str, Any]:
         synced = added = updated = 0
         errors: list[str] = []
+        profiles = self._load_injection_profiles()
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -387,14 +489,30 @@ class ContextForgeClient:
                 template_text = item.get("template") or item.get("template_text") or item.get("content")
                 if not template_text:
                     continue
+                # Prompt template text is the highest-risk field here: it
+                # gets injected directly into LLM system messages (see
+                # prompt_registry.py / app.py's auto-inject path), so a
+                # block-level match excludes the whole template from sync.
+                blocked, safe_template_text, reason = self._scan_content(
+                    profiles, str(template_text), f"prompt template '{name}' text",
+                )
+                if blocked:
+                    errors.append(f"prompt {name}: excluded from sync ({reason})")
+                    continue
+                desc_blocked, safe_description, desc_reason = self._scan_content(
+                    profiles, item.get("description", ""), f"prompt template '{name}' description",
+                )
+                if desc_blocked:
+                    errors.append(f"prompt {name}: excluded from sync ({desc_reason})")
+                    continue
                 variables = item.get("variables", [])
                 if isinstance(variables, list) and variables and isinstance(variables[0], dict):
                     variables = [v.get("name", "") for v in variables if isinstance(v, dict)]
                 existing = memory.get_prompt_template_by_name(str(name))
                 memory.upsert_prompt_template(
                     name=str(name),
-                    description=item.get("description", ""),
-                    template_text=str(template_text),
+                    description=safe_description,
+                    template_text=safe_template_text,
                     variables=variables if isinstance(variables, list) else [],
                     category=item.get("category", "contextforge"),
                     enabled=item.get("enabled", True),

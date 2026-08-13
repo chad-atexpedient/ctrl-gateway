@@ -1734,6 +1734,19 @@ def reserve_usage(
         return False, f"max_request_tokens {max_request_tokens} exceeded (estimated {estimated_tokens})"
 
     with begin() as conn:
+        if engine().dialect.name == "sqlite":
+            # SQLite's default (deferred) transaction mode does not take a
+            # lock on SELECT — only on the first write — so concurrent
+            # requests can all read the same "current usage" total, all
+            # decide they're under budget, and all proceed, overspending it.
+            # Issuing BEGIN IMMEDIATE as the very first statement forces
+            # SQLite to acquire the RESERVED lock immediately, serializing
+            # concurrent reservation transactions. This is SQLite's
+            # equivalent of `SELECT ... FOR UPDATE`, which it doesn't
+            # support. Must be the first statement executed on this
+            # connection/transaction — the with_for_update() below is the
+            # real row-lock equivalent on Postgres, which doesn't need this.
+            conn.exec_driver_sql("BEGIN IMMEDIATE")
         user_q = select(users.c.tenant_id).where(users.c.tenant_id == tenant_id)
         if engine().dialect.name != "sqlite":
             user_q = user_q.with_for_update()

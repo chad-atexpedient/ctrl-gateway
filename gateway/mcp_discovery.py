@@ -193,13 +193,17 @@ async def discover(
     candidates = [f"http://{h}:{p}" for h in hosts for p in ports]
     discovered: list[DiscoveredServer] = []
     from . import ssrf
-    # connector re-checks the SSRF policy at actual connect time, closing the
-    # TOCTOU/DNS-rebinding gap the validate_url() call in _probe_one() below
-    # can't close on its own (see ssrf.SSRFSafeResolver). One shared
-    # connector for the whole probe batch is fine — policy is the same for
-    # every candidate.
-    connector = ssrf.safe_connector(allow_localhost=True, allow_private=True)
-    async with aiohttp.ClientSession(connector=connector) as session:
+    # ssrf_client_kwargs() bundles the connect-time-DNS-rebinding-safe
+    # connector with a redirect-target guard, closing the TOCTOU/DNS
+    # -rebinding gap the validate_url() call in _probe_one() below can't
+    # close on its own (see ssrf.SSRFSafeResolver) as well as the
+    # redirect-to-blocked-target gap neither validate_url() nor the
+    # connector alone can catch (see ssrf.redirect_guard_trace_config). One
+    # shared session for the whole probe batch is fine — policy is the same
+    # for every candidate.
+    async with aiohttp.ClientSession(
+        **ssrf.ssrf_client_kwargs(allow_localhost=True, allow_private=True)
+    ) as session:
         results = await asyncio.gather(
             *(_probe_one(session, url) for url in candidates),
             return_exceptions=True,

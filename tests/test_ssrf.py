@@ -241,5 +241,119 @@ class SafeConnectorTests(unittest.TestCase):
         _run(build())
 
 
+class RedirectGuardTests(unittest.TestCase):
+    """redirect_guard_trace_config() / ssrf_client_kwargs(): validate_url()
+    checks a URL once before the request, and SSRFSafeResolver re-checks at
+    DNS-resolution time, but neither catches a same-request 3xx redirect to
+    a blocked target. This is especially dangerous for IP-literal redirect
+    targets, since aiohttp special-cases IP-literal hosts and skips the
+    custom resolver entirely for them -- SSRFSafeResolver can't see that hop
+    at all, so only a redirect-time check closes the gap. Uses a real
+    aiohttp TestServer (not mocks) so the on_request_redirect trace signal
+    fires exactly as it would in production.
+    """
+
+    def test_redirect_to_link_local_metadata_ip_is_blocked(self):
+        from aiohttp import web
+        from aiohttp.test_utils import TestServer
+        import aiohttp
+
+        async def scenario():
+            async def go(request):
+                raise web.HTTPFound("http://169.254.169.254/latest/meta-data/")
+
+            app = web.Application()
+            app.router.add_get("/go", go)
+            server = TestServer(app)
+            await server.start_server()
+            try:
+                kwargs = ssrf.ssrf_client_kwargs(allow_localhost=True, allow_private=True)
+                async with aiohttp.ClientSession(**kwargs) as session:
+                    with self.assertRaises(ssrf.SSRFBlockedURL) as ctx:
+                        async with session.get(server.make_url("/go")):
+                            pass
+                    self.assertIn("link-local", ctx.exception.reason)
+            finally:
+                await server.close()
+
+        _run(scenario())
+
+    def test_redirect_to_ip_literal_private_address_is_blocked(self):
+        from aiohttp import web
+        from aiohttp.test_utils import TestServer
+        import aiohttp
+
+        async def scenario():
+            async def go(request):
+                raise web.HTTPFound("http://10.1.2.3/secret")
+
+            app = web.Application()
+            app.router.add_get("/go", go)
+            server = TestServer(app)
+            await server.start_server()
+            try:
+                # allow_private=False (the common policy for e.g. webhook
+                # delivery) -- the initial request is fine, but the redirect
+                # target is an IP-literal private address aiohttp would
+                # otherwise follow without ever consulting the custom
+                # resolver.
+                kwargs = ssrf.ssrf_client_kwargs(allow_localhost=True, allow_private=False)
+                async with aiohttp.ClientSession(**kwargs) as session:
+                    with self.assertRaises(ssrf.SSRFBlockedURL) as ctx:
+                        async with session.get(server.make_url("/go")):
+                            pass
+                    self.assertIn("private", ctx.exception.reason)
+            finally:
+                await server.close()
+
+        _run(scenario())
+
+    def test_normal_same_origin_relative_redirect_still_succeeds(self):
+        """No false positives: a same-origin relative redirect (the common,
+        legitimate case) must not be blocked."""
+        from aiohttp import web
+        from aiohttp.test_utils import TestServer
+        import aiohttp
+
+        async def scenario():
+            async def go(request):
+                raise web.HTTPFound("/landed")
+
+            async def landed(request):
+                return web.Response(text="ok")
+
+            app = web.Application()
+            app.router.add_get("/go", go)
+            app.router.add_get("/landed", landed)
+            server = TestServer(app)
+            await server.start_server()
+            try:
+                kwargs = ssrf.ssrf_client_kwargs(allow_localhost=True, allow_private=True)
+                async with aiohttp.ClientSession(**kwargs) as session:
+                    async with session.get(server.make_url("/go")) as resp:
+                        self.assertEqual(resp.status, 200)
+                        self.assertEqual(await resp.text(), "ok")
+            finally:
+                await server.close()
+
+        _run(scenario())
+
+
+class SSRFClientKwargsTests(unittest.TestCase):
+    def test_bundles_connector_and_trace_config(self):
+        import aiohttp
+
+        async def build():
+            kwargs = ssrf.ssrf_client_kwargs(allow_localhost=True, allow_private=True)
+            self.assertIn("connector", kwargs)
+            self.assertIn("trace_configs", kwargs)
+            self.assertIsInstance(kwargs["connector"], aiohttp.TCPConnector)
+            self.assertEqual(len(kwargs["trace_configs"]), 1)
+            async with aiohttp.ClientSession(**kwargs) as session:
+                self.assertIsNotNone(session)
+
+        _run(build())
+
+
 if __name__ == "__main__":
     unittest.main()

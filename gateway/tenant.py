@@ -92,26 +92,45 @@ class TenantManager:
         self._states: dict[str, TenantState] = {}
         self._lock = threading.Lock()
 
+    def _cfg_or_default(self, cfg: dict, key: str, default_value):
+        """Return cfg[key] if the key is explicitly present (not None),
+        else fall back to self._default[key], else default_value.
+
+        Deliberately uses `is None` rather than truthiness: several of
+        these fields have a legitimate, intentional value of 0 or [] that
+        is semantically distinct from "unset" — e.g. tier_access=[]
+        (explicitly restrict a tenant to zero tiers), concurrent_limit=0
+        (hard-block: asyncio.Semaphore(0) never admits a request),
+        rps_limit=0 / tokens_per_min=0 / budget_usd_per_day=0 /
+        daily_token_limit=0 (explicitly "unlimited", overriding a
+        non-zero default). A truthiness check (`cfg.get(key) or default`)
+        can't distinguish any of those explicit values from "key absent"
+        and silently replaces them with the default instead.
+        """
+        value = cfg.get(key)
+        if value is not None:
+            return value
+        return self._default.get(key, default_value)
+
     def _build_state(self, tenant_id: str, cfg: dict) -> TenantState:
         tier_access = cfg.get("tier_access")
         if isinstance(tier_access, str):
             import json
             tier_access = json.loads(tier_access) if tier_access else []
-        elif not tier_access:
+        elif tier_access is None:
             tier_access = self._default.get("tier_access", [])
-        rps = int(cfg.get("rps_limit") or self._default.get("rps_limit", 100))
-        conc = int(cfg.get("concurrent_limit") or self._default.get("concurrent_limit", 20))
+        rps = int(self._cfg_or_default(cfg, "rps_limit", 100))
+        conc = int(self._cfg_or_default(cfg, "concurrent_limit", 20))
         return TenantState(
             tenant_id=tenant_id,
             tier_access=tier_access,
-            budget_usd_per_day=float(cfg.get("budget_usd_per_day") or self._default.get("budget_usd_per_day", 1.0)),
+            budget_usd_per_day=float(self._cfg_or_default(cfg, "budget_usd_per_day", 1.0)),
             rps_limit=rps,
             concurrent_limit=conc,
-            tokens_per_min=int(cfg.get("tokens_per_min") or self._default.get("tokens_per_min", 200000)),
-            daily_token_limit=int(cfg.get("daily_token_limit") or self._default.get("daily_token_limit", 0)),
+            tokens_per_min=int(self._cfg_or_default(cfg, "tokens_per_min", 200000)),
+            daily_token_limit=int(self._cfg_or_default(cfg, "daily_token_limit", 0)),
             target_success_probability=float(
-                cfg.get("target_success_probability")
-                or self._default.get("target_success_probability", 0.99)
+                self._cfg_or_default(cfg, "target_success_probability", 0.99)
             ),
             plan_id=cfg.get("plan_id"),
             bucket=_TokenBucket(rate_per_sec=rps, capacity=rps * 2),

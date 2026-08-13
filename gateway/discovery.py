@@ -167,8 +167,27 @@ async def test_endpoint(
 
     t0 = time.time()
     try:
+        from . import ssrf
+
+        # base_url comes from the dashboard's "Add Provider" flow — an
+        # admin-configured endpoint, not a hardcoded gateway-internal URL —
+        # so it gets the same SSRF policy as every other admin-configured
+        # integration in this codebase (allow_localhost=True,
+        # allow_private=True is intentional here for local/self-hosted
+        # providers — only the DNS-rebinding/redirect-bypass gaps around
+        # that policy need closing, not the policy itself). Validate the
+        # actual transcoded request URL, since that's what the request will
+        # hit.
+        try:
+            ssrf.validate_url(transcoded.url, allow_localhost=True, allow_private=True)
+        except ssrf.SSRFBlockedURL as e:
+            return {"ok": False, "error": f"blocked by SSRF policy: {e.reason}", "latency_ms": 0}
+
         timeout = aiohttp.ClientTimeout(total=TEST_TIMEOUT)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            **ssrf.ssrf_client_kwargs(allow_localhost=True, allow_private=True),
+        ) as session:
             async with session.post(
                 transcoded.url, headers=transcoded.headers, json=transcoded.body,
             ) as resp:

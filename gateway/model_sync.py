@@ -294,11 +294,16 @@ class ModelSyncEngine:
             return None
         try:
             timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
-            # connector re-checks the SSRF policy at actual connect time,
-            # closing the TOCTOU/DNS-rebinding gap the validate_url() call
-            # above can't close on its own (see ssrf.SSRFSafeResolver).
-            connector = ssrf.safe_connector(allow_localhost=True, allow_private=True)
-            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+            # ssrf_client_kwargs() bundles the connect-time-DNS-rebinding
+            # -safe connector (closing the TOCTOU/DNS-rebinding gap the
+            # validate_url() call above can't close on its own — see
+            # ssrf.SSRFSafeResolver) with a redirect-target guard (closing
+            # the separate gap where a 3xx response redirects to a blocked
+            # target — see ssrf.redirect_guard_trace_config).
+            async with aiohttp.ClientSession(
+                timeout=timeout,
+                **ssrf.ssrf_client_kwargs(allow_localhost=True, allow_private=True),
+            ) as session:
                 async with session.get(url, headers=headers or {}) as resp:
                     if resp.status != 200:
                         log.warning(

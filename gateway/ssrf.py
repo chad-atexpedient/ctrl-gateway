@@ -80,12 +80,22 @@ def _is_blocked_ip(ip_str: str, cfg: SSRFConfig) -> str | None:
         if cfg.allow_localhost:
             return None
         return "loopback address blocked"
+    # Link-local (169.254.x.x — cloud metadata) — checked independently of
+    # (and before) the general private-network check below. Python's
+    # ipaddress module classifies 169.254.0.0/16 as BOTH is_private AND
+    # is_link_local, so if the is_private branch ran first it would block
+    # link-local addresses whenever allow_private=False, even if
+    # allow_link_local=True — making allow_link_local unreachable/useless
+    # under the common policy (allow_private=False). Evaluating
+    # is_link_local on its own branch first keeps the two flags truly
+    # independent.
+    if ip.is_link_local:
+        if cfg.allow_link_local:
+            return None
+        return "link-local address blocked (cloud metadata)"
     # Private (RFC 1918)
     if ip.is_private and not cfg.allow_private:
         return "private network blocked"
-    # Link-local (169.254.x.x — cloud metadata)
-    if ip.is_link_local and not cfg.allow_link_local:
-        return "link-local address blocked (cloud metadata)"
     # Reserved/multicast — note: loopback already handled above
     if ip.is_reserved:
         return "reserved address blocked"
@@ -223,6 +233,103 @@ def safe_connector(
         allow_link_local=allow_link_local,
     )
     return aiohttp.TCPConnector(resolver=SSRFSafeResolver(cfg), **connector_kwargs)
+
+
+def redirect_guard_trace_config(
+    allow_localhost: bool = False,
+    allow_private: bool = False,
+    allow_link_local: bool = False,
+):
+    """Build an aiohttp.TraceConfig that re-validates every redirect target
+    against the SSRF policy before aiohttp follows it.
+
+    Neither validate_url() (a one-time pre-check) nor safe_connector() /
+    SSRFSafeResolver (re-checks at DNS-resolution time) catch a redirect: an
+    admin-configured URL can be safe on the initial request, then have the
+    remote server respond with a 3xx to a blocked target (e.g. the cloud
+    metadata IP, or an IP-literal private address) and aiohttp will follow it
+    by default. An IP-literal redirect target is the most dangerous case,
+    because aiohttp special-cases IP-literal hosts and skips the custom
+    resolver entirely for them — SSRFSafeResolver alone can never see that
+    hop, so this needs an independent guard at the redirect signal itself.
+
+    Note: aiohttp's on_request_redirect trace signal hands you the
+    *pre-redirect* request URL in TraceRequestRedirectParams.url, not the
+    redirect target — the actual target has to be read from the response's
+    Location/URI header and resolved against the request URL (relative
+    redirects are legal), the same way aiohttp's own client internals
+    resolve it before following the hop.
+
+    Raising SSRFBlockedURL from the trace handler propagates out of the
+    request and aborts it — aiohttp trace signals run synchronously as part
+    of the request lifecycle, so an exception raised here is not swallowed.
+    """
+    import aiohttp
+    from yarl import URL
+
+    cfg = SSRFConfig(
+        allow_localhost=allow_localhost,
+        allow_private=allow_private,
+        allow_link_local=allow_link_local,
+    )
+
+    async def _on_request_redirect(session, trace_ctx, params) -> None:
+        location = params.response.headers.get("Location") or params.response.headers.get("URI")
+        if not location:
+            return
+        target = URL(params.url).join(URL(location))
+        reason = None
+        try:
+            validate_url(
+                str(target),
+                allow_localhost=cfg.allow_localhost,
+                allow_private=cfg.allow_private,
+                allow_link_local=cfg.allow_link_local,
+            )
+        except SSRFBlockedURL as e:
+            reason = e.reason
+        if reason:
+            log.warning("SSRF blocked redirect %s -> %s: %s", params.url, target, reason)
+            raise SSRFBlockedURL(str(target), f"redirect target blocked: {reason}")
+
+    trace_config = aiohttp.TraceConfig()
+    trace_config.on_request_redirect.append(_on_request_redirect)
+    return trace_config
+
+
+def ssrf_client_kwargs(
+    allow_localhost: bool = False,
+    allow_private: bool = False,
+    allow_link_local: bool = False,
+    **extra,
+) -> dict:
+    """Bundle a safe connector + redirect guard into kwargs ready to splat
+    into aiohttp.ClientSession(**ssrf.ssrf_client_kwargs(...)).
+
+    This is the recommended way to construct any ClientSession that talks to
+    an admin-configured URL (agents, webhooks, sync sources): it covers all
+    three enforcement points together — the pre-check callers still do
+    separately via validate_url(), connect-time DNS-rebinding protection via
+    safe_connector()/SSRFSafeResolver, and post-response redirect-target
+    validation via redirect_guard_trace_config(). Any extra ClientSession
+    kwargs (timeout, headers, etc.) can be passed through via **extra.
+    """
+    kwargs: dict = dict(extra)
+    kwargs["connector"] = safe_connector(
+        allow_localhost=allow_localhost,
+        allow_private=allow_private,
+        allow_link_local=allow_link_local,
+    )
+    trace_configs = list(kwargs.get("trace_configs") or [])
+    trace_configs.append(
+        redirect_guard_trace_config(
+            allow_localhost=allow_localhost,
+            allow_private=allow_private,
+            allow_link_local=allow_link_local,
+        )
+    )
+    kwargs["trace_configs"] = trace_configs
+    return kwargs
 
 
 def safe_url(
