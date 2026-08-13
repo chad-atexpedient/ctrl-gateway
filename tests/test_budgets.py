@@ -418,6 +418,47 @@ class QualityProfileTests(unittest.TestCase):
         self.assertGreater(p, 0.84)
         self.assertLess(p, 0.95)
 
+    def test_wilson_lower_bound_matches_standard_formula(self):
+        """Regression: `margin` previously multiplied the z-factor (1.96) by
+        _normal_approx_z(0.975) (~1.96) a second time, roughly squaring the
+        z-factor to ~3.84 and making the bound far more conservative than a
+        true 95% Wilson score interval (e.g. ~0.845 instead of ~0.888 for a
+        95/100 sample). The existing loose 0.84 < p < 0.95 check above did
+        not catch this because both the correct and the buggy value happen
+        to fall inside that range. Pin against an independent reimplementation
+        of the textbook formula instead.
+        """
+        from gateway import memory, policy
+        successes, total = 95, 100
+        for _ in range(successes):
+            memory.record_quality_sample("tier1_model", "programming", 3, success=True)
+        for _ in range(total - successes):
+            memory.record_quality_sample("tier1_model", "programming", 3, success=False)
+        p, n = policy.estimate_success_probability(
+            "tier1_model", "programming", 3, min_samples=10,
+        )
+        self.assertEqual(n, total)
+
+        # Independent reimplementation of the Wilson score interval lower bound
+        # (https://en.wikipedia.org/wiki/Binomial_proportion_confidence_interval#Wilson_score_interval).
+        phat = successes / total
+        z = 1.96
+        denom = 1.0 + (z * z) / total
+        center = (phat + (z * z) / (2.0 * total)) / denom
+        margin = z * ((phat * (1.0 - phat) + (z * z) / (4.0 * total)) / total) ** 0.5 / denom
+        expected = center - margin
+        self.assertAlmostEqual(p, expected, places=9)
+
+        # The old doubled-z-factor calc would have landed here instead; pin
+        # against it explicitly so a regression back to that formula fails loudly.
+        buggy_margin = (
+            z * float(policy._normal_approx_z(0.975))
+            * ((phat * (1.0 - phat) + (z * z) / (4.0 * total)) / total) ** 0.5
+            / denom
+        )
+        buggy = center - buggy_margin
+        self.assertNotAlmostEqual(p, buggy, places=3)
+
     def test_imperfect_model_returns_lower_bound(self):
         from gateway import memory, policy
         # 50/100 success rate → lower bound should be well below 0.5

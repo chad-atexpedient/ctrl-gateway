@@ -7,10 +7,10 @@ Each registered webhook subscribes to a list of event_type strings (or
 matching webhook receives a POST with:
 
   - Content-Type: application/json
-  - X-Glint-Event-Type: <event_type>
-  - X-Glint-Event-Id: <id>
-  - X-Glint-Timestamp: <unix_seconds>
-  - X-Glint-Signature: hmac_sha256(secret, payload_json) (when secret is set)
+  - X-Gateway-Event-Type: <event_type>
+  - X-Gateway-Event-Id: <id>
+  - X-Gateway-Timestamp: <unix_seconds>
+  - X-Gateway-Signature: hmac_sha256(secret, payload_json) (when secret is set)
   - Body: { id, type, source, severity, ts, tenant_id, data, ... }
 
 Delivery is async with exponential backoff. Every attempt is logged into
@@ -32,7 +32,7 @@ import aiohttp
 
 from . import memory
 
-log = logging.getLogger("glint.webhook")
+log = logging.getLogger("ctrl.webhook")
 
 
 @dataclass
@@ -170,8 +170,16 @@ class WebhookDispatcher:
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            from . import ssrf
+            # connector re-checks the SSRF policy at actual connect time,
+            # closing the TOCTOU/DNS-rebinding gap the validate_url() call
+            # in _deliver_with_retry() below can't close on its own (see
+            # ssrf.SSRFSafeResolver). This session is reused across
+            # deliveries to many different webhook URLs; policy is the same
+            # fixed one for all of them, so one shared connector is fine.
             self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.delivery_timeout_seconds)
+                timeout=aiohttp.ClientTimeout(total=self.delivery_timeout_seconds),
+                connector=ssrf.safe_connector(allow_localhost=True, allow_private=True),
             )
         return self._session
 
@@ -244,7 +252,10 @@ class WebhookDispatcher:
         last_delivery_id = 0
         last_error = "no attempts"
         last_body = ""
-        # SSRF protection: block private/loopback/link-local webhook targets
+        # SSRF protection: private networks and loopback are intentionally
+        # allowed (self-hosted admins routinely point webhooks at internal
+        # services); link-local/reserved/multicast/unspecified — notably the
+        # 169.254.169.254 cloud-metadata endpoint — are always blocked.
         from . import ssrf
         try:
             ssrf.validate_url(webhook.url, allow_localhost=True, allow_private=True)
@@ -264,13 +275,13 @@ class WebhookDispatcher:
         for attempt in range(1, effective_retries + 1):
             headers = {
                 "Content-Type": "application/json",
-                "X-Glint-Event-Type": event_type,
-                "X-Glint-Event-Id": str(payload.get("id", "")),
-                "X-Glint-Timestamp": str(int(time.time())),
-                "X-Glint-Delivery-Attempt": str(attempt),
+                "X-Gateway-Event-Type": event_type,
+                "X-Gateway-Event-Id": str(payload.get("id", "")),
+                "X-Gateway-Timestamp": str(int(time.time())),
+                "X-Gateway-Delivery-Attempt": str(attempt),
             }
             if webhook.secret:
-                headers["X-Glint-Signature"] = _sign(webhook.secret, body_str)
+                headers["X-Gateway-Signature"] = _sign(webhook.secret, body_str)
             started = time.monotonic()
             try:
                 async with session.post(

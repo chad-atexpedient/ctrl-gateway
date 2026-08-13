@@ -47,7 +47,7 @@ import aiohttp
 
 from . import memory, ssrf
 
-log = logging.getLogger("glint.model_sync")
+log = logging.getLogger("ctrl.model_sync")
 
 # Default sync interval: 6 hours. New models don't appear every minute.
 DEFAULT_SYNC_INTERVAL_SECONDS = 6 * 60 * 60
@@ -294,7 +294,11 @@ class ModelSyncEngine:
             return None
         try:
             timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            # connector re-checks the SSRF policy at actual connect time,
+            # closing the TOCTOU/DNS-rebinding gap the validate_url() call
+            # above can't close on its own (see ssrf.SSRFSafeResolver).
+            connector = ssrf.safe_connector(allow_localhost=True, allow_private=True)
+            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
                 async with session.get(url, headers=headers or {}) as resp:
                     if resp.status != 200:
                         log.warning(

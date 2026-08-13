@@ -126,6 +126,54 @@ class MemoryNewTablesTests(unittest.TestCase):
         agents = memory.list_a2a_agents()
         self.assertEqual(len(agents), 1)
 
+    def test_a2a_agent_upsert_same_name_updates_not_duplicates(self):
+        """upsert_a2a_agent's own SELECT-then-update path must still update
+        an existing (tenant_id, name) row in place -- the new DB-level
+        uniqueness constraint must not interfere with the legitimate case
+        it's designed to allow."""
+        from gateway import memory
+        memory.upsert_a2a_agent(
+            name="dup", endpoint_url="http://first", agent_type="jsonrpc", tenant_id="t1",
+        )
+        memory.upsert_a2a_agent(
+            name="dup", endpoint_url="http://second", agent_type="jsonrpc", tenant_id="t1",
+        )
+        agents = [a for a in memory.list_a2a_agents(tenant_id="t1") if a["name"] == "dup"]
+        self.assertEqual(len(agents), 1, "second upsert should update in place, not create a duplicate row")
+        self.assertEqual(agents[0]["endpoint_url"], "http://second")
+
+    def test_a2a_agent_duplicate_name_blocked_at_db_level(self):
+        """Regression: (tenant_id, name) had no DB-level uniqueness despite
+        upsert_a2a_agent's docstring claiming it as "the logical uniqueness
+        key" -- upsert_a2a_agent only did an application-level SELECT-then
+        -insert-or-update with no locking, so two concurrent registrations
+        of the same name could both miss each other's SELECT and both
+        INSERT. Bypass upsert_a2a_agent entirely and insert directly to
+        prove the schema itself now rejects a duplicate (tenant_id, name),
+        the way a race would surface it.
+        """
+        import sqlalchemy
+        from sqlalchemy import insert
+
+        from gateway import memory
+        with memory.begin() as conn:
+            conn.execute(insert(memory.a2a_agents).values(
+                name="racer", endpoint_url="http://a", agent_type="jsonrpc", tenant_id="t1",
+            ))
+        with self.assertRaises(sqlalchemy.exc.IntegrityError):
+            with memory.begin() as conn:
+                conn.execute(insert(memory.a2a_agents).values(
+                    name="racer", endpoint_url="http://b", agent_type="jsonrpc", tenant_id="t1",
+                ))
+        # A different tenant (or a different name) is unaffected.
+        with memory.begin() as conn:
+            conn.execute(insert(memory.a2a_agents).values(
+                name="racer", endpoint_url="http://c", agent_type="jsonrpc", tenant_id="t2",
+            ))
+        agents = memory.list_a2a_agents(tenant_id=None)
+        racer_rows = [a for a in agents if a["name"] == "racer"]
+        self.assertEqual(len(racer_rows), 2)  # t1 and t2, not t1 duplicated
+
     def test_a2a_agent_invalid_type(self):
         from gateway import memory
         row = memory.upsert_a2a_agent(
@@ -735,6 +783,43 @@ class PluginLoaderTests(unittest.TestCase):
             plugin_root="/no/such/directory/anywhere",
         )
         self.assertEqual(loader.load_all(), 0)
+
+    def test_default_plugin_root_resolves_to_gateway_plugins_and_loads_sample(self):
+        """Regression: plugin_root defaults (PluginLoader.__init__, init_loader(),
+        and gateway-config.json's plugins.root) used to be "./plugins", but the
+        shipped sample plugin lives at gateway/plugins/microsoft_learn/ (see
+        README.md's "Plugins live under gateway/plugins/<name>/"). Any
+        deployment started from the repo root -- both the documented
+        `python -m gateway.app` quick start and the Dockerfile's WORKDIR /app
+        + `COPY gateway/ ./gateway/` assume this -- would silently load zero
+        plugins. Pin every default, then prove the real sample plugin
+        actually loads when resolved the way a real boot would resolve it.
+        """
+        import inspect
+
+        from gateway import events
+        from gateway import plugin as plugin_mod
+
+        init_default = inspect.signature(plugin_mod.PluginLoader.__init__).parameters["plugin_root"].default
+        self.assertEqual(init_default, "./gateway/plugins")
+        loader_fn_default = inspect.signature(plugin_mod.init_loader).parameters["plugin_root"].default
+        self.assertEqual(loader_fn_default, "./gateway/plugins")
+
+        repo_root = Path(__file__).resolve().parent.parent
+        config = json.loads((repo_root / "gateway-config.json").read_text())
+        self.assertEqual(config["plugins"]["root"], "./gateway/plugins")
+
+        loader = plugin_mod.PluginLoader(
+            app=web.Application(),
+            config=MagicMock(),
+            event_bus=events.EventBus(),
+            plugin_root=repo_root / "gateway" / "plugins",
+        )
+        count = loader.load_all()
+        self.assertGreaterEqual(count, 1)
+        self.assertIn("microsoft_learn", loader.plugins)
+        self.assertTrue(loader.plugins["microsoft_learn"].loaded)
+        self.assertIsNone(loader.plugins["microsoft_learn"].error)
 
     def test_plugin_context_helpers(self):
         from gateway import events
@@ -1417,6 +1502,98 @@ class MCPRoutesTests(_NewRoutesTestBase):
         }))
         self.assertEqual(resp.status, 200)
         self.assertIn("discovered", body)
+
+
+class MCPFacadeTenantIsolationTests(_NewRoutesTestBase):
+    """Regression test for the /mcp tenant-impersonation fix.
+
+    Previously handle_mcp_rpc() read tenant identity from a raw, client-
+    controlled `X-Tenant-Id` header instead of the auth-verified
+    request["tenant_id"] set by auth_middleware. That let any authenticated
+    tenant read/invoke another tenant's private A2A agents by simply setting
+    that header. This test proves a spoofed X-Tenant-Id no longer has any
+    effect once auth is enabled.
+    """
+
+    def _build_config(self, db_url):
+        config = super()._build_config(db_url)
+        config["auth"] = {
+            "enabled": True,
+            "keys": {
+                "admin-test-key": {"tenant_id": "admin", "scope": ["admin", "user"]},
+                "alice-test-key": {"tenant_id": "alice", "scope": ["user"]},
+                "bob-test-key": {"tenant_id": "bob", "scope": ["user"]},
+            },
+            "admin_paths": ["/admin", "/retrain", "/reload", "/config", "/export", "/registry", "/metrics"],
+            "public_paths": ["/", "/health", "/ready", "/dashboard"],
+            "allow_unauthenticated_user": False,
+        }
+        return config
+
+    async def _post_json(self, path, body, token=None):
+        client = self.server._client
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        resp = await client.post(path, json=body, headers=headers)
+        return resp, await resp.json()
+
+    async def _post_mcp(self, rpc_body, token=None, x_tenant_id=None):
+        client = self.server._client
+        headers = {}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        if x_tenant_id:
+            headers["X-Tenant-Id"] = x_tenant_id
+        resp = await client.post("/mcp", json=rpc_body, headers=headers)
+        return resp, await resp.json()
+
+    def test_spoofed_header_cannot_leak_another_tenants_private_agent(self):
+        # Admin registers a private A2A agent scoped to tenant "bob" only.
+        resp, row = self._run_coro(self._post_json(
+            "/admin/a2a/agents",
+            {
+                "name": "bob_secret_agent",
+                "endpoint_url": "http://127.0.0.1:1/",
+                "agent_type": "custom",
+                "description": "bob's private agent",
+                "tenant_id": "bob",
+            },
+            token="admin-test-key",
+        ))
+        self.assertEqual(row.get("name"), "bob_secret_agent", row)
+
+        # Bob (real owner) sees his own agent via tools/list.
+        resp, bob_body = self._run_coro(self._post_mcp(
+            {"jsonrpc": "2.0", "method": "tools/list", "id": 1},
+            token="bob-test-key",
+        ))
+        bob_tool_names = {t["name"] for t in bob_body["result"]["tools"]}
+        self.assertIn("a2a_bob_secret_agent", bob_tool_names)
+
+        # Alice, authenticated as herself but spoofing X-Tenant-Id: bob, must
+        # NOT see bob's private agent — her auth-verified identity (alice)
+        # is what governs scoping, not the header.
+        resp, alice_body = self._run_coro(self._post_mcp(
+            {"jsonrpc": "2.0", "method": "tools/list", "id": 2},
+            token="alice-test-key",
+            x_tenant_id="bob",
+        ))
+        alice_tool_names = {t["name"] for t in alice_body["result"]["tools"]}
+        self.assertNotIn("a2a_bob_secret_agent", alice_tool_names)
+
+        # And a direct tools/call attempt against bob's agent, still
+        # authenticated as alice + spoofed header, must fail to resolve it.
+        resp, call_body = self._run_coro(self._post_mcp(
+            {
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "a2a_bob_secret_agent", "arguments": {}},
+                "id": 3,
+            },
+            token="alice-test-key",
+            x_tenant_id="bob",
+        ))
+        self.assertIn("error", call_body)
+        self.assertEqual(call_body["error"]["code"], -32602)
 
 
 class CacheRoutesTests(_NewRoutesTestBase):

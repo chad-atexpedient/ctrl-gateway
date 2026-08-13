@@ -1,8 +1,8 @@
 {
-  "_doc": "Glint-V2 gateway config. Hot-reload via POST /reload. See README for reviewer model selection guide.",
+  "_doc": "CTRL Gateway config. Hot-reload via POST /reload. See README for reviewer model selection guide.",
 
   "mode": "single",
-  "db_url": "sqlite:///./glint-v2.db",
+  "db_url": "sqlite:///./ctrl-gateway.db",
   "host": "0.0.0.0",
   "port": 8076,
 
@@ -305,10 +305,10 @@
     "force_observe_on_close": false
   },
 
-  "_doc_plugins": "Plugin system. Drops plugin directories into ./plugins/ — each must have a manifest.yaml and a plugin.py exposing build_router(context). Hot-reload via POST /admin/plugins/{name}/reload. admin_scope required to register/delete.",
+  "_doc_plugins": "Plugin system. Drops plugin directories into ./gateway/plugins/ — each must have a manifest.yaml and a plugin.py exposing build_router(context). Hot-reload via POST /admin/plugins/{name}/reload. admin_scope required to register/delete.",
   "plugins": {
     "enabled": true,
-    "root": "./plugins",
+    "root": "./gateway/plugins",
     "scan_interval_seconds": 30,
     "auto_load": true,
     "_doc_scan_interval": "Background scan interval — picks up newly added plugin directories without restart."

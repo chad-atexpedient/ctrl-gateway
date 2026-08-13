@@ -24,7 +24,7 @@ import aiohttp
 from . import config as cfg
 from . import memory
 
-log = logging.getLogger("glint.reviewer")
+log = logging.getLogger("ctrl.reviewer")
 
 
 REVIEW_SYSTEM_PROMPT = (
@@ -298,6 +298,17 @@ class ReviewQueueWorker:
                 memory.complete_review(queue_ids[i], status="done")
             except Exception as e:
                 log.exception("failed to persist review result for decision %d: %s", decision_id, e)
+                # Without this, the queue item is left however dequeue_review()
+                # set it ("in_progress"); requeue_stale_reviews() would then
+                # flip it back to "pending" once its staleness window elapses,
+                # and it gets dequeued and retried forever -- repeatedly
+                # re-spending reviewer API budget on an item that fails the
+                # same deterministic way every time. Mark it failed, like
+                # every other error path in this function does.
+                try:
+                    memory.complete_review(queue_ids[i], status="failed", error=str(e)[:200])
+                except Exception:
+                    log.exception("failed to mark review queue item %s as failed", queue_ids[i])
 
         # Update spend counters
         _record_reviewer_spend(cost, caps)

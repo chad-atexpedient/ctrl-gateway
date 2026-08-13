@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from . import config as cfg
 from . import ood as ood_mod
 
-log = logging.getLogger("glint.policy")
+log = logging.getLogger("ctrl.policy")
 
 
 @dataclass
@@ -661,8 +661,11 @@ class BudgetRoutingDecision:
 
 
 def _normal_approx_z(p: float) -> float:
-    """Inverse normal CDF (z-score) for a probability p in (0,1). Used for the
-    99th-percentile cost estimation. Returns 2.33 for p=0.99."""
+    """Inverse normal CDF (z-score) for a probability p in (0,1). Returns 2.33
+    for p=0.99. Currently unused: cost_to_complete_p99() below models cost as
+    a discrete geometric distribution over retry attempts rather than a
+    continuous Gaussian, so it doesn't need a z-score. Kept as a general
+    inverse-normal-CDF helper available for future confidence-interval work."""
     # Abramowitz & Stegun 26.2.23 inverse-erf approximation
     if p <= 0.0:
         return -10.0
@@ -729,12 +732,18 @@ def estimate_success_probability(
     if n < min_samples:
         return conservative_prior, float(n)
     success = int(quality_profile.get("success_count", 0) or 0)
-    # Wilson lower bound for 95% confidence of a binomial proportion
+    # Wilson lower bound for 95% confidence of a binomial proportion.
+    # z is the single normal-quantile factor used throughout (Wilson score
+    # interval formula: https://en.wikipedia.org/wiki/Binomial_proportion_confidence_interval#Wilson_score_interval).
+    # Previously `margin` also multiplied in _normal_approx_z(0.975) (~1.96) on
+    # top of `z` (1.96), effectively squaring the z-factor to ~3.84 and making
+    # the lower bound far more conservative than a true 95% Wilson interval —
+    # e.g. for 90/100 successes this dropped the bound from ~0.826 to ~0.768.
     p = success / n if n > 0 else 0.0
     z = 1.96  # 95% one-sided
     denom = 1.0 + (z * z) / n
     center = (p + (z * z) / (2.0 * n)) / denom
-    margin = (z * float(_normal_approx_z(0.975))) * float((p * (1.0 - p) + (z * z) / (4.0 * n)) / n) ** 0.5 / denom
+    margin = z * float((p * (1.0 - p) + (z * z) / (4.0 * n)) / n) ** 0.5 / denom
     lower = max(0.0, min(1.0, center - margin))
     return float(lower), float(n)
 

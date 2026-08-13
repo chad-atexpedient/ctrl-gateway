@@ -49,7 +49,7 @@ from . import config as cfg_mod
 from . import events as events_mod
 from . import memory
 
-log = logging.getLogger("glint.plugin")
+log = logging.getLogger("ctrl.plugin")
 
 
 @dataclass
@@ -132,7 +132,7 @@ class PluginLoader:
         app: web.Application,
         config: cfg_mod.Config,
         event_bus: events_mod.EventBus,
-        plugin_root: str | Path = "./plugins",
+        plugin_root: str | Path = "./gateway/plugins",
         scan_interval_seconds: int = 30,
         auto_load: bool = True,
     ):
@@ -179,7 +179,7 @@ class PluginLoader:
         module_file = directory / manifest.get("module", "plugin.py")
         prefix = manifest.get("prefix", "")
         spec = importlib.util.spec_from_file_location(
-            f"glint.plugins.{name}", module_file
+            f"ctrl.plugins.{name}", module_file
         )
         if spec is None or spec.loader is None:
             self._record_error(name, directory, manifest, prefix, "could not load plugin module spec")
@@ -293,7 +293,7 @@ class PluginLoader:
         # Re-import the module
         module_file = existing.directory / existing.manifest.get("module", "plugin.py")
         spec = importlib.util.spec_from_file_location(
-            f"glint.plugins.{name}", module_file
+            f"ctrl.plugins.{name}", module_file
         )
         if spec is None or spec.loader is None:
             return False
@@ -365,7 +365,7 @@ def init_loader(
     app: web.Application,
     config: cfg_mod.Config,
     event_bus: events_mod.EventBus,
-    plugin_root: str | Path = "./plugins",
+    plugin_root: str | Path = "./gateway/plugins",
     scan_interval_seconds: int = 30,
     auto_load: bool = True,
 ) -> PluginLoader:

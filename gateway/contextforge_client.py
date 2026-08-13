@@ -37,7 +37,7 @@ import aiohttp
 
 from . import a2a_registry, memory
 
-log = logging.getLogger("glint.contextforge")
+log = logging.getLogger("ctrl.contextforge")
 
 
 class ContextForgeError(Exception):
@@ -85,9 +85,17 @@ class ContextForgeClient:
             headers = {"Accept": "application/json"}
             if self.api_key:
                 headers["Authorization"] = f"Bearer {self.api_key}"
+            from . import ssrf
+            # connector re-checks the SSRF policy at actual connect time,
+            # closing the TOCTOU/DNS-rebinding gap the validate_url() call
+            # in _fetch() below can't close on its own (see
+            # ssrf.SSRFSafeResolver). This session is reused across many
+            # requests to the same configured external_url, so one shared
+            # connector is fine here.
             self._session = aiohttp.ClientSession(
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=self.timeout_seconds),
+                connector=ssrf.safe_connector(allow_localhost=True, allow_private=True),
             )
         return self._session
 

@@ -27,7 +27,7 @@ import aiohttp
 
 from . import memory
 
-log = logging.getLogger("glint.a2a")
+log = logging.getLogger("ctrl.a2a")
 
 
 class A2AError(Exception):
@@ -243,7 +243,10 @@ async def invoke_agent(
     url, payload = build_request_payload(agent, parameters)
     headers = build_auth_headers(agent)
     headers.setdefault("Content-Type", "application/json")
-    # SSRF protection: block private/loopback/link-local targets unless explicitly allowed
+    # SSRF protection: private networks and loopback are intentionally
+    # allowed (self-hosted admins routinely register agents on internal
+    # services); link-local/reserved/multicast/unspecified — notably the
+    # 169.254.169.254 cloud-metadata endpoint — are always blocked.
     from . import ssrf
     try:
         ssrf.validate_url(url, allow_localhost=True, allow_private=True)
@@ -255,8 +258,12 @@ async def invoke_agent(
     started = time.monotonic()
     owns_session = False
     if session is None:
+        # connector re-checks the SSRF policy at actual connect time, closing
+        # the TOCTOU/DNS-rebinding gap the validate_url() call above can't
+        # close on its own (see ssrf.SSRFSafeResolver).
         session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=timeout_seconds)
+            timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+            connector=ssrf.safe_connector(allow_localhost=True, allow_private=True),
         )
         owns_session = True
     try:

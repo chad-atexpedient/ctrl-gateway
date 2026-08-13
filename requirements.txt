@@ -28,3 +28,4 @@ pytest-asyncio>=0.23
 # Lint / type check (CI)
 ruff>=0.5
 mypy>=1.10
+types-PyYAML>=6.0

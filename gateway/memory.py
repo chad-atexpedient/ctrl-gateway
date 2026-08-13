@@ -1,4 +1,4 @@
-"""Glint-V2 data layer.
+"""CTRL Gateway data layer.
 
 SQLAlchemy core (schema-only; no ORM) — same schema works for SQLite (single
 mode) and Postgres (multi mode). Driver is selected from db_url.
@@ -56,6 +56,7 @@ from sqlalchemy import (
     String,
     Table,
     Text,
+    UniqueConstraint,
     create_engine,
     delete,
     func,
@@ -66,7 +67,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import Engine
 
-log = logging.getLogger("glint.memory")
+log = logging.getLogger("ctrl.memory")
 
 metadata = MetaData()
 
@@ -449,6 +450,15 @@ a2a_agents = Table(
     Column("tenant_id", String(64), default="__all__", index=True),
     Column("created_at", DateTime, default=lambda: datetime.now(UTC)),
     Column("updated_at", DateTime, default=lambda: datetime.now(UTC)),
+    # upsert_a2a_agent()'s docstring has always claimed (tenant_id, name) as
+    # "the logical uniqueness key", but nothing enforced it at the DB level —
+    # upsert_a2a_agent only does a SELECT-then-INSERT-or-UPDATE, which is a
+    # plain application-level check-then-act with no locking, so two
+    # concurrent registrations of the same name could both miss each other's
+    # SELECT and both INSERT, leaving two rows for the same (tenant_id, name)
+    # with nothing to say which one is authoritative. Make the schema match
+    # the documented invariant.
+    UniqueConstraint("tenant_id", "name", name="uq_a2a_agents_tenant_name"),
 )
 
 
@@ -683,6 +693,22 @@ def _migrate(engine: Engine):
             wh_cols = _column_names(conn, "webhooks")
             if wh_cols and "max_retries" not in wh_cols:
                 conn.execute(text("ALTER TABLE webhooks ADD COLUMN max_retries INTEGER"))
+                conn.commit()
+            # (tenant_id, name) uniqueness for a2a_agents (see the Table
+            # definition above). create_all() only applies new constraints to
+            # brand-new tables, so pre-existing databases need this added
+            # explicitly. SQLite can't ALTER TABLE to add a constraint, but a
+            # UNIQUE INDEX enforces the same invariant and works identically
+            # on SQLite and Postgres. If a pre-existing database already has
+            # duplicate (tenant_id, name) rows -- which is exactly the data
+            # corruption this fix prevents going forward -- this statement
+            # fails and is logged + skipped like any other migration step
+            # here; the duplicates need a manual one-time cleanup in that case.
+            if _column_names(conn, "a2a_agents"):
+                conn.execute(text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_a2a_agents_tenant_name "
+                    "ON a2a_agents (tenant_id, name)"
+                ))
                 conn.commit()
     except Exception as e:
         log.warning("schema migration skipped: %s", e)

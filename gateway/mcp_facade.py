@@ -28,10 +28,10 @@ from aiohttp import web
 
 from . import a2a_registry, memory
 
-log = logging.getLogger("glint.mcp_facade")
+log = logging.getLogger("ctrl.mcp_facade")
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_NAME = "glint-v2-gateway"
+SERVER_NAME = "ctrl-gateway"
 SERVER_VERSION = "2.0.0"
 
 
@@ -153,8 +153,16 @@ async def handle_mcp_rpc(request: web.Request) -> web.Response:
     method = body.get("method", "")
     req_id = body.get("id")
     params = body.get("params", {})
-    # Tenant context from header (admin/anonymous when absent).
-    tenant_id = request.headers.get("X-Tenant-Id", "anonymous")
+    # Tenant resolution: MUST come from the auth-verified identity, never from a
+    # client-supplied header — auth_middleware sets request["tenant_id"] from the
+    # resolved API key when auth is enabled. X-User-Id is only the fallback used
+    # elsewhere in the gateway (chat_completions et al.) for trusted-reverse-proxy
+    # deployments with auth disabled. Previously this read a raw `X-Tenant-Id`
+    # header directly, which let any authenticated caller impersonate any other
+    # tenant for tools/list, tools/call, and prompts/get — including invoking
+    # another tenant's private A2A agents. Fixed to match every other tenant-scoped
+    # handler in app.py.
+    tenant_id = str(request.get("tenant_id") or request.headers.get("X-User-Id", "anonymous"))
 
     if method == "initialize":
         return web.json_response(

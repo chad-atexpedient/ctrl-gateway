@@ -26,9 +26,17 @@ import ipaddress
 import logging
 import socket
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
-log = logging.getLogger("glint.ssrf")
+if TYPE_CHECKING:
+    # Only for static typing (see SSRFSafeResolver's docstring for why this
+    # module avoids a hard runtime import of aiohttp) — `from __future__
+    # import annotations` above means this name is never evaluated at
+    # runtime, so the TYPE_CHECKING guard is what keeps it import-free.
+    from aiohttp.abc import AbstractResolver
+
+log = logging.getLogger("ctrl.ssrf")
 
 
 class SSRFBlockedURL(Exception):
@@ -145,6 +153,76 @@ def validate_url(
         reason = _is_blocked_ip(ip_str, cfg)
         if reason:
             raise SSRFBlockedURL(url, reason)
+
+
+class SSRFSafeResolver:
+    """aiohttp DNS resolver wrapper that re-applies the SSRF policy to every
+    resolved IP at the moment aiohttp is actually about to connect.
+
+    validate_url() below checks a hostname's IPs once, ahead of the real
+    request. If the target hostname's DNS is attacker-controlled, the
+    attacker can let that check pass against a safe IP and then "rebind"
+    the name to a blocked address (most dangerously the cloud-metadata
+    endpoint, 169.254.169.254) before the real connection happens — a plain
+    aiohttp.ClientSession performs its own independent resolution at connect
+    time, so there is a real gap between check and use. Passing an instance
+    of this class via TCPConnector(resolver=...) (see safe_connector())
+    makes that second, real resolution the one that gets policy-checked, so
+    there is no gap left to race.
+
+    Implements aiohttp.abc.AbstractResolver's async duck-typed interface
+    (resolve()/close()) without subclassing it, so this module has no hard
+    dependency on aiohttp at import time.
+    """
+
+    def __init__(self, cfg: SSRFConfig | None = None, inner: AbstractResolver | None = None):
+        self._cfg = cfg or SSRFConfig()
+        self._inner: AbstractResolver
+        if inner is not None:
+            self._inner = inner
+        else:
+            from aiohttp.resolver import ThreadedResolver
+            self._inner = ThreadedResolver()
+
+    async def resolve(self, host: str, port: int = 0, family: int = socket.AF_INET):
+        hosts = await self._inner.resolve(host, port, family)
+        safe = []
+        for entry in hosts:
+            reason = _is_blocked_ip(entry["host"], self._cfg)
+            if reason:
+                log.warning("SSRF resolver blocked %s -> %s: %s", host, entry["host"], reason)
+                continue
+            safe.append(entry)
+        if not safe:
+            raise OSError(f"SSRF blocked: no safe address remained for {host}")
+        return safe
+
+    async def close(self) -> None:
+        await self._inner.close()
+
+
+def safe_connector(
+    allow_localhost: bool = False,
+    allow_private: bool = False,
+    allow_link_local: bool = False,
+    **connector_kwargs,
+):
+    """Build an aiohttp.TCPConnector whose resolver enforces the SSRF policy
+    at actual connect time (see SSRFSafeResolver), closing the TOCTOU /
+    DNS-rebinding gap that a validate_url() pre-check alone can't close.
+
+    Use alongside validate_url() (not instead of it) at each call site:
+    validate_url() gives a fast, specific SSRFBlockedURL with a clear reason
+    before a connection is even attempted; this connector is the actual
+    last-line enforcement at request time, in case DNS changed in between.
+    """
+    import aiohttp
+    cfg = SSRFConfig(
+        allow_localhost=allow_localhost,
+        allow_private=allow_private,
+        allow_link_local=allow_link_local,
+    )
+    return aiohttp.TCPConnector(resolver=SSRFSafeResolver(cfg), **connector_kwargs)
 
 
 def safe_url(
