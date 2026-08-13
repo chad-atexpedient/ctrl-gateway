@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CTRL Gateway — semantic LLM gateway &amp; router</title>
+<meta name="description" content="CTRL Gateway routes every request to the cheapest model that can handle it, auto-discovers models from every provider, learns from feedback, and manages a multi-tenant inference fleet — OpenAI- and Anthropic-compatible endpoints, plugins, A2A orchestration, an MCP facade, and a live comparison dashboard included.">
+<link rel="icon" type="image/png" href="data:image/png;base64,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">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&amp;family=Inter:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #060606;
+    --bg-alt: #0c0c0c;
+    --panel: #111113;
+    --panel-2: #16161a;
+    --border: rgba(255,255,255,0.09);
+    --border-strong: rgba(255,255,255,0.16);
+    --text: #f5f5f5;
+    --dim: #a3a3a6;
+    --dimmer: #6d6d72;
+    --red: #f30505;
+    --red-soft: rgba(243,5,5,0.10);
+    --red-border: rgba(243,5,5,0.35);
+    --green: #45ca9f;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    --display: "Space Grotesk", var(--sans);
+    --sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+  }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: inherit; }
+  img { max-width: 100%; display: block; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 24px; }
+
+  /* ---- word reveal ---- */
+  .w {
+    display: inline-block;
+    opacity: 0;
+    transform: translateY(0.4em);
+    animation: wordUp 0.7s cubic-bezier(0.16,1,0.3,1) forwards;
+    animation-delay: calc(var(--i) * 0.045s);
+  }
+  @keyframes wordUp {
+    to { opacity: 1; transform: translateY(0); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .w { animation: none; opacity: 1; transform: none; }
+  }
+
+  /* ---- scroll reveal ---- */
+  .reveal { opacity: 0; transform: translateY(22px); transition: opacity .6s ease, transform .6s ease; }
+  .reveal.in { opacity: 1; transform: translateY(0); }
+  @media (prefers-reduced-motion: reduce) {
+    .reveal { opacity: 1; transform: none; transition: none; }
+  }
+
+  /* ---- nav ---- */
+  nav {
+    position: sticky; top: 0; z-index: 50;
+    background: rgba(6,6,6,0.88);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border);
+  }
+  nav .wrap { display: flex; align-items: center; justify-content: space-between; height: 68px; }
+  .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; }
+  .brand img { width: 30px; height: 30px; }
+  .brand .word { font-family: var(--display); font-weight: 700; font-size: 19px; letter-spacing: -0.01em; }
+  .brand .word .accent { color: var(--red); }
+  .navlinks { display: flex; align-items: center; gap: 26px; font-size: 14px; color: var(--dim); }
+  .navlinks a { text-decoration: none; transition: color .15s ease; }
+  .navlinks a:hover { color: var(--text); }
+  .navlinks .cta {
+    color: #fff; background: var(--red); padding: 9px 18px; border-radius: 999px;
+    font-weight: 600; transition: transform .15s ease, background .15s ease;
+  }
+  .navlinks .cta:hover { background: #ff1f1f; transform: translateY(-1px); color: #fff; }
+
+  /* ---- hero ---- */
+  header.hero { position: relative; overflow: hidden; padding: 76px 0 60px; }
+  header.hero canvas { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 0; opacity: 0.8; }
+  header.hero .fade-top {
+    position: absolute; inset: 0; z-index: 1; pointer-events: none;
+    background:
+      radial-gradient(ellipse 720px 420px at 50% 0%, rgba(243,5,5,0.16), transparent 65%),
+      linear-gradient(to bottom, rgba(6,6,6,0.55) 0%, rgba(6,6,6,0.15) 30%, rgba(6,6,6,0.55) 78%, var(--bg) 100%);
+  }
+  header.hero .wrap { position: relative; z-index: 2; }
+
+  .badges { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 26px; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 7px;
+    font-size: 13px; font-weight: 500; padding: 6px 13px; border-radius: 999px;
+    border: 1px solid var(--border-strong); background: rgba(255,255,255,0.03);
+    color: var(--dim);
+  }
+  .badge.red { color: #ff8080; background: var(--red-soft); border-color: var(--red-border); }
+  .badge img { width: 15px; height: 15px; }
+  .badge .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); display: inline-block; }
+
+  h1.headline {
+    font-family: var(--display);
+    font-size: clamp(36px, 5.8vw, 66px); line-height: 1.06; font-weight: 700;
+    margin: 0 0 24px; letter-spacing: -0.025em; max-width: 900px;
+  }
+  h1.headline .accent { color: var(--red); }
+  p.sub {
+    font-size: clamp(16px, 2vw, 19px); color: var(--dim); max-width: 660px; margin: 0 0 36px;
+  }
+  .hero-ctas { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 56px; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 9px;
+    padding: 12px 22px; border-radius: 999px; font-weight: 600; font-size: 15px;
+    text-decoration: none; border: 1px solid transparent; transition: transform .15s ease, background .15s ease, gap .15s ease, box-shadow .15s ease;
+  }
+  .btn .arrow { transition: transform .15s ease; }
+  .btn:hover { transform: translateY(-1px); gap: 13px; }
+  .btn:hover .arrow { transform: translateX(2px); }
+  .btn-primary { background: var(--red); color: #fff; box-shadow: 0 0 0 rgba(243,5,5,0); }
+  .btn-primary:hover { background: #ff1f1f; box-shadow: 0 6px 24px rgba(243,5,5,0.35); }
+  .btn-ghost { background: transparent; color: var(--text); border-color: var(--border-strong); }
+  .btn-ghost:hover { border-color: #fff; }
+
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: 14px; overflow: hidden; }
+  .stat { background: var(--panel); padding: 20px 18px; text-align: center; }
+  .stat .n { font-family: var(--display); font-size: 28px; font-weight: 700; color: var(--red); }
+  .stat .l { font-size: 12.5px; color: var(--dim); margin-top: 4px; }
+
+  /* ---- code preview ---- */
+  .code-card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+    overflow: hidden; margin-top: 44px;
+  }
+  .code-card .bar {
+    display: flex; align-items: center; gap: 7px; padding: 12px 16px; border-bottom: 1px solid var(--border);
+  }
+  .code-card .dot { width: 10px; height: 10px; border-radius: 50%; }
+  .code-card pre {
+    margin: 0; padding: 20px 22px; overflow-x: auto; font-family: var(--mono); font-size: 13.5px; line-height: 1.7;
+  }
+  .code-card code { color: #d8d8da; }
+  .tok-c { color: var(--dimmer); } /* comment */
+  .tok-s { color: #ff8080; } /* string */
+  .tok-k { color: var(--dim); } /* keyword */
+
+  /* ---- sections ---- */
+  section { padding: 88px 0; border-top: 1px solid var(--border); }
+  .kicker { font-family: var(--mono); font-size: 12.5px; color: var(--red); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 12px; }
+  h2 { font-family: var(--display); font-size: clamp(26px, 3.4vw, 38px); margin: 0 0 14px; letter-spacing: -0.02em; font-weight: 700; }
+  p.lead { color: var(--dim); font-size: 16.5px; max-width: 680px; margin: 0 0 48px; }
+
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 18px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 24px;
+    transition: border-color .2s ease, transform .2s ease;
+  }
+  .card:hover { border-color: var(--red-border); transform: translateY(-2px); }
+  .card .icon {
+    width: 38px; height: 38px; border-radius: 10px; margin-bottom: 16px;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--red-soft); border: 1px solid var(--red-border); color: var(--red); font-size: 18px;
+  }
+  .card h3 { font-family: var(--display); font-size: 16px; margin: 0 0 8px; font-weight: 600; }
+  .card p { font-size: 14px; color: var(--dim); margin: 0; }
+
+  /* ---- lifecycle ---- */
+  .steps { counter-reset: step; display: flex; flex-direction: column; gap: 0; max-width: 760px; }
+  .step { display: flex; gap: 20px; padding: 20px 0; border-bottom: 1px solid var(--border); }
+  .step:last-child { border-bottom: none; }
+  .step .num {
+    counter-increment: step; flex: none;
+    width: 34px; height: 34px; border-radius: 10px; background: var(--panel); border: 1px solid var(--red-border);
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--display); font-weight: 700; color: var(--red); font-size: 14px;
+  }
+  .step .num::before { content: counter(step); }
+  .step h4 { margin: 4px 0 6px; font-size: 15.5px; font-family: var(--display); font-weight: 600; }
+  .step p { margin: 0; color: var(--dim); font-size: 14.5px; }
+
+  /* ---- architecture diagram ---- */
+  .arch {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 32px;
+    font-family: var(--mono); font-size: 13px;
+  }
+  .arch-row { display: flex; align-items: center; gap: 14px; margin-bottom: 14px; flex-wrap: wrap; justify-content: center; }
+  .arch-box {
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 16px; color: var(--text); white-space: nowrap;
+  }
+  .arch-box.hi { border-color: var(--red-border); color: #ff8080; }
+  .arch-box.hi2 { border-color: rgba(255,255,255,0.28); color: var(--text); }
+  .arch-arrow { color: var(--dimmer); }
+  .arch-divider { text-align: center; color: var(--dimmer); margin: 4px 0; }
+
+  /* ---- security ---- */
+  .sec-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+  .sec-card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 14px; padding: 22px; }
+  .sec-card h3 { font-family: var(--display); font-size: 15px; margin: 0 0 10px; color: #ff8080; font-weight: 600; }
+  .sec-card p { font-size: 13.5px; color: var(--dim); margin: 0; }
+
+  /* ---- dashboard preview ---- */
+  .tabs-row { display: flex; flex-wrap: wrap; gap: 10px; }
+  .tab-chip {
+    font-family: var(--mono); font-size: 12.5px; padding: 7px 14px; border-radius: 999px;
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--dim);
+  }
+
+  footer { padding: 48px 0 64px; }
+  footer .wrap { display: flex; flex-direction: column; align-items: stretch; }
+  footer .top { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 20px; margin-bottom: 8px; }
+  footer .brand { opacity: 0.9; }
+  footer .cols { display: flex; gap: 40px; flex-wrap: wrap; }
+  footer .col h5 { font-size: 12.5px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--dimmer); margin: 0 0 12px; }
+  footer .col a { display: block; font-size: 14px; color: var(--dim); text-decoration: none; margin-bottom: 8px; }
+  footer .col a:hover { color: var(--text); }
+  footer .fine { font-size: 13px; color: var(--dimmer); margin-top: 40px; padding-top: 24px; border-top: 1px solid var(--border); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  footer .fine img { width: 15px; height: 15px; }
+
+  @media (max-width: 860px) {
+    .grid { grid-template-columns: repeat(2, 1fr); }
+    .sec-grid { grid-template-columns: 1fr; }
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .navlinks { display: none; }
+    footer .top { flex-direction: column; align-items: flex-start; }
+  }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <a class="brand" href="#top">
+      <img src="data:image/png;base64,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" alt="">
+      <span class="word">CTRL<span class="accent"> GATEWAY</span></span>
+    </a>
+    <div class="navlinks">
+      <a href="#features">Features</a>
+      <a href="#how-it-works">How it works</a>
+      <a href="#security">Security</a>
+      <a href="https://github.com/chad-atexpedient/ctrl-gateway#readme">Docs</a>
+      <a class="cta" href="https://github.com/chad-atexpedient/ctrl-gateway">GitHub &#8599;</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero" id="top">
+  <canvas id="circuit-canvas" aria-hidden="true"></canvas>
+  <div class="fade-top" aria-hidden="true"></div>
+  <div class="wrap">
+    <div class="badges">
+      <span class="badge red"><img src="data:image/png;base64,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" alt="">An Expedient AI Project</span>
+      <span class="badge"><span class="dot"></span>Apache 2.0 &middot; self-hosted &middot; single Python service</span>
+    </div>
+    <h1 class="headline"><span class="w" style="--i:0">Routes</span> <span class="w" style="--i:1">every</span> <span class="w" style="--i:2">request</span> <span class="w" style="--i:3">to</span> <span class="w" style="--i:4">the</span> <span class="w accent" style="--i:5">cheapest</span> <span class="w accent" style="--i:6">model</span> <span class="w accent" style="--i:7">that</span> <span class="w accent" style="--i:8">can</span> <span class="w accent" style="--i:9">handle</span> <span class="w accent" style="--i:10">it</span> <span class="w" style="--i:11">&mdash;</span> <span class="w" style="--i:12">not</span> <span class="w" style="--i:13">just</span> <span class="w" style="--i:14">whatever&rsquo;s</span> <span class="w" style="--i:15">hardcoded</span> <span class="w" style="--i:16">in</span> <span class="w" style="--i:17">your</span> <span class="w" style="--i:18">client.</span></h1>
+    <p class="sub">
+      CTRL Gateway sits between your application and your LLM providers — OpenAI, Anthropic,
+      Google, Ollama, OpenRouter, Groq, Together, DeepSeek, and 15+ others — reachable through
+      either an OpenAI-compatible or an Anthropic-compatible endpoint. It classifies every request
+      by vertical and complexity, routes it to the cheapest sufficient model, falls back on
+      failure, and learns from outcomes to improve future routing.
+    </p>
+    <div class="hero-ctas">
+      <a class="btn btn-primary" href="https://github.com/chad-atexpedient/ctrl-gateway">View on GitHub <span class="arrow">&rarr;</span></a>
+      <a class="btn btn-ghost" href="#quickstart">Quick start</a>
+      <a class="btn btn-ghost" href="https://github.com/chad-atexpedient/ctrl-gateway#readme">Read the docs</a>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><div class="n">65</div><div class="l">routing verticals</div></div>
+      <div class="stat"><div class="n">22</div><div class="l">provider presets</div></div>
+      <div class="stat"><div class="n">300+</div><div class="l">models via OpenRouter</div></div>
+      <div class="stat"><div class="n">389</div><div class="l">tests passing</div></div>
+    </div>
+
+    <div class="code-card" id="quickstart">
+      <div class="bar">
+        <span class="dot" style="background:#ff5f57"></span>
+        <span class="dot" style="background:#febc2e"></span>
+        <span class="dot" style="background:#28c840"></span>
+      </div>
+      <pre><code><span class="tok-c"># 1. Install</span>
+pip install -r requirements.txt
+
+<span class="tok-c"># 2. Configure</span>
+cp gateway-config.json gateway-config.runtime.json
+
+<span class="tok-c"># 3. Run</span>
+python -m gateway.app
+
+<span class="tok-c"># 4. Call it — OpenAI or Anthropic shaped, your choice</span>
+curl <span class="tok-s">localhost:8076/v1/chat/completions</span>  <span class="tok-c"># OpenAI wire format</span>
+curl <span class="tok-s">localhost:8076/v1/messages</span>          <span class="tok-c"># Anthropic wire format</span>
+
+<span class="tok-c"># 5. Open the dashboard</span>
+<span class="tok-s">http://localhost:8076/dashboard</span></code></pre>
+    </div>
+  </div>
+</header>
+
+<section id="features">
+  <div class="wrap">
+    <div class="kicker">What it does</div>
+    <h2 class="reveal">One gateway, the whole inference fleet.</h2>
+    <p class="lead reveal">
+      An OpenAI- and Anthropic-compatible reverse proxy in front, a real routing brain behind it —
+      not just a static model list with a load balancer.
+    </p>
+    <div class="grid">
+      <div class="card reveal">
+        <span class="icon">&#8644;</span>
+        <h3>Gateway</h3>
+        <p>OpenAI- and Anthropic-compatible reverse proxy. Health checks, circuit breakers, streaming, concurrency control, per-tenant auth.</p>
+      </div>
+      <div class="card reveal">
+        <span class="icon">&#8982;</span>
+        <h3>Router</h3>
+        <p>Frozen sentence embedding + MLP classifier heads. 65 verticals, complexity scoring, code/math/reasoning flags, OOD detection — CPU-only.</p>
+      </div>
+      <div class="card reveal">
+        <span class="icon">&#9878;</span>
+        <h3>Policy engine</h3>
+        <p>Deterministic pre-routes &rarr; cost-first gate &rarr; uncertainty escalation &rarr; tier ladder. Budget-aware routing with Wilson confidence bounds.</p>
+      </div>
+      <div class="card reveal">
+        <span class="icon">&#9737;</span>
+        <h3>Model catalog</h3>
+        <p>Auto-discovers models from OpenRouter, OpenAI, Anthropic, Ollama. Capability scoring, auto-tier assignment, spidergraph comparison.</p>
+      </div>
+      <div class="card reveal">
+        <span class="icon">&#8635;</span>
+        <h3>Data flywheel</h3>
+        <p>Async reviewer labels every prompt; high-agreement samples become training data; auto-retrain with eval gate and auto-rollback.</p>
+      </div>
+      <div class="card reveal">
+        <span class="icon">&#10022;</span>
+        <h3>Extensions</h3>
+        <p>Plugin system, A2A agent registry, IBM ContextForge connector, MCP discovery + unified facade, prompt templates, webhooks, tool cache.</p>
+      </div>
+      <div class="card reveal">
+        <span class="icon">&#128737;</span>
+        <h3>Security</h3>
+        <p>Prompt-injection detection, provider domain allowlist, host firewall, DNS-rebinding-resistant SSRF protection, audit log.</p>
+      </div>
+      <div class="card reveal">
+        <span class="icon">&#9901;</span>
+        <h3>Multi-tenant</h3>
+        <p>Per-user API keys tagged by wire format, rate limits, token/USD budgets, tier access, plan-based quotas. Tenant scoping on every extension table.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="how-it-works">
+  <div class="wrap">
+    <div class="kicker">Request lifecycle</div>
+    <h2 class="reveal">What happens between your request and a response.</h2>
+    <p class="lead reveal">Every call passes through the same pipeline — deterministic where it can be, learned where it should be.</p>
+
+    <div class="steps">
+      <div class="step reveal">
+        <div class="num"></div>
+        <div><h4>Auth &amp; injection check</h4><p>Per-tenant API key resolution, then DB-backed regex profiles scan the prompt — block/alert/log actions, evaluated before any routing happens.</p></div>
+      </div>
+      <div class="step reveal">
+        <div class="num"></div>
+        <div><h4>Classify</h4><p>Embedding + MLP heads classify into 65 verticals plus complexity 1&ndash;5, with code/math/reasoning/long-output flags and out-of-distribution detection.</p></div>
+      </div>
+      <div class="step reveal">
+        <div class="num"></div>
+        <div><h4>Route</h4><p>Deterministic pre-routes (vision, medical, freshness) first, then cost-first tier selection or a budget-aware cascade chain, with escalation for low-confidence calls.</p></div>
+      </div>
+      <div class="step reveal">
+        <div class="num"></div>
+        <div><h4>Transcode &amp; dispatch</h4><p>The payload is rewritten between wire formats (OpenAI, Anthropic, and every upstream's native shape) and sent with concurrency control, circuit breakers, and a retry/fallback ladder.</p></div>
+      </div>
+      <div class="step reveal">
+        <div class="num"></div>
+        <div><h4>Review &amp; learn</h4><p>An async reviewer independently labels the exchange; high-agreement labels become curated training data that periodically retrains the router.</p></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="architecture">
+  <div class="wrap">
+    <div class="kicker">Architecture</div>
+    <h2 class="reveal">Where the pieces sit.</h2>
+    <p class="lead reveal">A single aiohttp service — no message queue or separate control plane required to get started.</p>
+
+    <div class="arch reveal">
+      <div class="arch-row">
+        <span class="arch-box">Client (OpenAI or Anthropic shaped)</span>
+        <span class="arch-arrow">&rarr;</span>
+        <span class="arch-box hi">Auth</span>
+        <span class="arch-arrow">&rarr;</span>
+        <span class="arch-box hi">Injection check</span>
+        <span class="arch-arrow">&rarr;</span>
+        <span class="arch-box hi">Router</span>
+        <span class="arch-arrow">&rarr;</span>
+        <span class="arch-box hi">Policy</span>
+      </div>
+      <div class="arch-divider">&darr;</div>
+      <div class="arch-row">
+        <span class="arch-box hi2">Cost-first route</span>
+        <span style="color:var(--dimmer)">or</span>
+        <span class="arch-box hi2">Budget-aware cascade</span>
+      </div>
+      <div class="arch-divider">&darr;</div>
+      <div class="arch-row">
+        <span class="arch-box">Endpoint pool</span>
+        <span class="arch-arrow">&larr;</span>
+        <span class="arch-box">Model catalog</span>
+      </div>
+      <div class="arch-divider">&darr;</div>
+      <div class="arch-row">
+        <span class="arch-box">Transcoder</span>
+        <span class="arch-arrow">&rarr;</span>
+        <span class="arch-box">OpenAI</span>
+        <span class="arch-box">Anthropic</span>
+        <span class="arch-box">Ollama</span>
+        <span class="arch-box">OpenRouter</span>
+        <span class="arch-box">+15 more</span>
+      </div>
+      <div class="arch-divider">&darr;</div>
+      <div class="arch-row">
+        <span class="arch-box">Reviewer worker</span>
+        <span class="arch-box">Trainer worker</span>
+        <span class="arch-box">Observer worker</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="security">
+  <div class="wrap">
+    <div class="kicker">Security hub</div>
+    <h2 class="reveal">Three layers, all configurable at runtime.</h2>
+    <p class="lead reveal">None of this requires a restart — profiles, allowlists, and firewall rules are all hot-reloadable via the admin API.</p>
+    <div class="sec-grid">
+      <div class="sec-card reveal">
+        <h3>Prompt-injection detection</h3>
+        <p>DB-backed regex profiles with severity and action (block/alert/log). Six built-in profiles cover jailbreak, role override, context escape, router manipulation, data exfiltration, and semantic DoS. Routing is never altered by injection signals — a blocked request returns HTTP 400 before routing runs.</p>
+      </div>
+      <div class="sec-card reveal">
+        <h3>Provider domain allowlist</h3>
+        <p>Governs which LLM provider domains the gateway may talk to, with config- and DB-backed rules plus tenant-specific overrides. An optional host-level firewall enforces the same policy at the OS level on Windows or Linux.</p>
+      </div>
+      <div class="sec-card reveal">
+        <h3>SSRF protection</h3>
+        <p>Validates outbound HTTP from every integration point — A2A, ContextForge, MCP discovery, webhook delivery. Blocks loopback, private, link-local, and reserved ranges by default, and closes the DNS-rebinding gap by re-checking resolved addresses at actual connect time, not just at request construction.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="dashboard">
+  <div class="wrap">
+    <div class="kicker">Dashboard</div>
+    <h2 class="reveal">Eleven tabs, zero build step.</h2>
+    <p class="lead reveal">Pure vanilla JS, served straight from the gateway at <code>/dashboard</code> — no npm install, no separate frontend deploy.</p>
+    <div class="tabs-row reveal">
+      <span class="tab-chip">Live</span>
+      <span class="tab-chip">Providers</span>
+      <span class="tab-chip">Keys</span>
+      <span class="tab-chip">Routing</span>
+      <span class="tab-chip">Models</span>
+      <span class="tab-chip">Flywheel</span>
+      <span class="tab-chip">Security</span>
+      <span class="tab-chip">Plugins</span>
+      <span class="tab-chip">A2A</span>
+      <span class="tab-chip">Prompts</span>
+      <span class="tab-chip">Webhooks</span>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="top">
+      <a class="brand" href="#top">
+        <img src="data:image/png;base64,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" alt="" style="width:26px;height:26px;">
+        <span class="word" style="font-size:16px;">CTRL<span class="accent"> GATEWAY</span></span>
+      </a>
+    </div>
+    <div class="cols">
+      <div class="col">
+        <h5>Project</h5>
+        <a href="https://github.com/chad-atexpedient/ctrl-gateway">GitHub</a>
+        <a href="https://github.com/chad-atexpedient/ctrl-gateway#readme">README</a>
+        <a href="https://github.com/chad-atexpedient/ctrl-gateway/blob/main/LICENSE">Apache 2.0 License</a>
+      </div>
+      <div class="col">
+        <h5>Docs</h5>
+        <a href="https://github.com/chad-atexpedient/ctrl-gateway#configuration-reference">Configuration</a>
+        <a href="https://github.com/chad-atexpedient/ctrl-gateway#api-reference">API reference</a>
+        <a href="https://github.com/chad-atexpedient/ctrl-gateway#testing">Testing</a>
+      </div>
+      <div class="col">
+        <h5>Get started</h5>
+        <a href="#quickstart">Quick start</a>
+        <a href="https://github.com/chad-atexpedient/ctrl-gateway#multi-instance">Multi-instance</a>
+      </div>
+    </div>
+    <div class="fine">
+      <img src="data:image/png;base64,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" alt="">
+      An Expedient AI project. CTRL Gateway is open source under the Apache License, Version 2.0. Not affiliated with OpenAI, Anthropic, Google, or any other provider named above.
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  // ---- circuit-network canvas background ----
+  var canvas = document.getElementById('circuit-canvas');
+  if (canvas && canvas.getContext) {
+    var ctx = canvas.getContext('2d');
+    var hero = canvas.parentElement;
+    var reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    var particles = [];
+    var W = 0, H = 0, DPR = 1;
+
+    function resize() {
+      var rect = hero.getBoundingClientRect();
+      DPR = Math.min(window.devicePixelRatio || 1, 2);
+      W = rect.width; H = rect.height;
+      canvas.width = Math.max(1, Math.floor(W * DPR));
+      canvas.height = Math.max(1, Math.floor(H * DPR));
+      ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    }
+
+    function init() {
+      resize();
+      var count = Math.min(80, Math.max(20, Math.floor((W * H) / 13000)));
+      particles = [];
+      for (var i = 0; i < count; i++) {
+        particles.push({
+          x: Math.random() * W,
+          y: Math.random() * H,
+          vx: (Math.random() - 0.5) * 0.2,
+          vy: (Math.random() - 0.5) * 0.2
+        });
+      }
+    }
+
+    function frame() {
+      ctx.clearRect(0, 0, W, H);
+      var linkDist = 130;
+      var i, j, p, a, b, dx, dy, dist;
+      for (i = 0; i < particles.length; i++) {
+        p = particles[i];
+        p.x += p.vx; p.y += p.vy;
+        if (p.x < 0 || p.x > W) p.vx *= -1;
+        if (p.y < 0 || p.y > H) p.vy *= -1;
+      }
+      for (i = 0; i < particles.length; i++) {
+        for (j = i + 1; j < particles.length; j++) {
+          a = particles[i]; b = particles[j];
+          dx = a.x - b.x; dy = a.y - b.y;
+          dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist < linkDist) {
+            ctx.strokeStyle = 'rgba(243,5,5,' + (0.16 * (1 - dist / linkDist)) + ')';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(a.x, a.y);
+            ctx.lineTo(b.x, b.y);
+            ctx.stroke();
+          }
+        }
+      }
+      for (i = 0; i < particles.length; i++) {
+        p = particles[i];
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 1.6, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(243,5,5,0.6)';
+        ctx.fill();
+      }
+      if (!reduceMotion) requestAnimationFrame(frame);
+    }
+
+    init();
+    if (reduceMotion) {
+      frame(); // draw a single static frame, no loop
+    } else {
+      requestAnimationFrame(frame);
+    }
+    var resizeTimer;
+    window.addEventListener('resize', function () {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(init, 150);
+    });
+  }
+
+  // ---- scroll reveal ----
+  var revealEls = document.querySelectorAll('.reveal');
+  if ('IntersectionObserver' in window && revealEls.length) {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (entry.isIntersecting) {
+          entry.target.classList.add('in');
+          io.unobserve(entry.target);
+        }
+      });
+    }, { threshold: 0.12, rootMargin: '0px 0px -40px 0px' });
+    revealEls.forEach(function (el) { io.observe(el); });
+  } else {
+    revealEls.forEach(function (el) { el.classList.add('in'); });
+  }
+})();
+</script>
+
+</body>
+</html>
